@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.DS_Store
+meta.json
+user_files/
+.idea/
+.vscode/
+*.ankiaddon
+ANKIWEB.md

@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "migrated_v1": false,
+  "first_run_seen": false,
+  "debug_logging": false,
+  "anthropic_api_key": "",
+  "claude_cli_path": "",
+  "claude_cli_extra_args": [],
+  "provider_mode": "auto",
+  "model_default": "claude-sonnet-4-6",
+  "window": {"width": 900, "height": 600, "x": null, "y": null},
+  "tools": {
+    "qbank": {
+      "enabled": true,
+      "show_heatmap": true,
+      "platforms": [
+        {"key": "osmosis",     "name": "Osmosis",     "url": "https://www.osmosis.org/"},
+        {"key": "emedici",     "name": "eMedici",     "url": "https://app.emedici.com"},
+        {"key": "clinicalkey", "name": "ClinicalKey", "url": "https://www.clinicalkey.com/student/questionbanks"}
+      ],
+      "default_daily": 0,
+      "target_periods": [],
+      "exam_dates": [],
+      "search_model": "claude-haiku-4-5-20251001",
+      "card_gen_model": "claude-sonnet-4-6",
+      "card_skill_id": "",
+      "card_prompt": "",
+      "card_notetype": "",
+      "card_deck": "",
+      "missed_q_field": "Missed Questions",
+      "tag_root": "Missed_Questions",
+      "last_system": "",
+      "last_subsystem": "",
+      "last_topic": "",
+      "ai_last_selected": "Claude",
+      "ai_panel_visible": false
+    },
+    "browse": {
+      "enabled": true,
+      "model": "claude-sonnet-4-6",
+      "last_used_tag": "",
+      "max_results": 50,
+      "notetype_filter": "",
+      "front_field": "Text",
+      "audit_tag": "Ankisstant::AI::Browse",
+      "enable_gap_report": false,
+      "source_tags": []
+    },
+    "gap_analyser": {
+      "enabled": true,
+      "model": "claude-sonnet-4-6",
+      "front_field": "Text",
+      "notetype_filter": "",
+      "last_used_tag": "",
+      "max_cards": 80,
+      "max_gaps": 10
+    },
+    "card_creator": {
+      "enabled": true,
+      "model": "claude-sonnet-4-6",
+      "default_deck": "",
+      "default_notetype": "",
+      "default_tags": [],
+      "audit_tag": "Ankisstant::AI::Creator",
+      "default_n_cards": 10,
+      "gap_n_cards": 3,
+      "front_field": "Text",
+      "extra_field": "Extra",
+      "one_by_one_field": "One by one"
+    }
+  }
+}

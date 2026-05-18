@@ -1,0 +1,13 @@
+{
+  "name": "Ankisstant",
+  "package": "ankisstant",
+  "author": "Fletcher Bucat",
+  "version": "1.2.0",
+  "description": "QBank, Browse, Knowledge Gaps, and Create — four Claude-powered tools for Anki, bundled into one addon.",
+  "conflicts": ["679076377", "browse_with_claude", "create_cards_with_claude"],
+  "mod": 0,
+  "min_point_version": 50,
+  "max_point_version": 0,
+  "branch_index": 0,
+  "homepage": "https://github.com/fletcherbucat/ankisstant"
+}
