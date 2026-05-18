@@ -1,5 +1,39 @@
 # Changelog
 
+## 1.4.0
+
+Per-type **custom field schemas** for Knowledge Gaps. Each type now owns
+its own list of inputs — what the KG detail page renders is driven by the
+active type's schema, not a fixed form.
+
+### Added
+- **Schema field on every type.** Each type has a `fields` list of
+  `{key, label, kind, placeholder}`. `kind` can be:
+    - `text` (single-line)
+    - `longtext` (multi-line)
+    - `html` (rich text + paste-screenshot, same editor QBank Capture uses)
+    - `url` (with an Open button)
+    - `tag` (single line with Anki tag autocomplete)
+- **Default type schemas**:
+    - **MQ** → concept, stem (html), system / subsystem / topic,
+      QBank source, notes
+    - **KG** → notes
+    - **LO** → learning objective, anki tag, notes
+- **Fields sub-editor** in Settings → Knowledge Gaps → Edit type.
+  Add/edit/remove/reorder fields, with a live preview of the key + kind.
+- **KG detail pane is now schema-driven.** Switching the type rebuilds the
+  form, preserving values for overlapping field keys.
+- **QBank Capture → KG** now writes into the MQ schema's fields blob, so
+  screenshots and stems flow into the detail pane verbatim.
+- **Send to Create** pulls supplemental context (stem + notes + concept +
+  LO) from the type's fields instead of fixed top-level keys.
+
+### Changed
+- KG entries now store type-specific content under a `fields: {key: value}`
+  dict on each entry. Legacy top-level keys (notes, stem_html, system,
+  subsystem, topic, platform, lo, lo_tag) are auto-promoted into `fields`
+  on first read — old entries continue to display without manual fixup.
+
 ## 1.3.0
 
 Knowledge Gap **types** (MQ / KG / LO + custom), and completed items now

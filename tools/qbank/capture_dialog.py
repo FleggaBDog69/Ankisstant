@@ -164,11 +164,15 @@ class CaptureDialog(QDialog):
             source="qbank",
             type="mq",
             status="open",
-            stem_html=stem,
-            platform=self._platform_key,
-            system=system,
-            subsystem=subsystem,
-            topic=topic,
+            fields={
+                "concept":   concept,
+                "stem_html": stem,
+                "system":    system,
+                "subsystem": subsystem,
+                "topic":     topic,
+                "platform":  self._platform_key,
+                "notes":     "",
+            },
         )
         # Tell any open KG panel to refresh.
         try:

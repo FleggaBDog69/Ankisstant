@@ -353,9 +353,12 @@ class GapAnalyserPanel(QWidget):
                 "source": "analyse",
                 "type":   "lo",
                 "status": "open",
-                "lo":     lo,
-                "lo_tag": tag,
                 "tags":   [tag] if tag else [],
+                "fields": {
+                    "lo":     lo,
+                    "lo_tag": tag,
+                    "notes":  "",
+                },
             }
             for gap_text in approved
         ]

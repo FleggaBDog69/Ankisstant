@@ -855,20 +855,98 @@ def _slugify_type_key(name: str) -> str:
     return s[:24] or "type"
 
 
-class _TypeEditorDialog(QDialog):
-    """Modal for adding/editing a KG type entry. Returns name/color/description."""
+FIELD_KIND_LABELS = [
+    ("text",     "Text (single line)"),
+    ("longtext", "Long text (multi-line)"),
+    ("html",     "Rich text + screenshots (HTML)"),
+    ("url",      "URL"),
+    ("tag",      "Anki tag (with autocomplete)"),
+]
+
+
+class _FieldEditorDialog(QDialog):
+    """Modal for editing a single field spec inside a type's schema."""
 
     def __init__(self, parent=None, existing: dict | None = None):
         super().__init__(parent)
-        self.setWindowTitle("Edit type" if existing else "Add type")
-        self.setMinimumWidth(420)
+        self.setWindowTitle("Edit field" if existing else "Add field")
+        self.setMinimumWidth(440)
         layout = _expand_form(QFormLayout(self))
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setVerticalSpacing(8)
 
+        self._existing_key = (existing or {}).get("key", "")
+
+        self._label = QLineEdit(str((existing or {}).get("label", "")))
+        self._label.setPlaceholderText("e.g. Question stem, Concept missed")
+        layout.addRow("Label:", self._label)
+
+        self._kind = QComboBox()
+        for k, lbl in FIELD_KIND_LABELS:
+            self._kind.addItem(lbl, k)
+        existing_kind = (existing or {}).get("kind", "text")
+        idx = self._kind.findData(existing_kind)
+        if idx >= 0:
+            self._kind.setCurrentIndex(idx)
+        layout.addRow("Kind:", self._kind)
+
+        self._placeholder = QLineEdit(str((existing or {}).get("placeholder", "")))
+        self._placeholder.setPlaceholderText("Hint shown inside the empty input")
+        layout.addRow("Placeholder:", self._placeholder)
+
+        if existing:
+            key_lbl = QLabel(f"<small>key: <code>{existing.get('key', '')}</code>"
+                             f" — locked once a field has data</small>")
+            key_lbl.setTextFormat(Qt.TextFormat.RichText)
+            key_lbl.setStyleSheet("color: gray;")
+            layout.addRow(key_lbl)
+
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        bb.accepted.connect(self._on_save)
+        bb.rejected.connect(self.reject)
+        layout.addRow(bb)
+
+    def _on_save(self):
+        if not self._label.text().strip():
+            showWarning("Label is required.")
+            return
+        self.accept()
+
+    def values(self) -> dict:
+        label = self._label.text().strip()
+        key = self._existing_key or _slugify_type_key(label)
+        return {
+            "key":         key,
+            "label":       label,
+            "kind":        self._kind.currentData() or "text",
+            "placeholder": self._placeholder.text().strip(),
+        }
+
+
+class _TypeEditorDialog(QDialog):
+    """Modal for adding/editing a KG type entry, including its field schema."""
+
+    def __init__(self, parent=None, existing: dict | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit type" if existing else "Add type")
+        self.setMinimumWidth(540)
+        self.setMinimumHeight(560)
+
+        # Working copy of the fields list — committed on Save.
+        self._fields: list[dict] = [dict(f) for f in (existing or {}).get("fields") or []]
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(14, 14, 14, 14)
+        outer.setSpacing(10)
+
+        form = _expand_form(QFormLayout())
+        form.setVerticalSpacing(8)
+
         self._name = QLineEdit(str((existing or {}).get("name", "")))
         self._name.setPlaceholderText("e.g. MQ, Drug fact, Mnemonic")
-        layout.addRow("Name:", self._name)
+        form.addRow("Name:", self._name)
 
         # Color row — line edit + a swatch button that opens QColorDialog.
         color = str((existing or {}).get("color", "#6b7280"))
@@ -890,29 +968,67 @@ class _TypeEditorDialog(QDialog):
         self._color.textChanged.connect(self._update_preview)
         wrap = QWidget()
         wrap.setLayout(color_row)
-        layout.addRow("Colour:", wrap)
+        form.addRow("Colour:", wrap)
 
         self._description = QPlainTextEdit(str((existing or {}).get("description", "")))
-        self._description.setMinimumHeight(60)
+        self._description.setMinimumHeight(50)
         self._description.setPlaceholderText("Optional — what is this type for?")
-        layout.addRow("Description:", self._description)
+        form.addRow("Description:", self._description)
 
-        # Show locked key if editing.
         if existing:
             key_lbl = QLabel(f"<small>key: <code>{existing.get('key', '')}</code></small>")
             key_lbl.setTextFormat(Qt.TextFormat.RichText)
             key_lbl.setStyleSheet("color: gray;")
-            layout.addRow(key_lbl)
+            form.addRow(key_lbl)
             self._key = existing.get("key", _slugify_type_key(existing.get("name", "")))
         else:
             self._key = None
+
+        outer.addLayout(form)
+
+        # Fields editor.
+        fields_box = QGroupBox("Fields (schema for KGs of this type)")
+        fb = QVBoxLayout(fields_box)
+        fb.setContentsMargins(10, 8, 10, 8)
+        fb.setSpacing(6)
+        fb_hint = QLabel(
+            "These are the inputs shown on the KG detail page for entries "
+            "of this type. Reorder with the arrows. The MQ defaults — "
+            "<code>concept</code>, <code>stem_html</code>, <code>system</code>, "
+            "<code>subsystem</code>, <code>topic</code>, <code>platform</code>, "
+            "<code>notes</code> — are read by the QBank capture dialog and "
+            "shouldn't be renamed unless you know what you're doing."
+        )
+        fb_hint.setTextFormat(Qt.TextFormat.RichText)
+        fb_hint.setStyleSheet("color: gray; font-size: 11px;")
+        fb_hint.setWordWrap(True)
+        fb.addWidget(fb_hint)
+
+        self._fields_list = QListWidget()
+        self._fields_list.setAlternatingRowColors(True)
+        self._fields_list.itemDoubleClicked.connect(lambda _it: self._edit_field())
+        self._refresh_fields_list()
+        fb.addWidget(self._fields_list)
+
+        f_btn_row = QHBoxLayout()
+        add_f = QPushButton("＋ Add field"); add_f.clicked.connect(self._add_field)
+        edit_f = QPushButton("Edit…");      edit_f.clicked.connect(self._edit_field)
+        rm_f = QPushButton("Remove");       rm_f.clicked.connect(self._remove_field)
+        up_f = QPushButton("↑");            up_f.setFixedWidth(28); up_f.clicked.connect(lambda: self._move_field(-1))
+        dn_f = QPushButton("↓");            dn_f.setFixedWidth(28); dn_f.clicked.connect(lambda: self._move_field(1))
+        f_btn_row.addWidget(add_f); f_btn_row.addWidget(edit_f); f_btn_row.addWidget(rm_f)
+        f_btn_row.addStretch(1)
+        f_btn_row.addWidget(up_f); f_btn_row.addWidget(dn_f)
+        fb.addLayout(f_btn_row)
+
+        outer.addWidget(fields_box)
 
         bb = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
         bb.accepted.connect(self._on_save)
         bb.rejected.connect(self.reject)
-        layout.addRow(bb)
+        outer.addWidget(bb)
 
     def _pick_color(self):
         current = QColor(self._color.text().strip() or "#6b7280")
@@ -937,6 +1053,85 @@ class _TypeEditorDialog(QDialog):
             return
         self.accept()
 
+    # ── fields sub-editor ────────────────────────────────────────────────────
+
+    def _refresh_fields_list(self):
+        self._fields_list.clear()
+        kind_lookup = dict(FIELD_KIND_LABELS)
+        for f in self._fields:
+            kind_lbl = kind_lookup.get(f.get("kind", "text"), f.get("kind", ""))
+            label = f"{f.get('label','')}    "
+            sub = f"key={f.get('key','')} · {kind_lbl}"
+            if f.get("placeholder"):
+                ph = f["placeholder"]
+                sub += f' · "{ph[:40] + ("…" if len(ph) > 40 else "")}"'
+            li = QListWidgetItem(label + "  ·  " + sub)
+            li.setData(Qt.ItemDataRole.UserRole, f.get("key"))
+            self._fields_list.addItem(li)
+
+    def _selected_field_index(self) -> int:
+        li = self._fields_list.currentItem()
+        if li is None:
+            return -1
+        key = li.data(Qt.ItemDataRole.UserRole)
+        for i, f in enumerate(self._fields):
+            if f.get("key") == key:
+                return i
+        return -1
+
+    def _add_field(self):
+        dlg = _FieldEditorDialog(self)
+        if not dlg.exec():
+            return
+        new = dlg.values()
+        # Avoid duplicate keys.
+        existing_keys = {f["key"] for f in self._fields}
+        base = new["key"]
+        i = 2
+        while new["key"] in existing_keys:
+            new["key"] = f"{base}_{i}"
+            i += 1
+        self._fields.append(new)
+        self._refresh_fields_list()
+
+    def _edit_field(self):
+        idx = self._selected_field_index()
+        if idx < 0:
+            tooltip("Pick a field first.")
+            return
+        dlg = _FieldEditorDialog(self, existing=self._fields[idx])
+        if not dlg.exec():
+            return
+        self._fields[idx] = dlg.values()
+        self._refresh_fields_list()
+
+    def _remove_field(self):
+        idx = self._selected_field_index()
+        if idx < 0:
+            tooltip("Pick a field first.")
+            return
+        from aqt.utils import askUser
+        if not askUser(
+            f"Remove field '{self._fields[idx].get('label', '')}'?\n\n"
+            "Existing KGs that have data for this key keep it in storage — "
+            "it just won't show in the editor any more.",
+            defaultno=True,
+        ):
+            return
+        self._fields.pop(idx)
+        self._refresh_fields_list()
+
+    def _move_field(self, delta: int):
+        idx = self._selected_field_index()
+        if idx < 0:
+            return
+        target = idx + delta
+        if target < 0 or target >= len(self._fields):
+            return
+        self._fields[idx], self._fields[target] = self._fields[target], self._fields[idx]
+        self._refresh_fields_list()
+        self._fields_list.setCurrentRow(target)
+
     def values(self, fallback_key: str = "") -> dict:
         name = self._name.text().strip()
         return {
@@ -944,6 +1139,7 @@ class _TypeEditorDialog(QDialog):
             "name":        name,
             "color":       self._color.text().strip() or "#6b7280",
             "description": self._description.toPlainText().strip(),
+            "fields":      [dict(f) for f in self._fields],
         }
 
 
@@ -1039,6 +1235,8 @@ class _KnowledgeGapsTab(QWidget):
             label = f"  ●  {t.get('name', '')}    "
             sub = []
             sub.append(f"key={t.get('key','')}")
+            nf = len(t.get("fields") or [])
+            sub.append(f"{nf} field{'s' if nf != 1 else ''}")
             if t.get("description"):
                 d = t["description"]
                 sub.append(d[:60] + ("…" if len(d) > 60 else ""))

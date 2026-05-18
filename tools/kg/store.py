@@ -78,8 +78,18 @@ def _default_type_for_source(source: str) -> str:
     return {"qbank": "mq", "analyse": "lo"}.get(source, "kg")
 
 
+LEGACY_FIELD_KEYS = (
+    "notes", "stem_html", "system", "subsystem", "topic",
+    "platform", "lo", "lo_tag",
+)
+
+
 def _normalise(item: dict) -> dict:
-    """Fill in defaults / coerce types so callers can pass partial dicts."""
+    """Fill in defaults / coerce types so callers can pass partial dicts.
+
+    Type-specific content lives in `fields: {key: value}`. Legacy top-level
+    keys (notes, stem_html, system, ...) get promoted into `fields` on read
+    so older entries continue to display."""
     out = dict(item)
     out.setdefault("id", uuid.uuid4().hex[:12])
     out["title"] = str(out.get("title", "")).strip()
@@ -93,16 +103,33 @@ def _normalise(item: dict) -> dict:
     if not tp:
         tp = _default_type_for_source(out["source"])
     out["type"] = tp
-    out["notes"] = str(out.get("notes", "") or "")
+
     tags = out.get("tags") or []
     out["tags"] = [str(t).strip() for t in tags if str(t).strip()]
-    out["system"]    = str(out.get("system", "") or "").strip()
-    out["subsystem"] = str(out.get("subsystem", "") or "").strip()
-    out["topic"]     = str(out.get("topic", "") or "").strip()
-    out["stem_html"] = str(out.get("stem_html", "") or "")
-    out["platform"]  = str(out.get("platform", "") or "")
-    out["lo"]        = str(out.get("lo", "") or "")
-    out["lo_tag"]    = str(out.get("lo_tag", "") or "")
+
+    # Fields blob — promote legacy top-level keys.
+    fields = dict(out.get("fields") or {})
+    for legacy in LEGACY_FIELD_KEYS:
+        if legacy in out:
+            val = out.pop(legacy)
+            if legacy not in fields and val not in (None, "", []):
+                fields[legacy] = val
+    # Coerce every value to a string for storage. Lists/dicts are JSON-
+    # serialised so they round-trip; we keep resources as a separate list.
+    cleaned_fields = {}
+    for k, v in fields.items():
+        key = str(k).strip()
+        if not key:
+            continue
+        if isinstance(v, (list, dict)):
+            cleaned_fields[key] = v
+        elif v is None:
+            cleaned_fields[key] = ""
+        else:
+            cleaned_fields[key] = str(v)
+    out["fields"] = cleaned_fields
+
+    # Resources stays top-level (it's a list of dicts, used regardless of type).
     resources = out.get("resources") or []
     cleaned: list[dict] = []
     for r in resources:
@@ -113,9 +140,21 @@ def _normalise(item: dict) -> dict:
         if label or url:
             cleaned.append({"label": label, "url": url})
     out["resources"] = cleaned
+
     out.setdefault("created_at", _now())
     out["updated_at"] = _now()
     return out
+
+
+def field(kg: dict, key: str, default: str = "") -> str:
+    """Return a field value, supporting both new `fields[key]` and legacy
+    top-level keys. Read-only — callers should write into `fields/`."""
+    fields = kg.get("fields") or {}
+    val = fields.get(key)
+    if val in (None, ""):
+        # Backward-compat: legacy entries that haven't been normalised yet.
+        val = kg.get(key, default)
+    return val if val is not None else default
 
 
 # ── CRUD ─────────────────────────────────────────────────────────────────────
@@ -211,16 +250,17 @@ def migrate_from_missed_queue() -> int:
             "source":     "qbank",
             "type":       "mq",
             "status":     "open",
-            "notes":      "",
-            "stem_html":  stem,
-            "system":     str(old.get("system", "") or ""),
-            "subsystem":  str(old.get("subsystem", "") or ""),
-            "topic":      str(old.get("topic", "") or ""),
-            "platform":   str(old.get("platform", "") or ""),
             "tags":       [],
             "resources":  [],
-            "lo":         "",
-            "lo_tag":     "",
+            "fields": {
+                "concept":   concept,
+                "stem_html": stem,
+                "system":    str(old.get("system", "") or ""),
+                "subsystem": str(old.get("subsystem", "") or ""),
+                "topic":     str(old.get("topic", "") or ""),
+                "platform":  str(old.get("platform", "") or ""),
+                "notes":     "",
+            },
             "created_at": str(old.get("captured_at") or _now()),
         })
 

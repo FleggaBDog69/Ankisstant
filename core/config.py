@@ -75,14 +75,51 @@ DEFAULTS: dict = {
             #   name        — display label
             #   color       — hex string for the badge background
             #   description — long-form help text shown in the type picker
+            #   fields      — list of {key, label, kind, placeholder} defining
+            #                 the schema for KGs of this type. `kind` is one of
+            #                 text | longtext | html | url | tag.
             # Users can add/edit/delete these in Ankisstant Settings → Knowledge Gaps.
             "types": [
-                {"key": "mq", "name": "MQ", "color": "#b45309",
-                 "description": "Missed question — captured from a QBank or recall."},
-                {"key": "kg", "name": "KG", "color": "#6b7280",
-                 "description": "Knowledge gap — anything you don't know yet."},
-                {"key": "lo", "name": "LO", "color": "#9333ea",
-                 "description": "Learning objective — a curriculum statement not yet covered."},
+                {
+                    "key": "mq", "name": "MQ", "color": "#b45309",
+                    "description": "Missed question — captured from a QBank or recall.",
+                    "fields": [
+                        {"key": "concept",   "label": "Concept missed",  "kind": "text",
+                         "placeholder": "e.g. digoxin toxicity worsened by hypokalaemia"},
+                        {"key": "stem_html", "label": "Question stem",   "kind": "html",
+                         "placeholder": "Paste text or a screenshot (Cmd/Ctrl+V)"},
+                        {"key": "system",    "label": "System",          "kind": "text",
+                         "placeholder": "e.g. Cardio"},
+                        {"key": "subsystem", "label": "Subsystem",       "kind": "text",
+                         "placeholder": "e.g. Arrhythmia"},
+                        {"key": "topic",     "label": "Topic",           "kind": "text",
+                         "placeholder": "e.g. Digoxin"},
+                        {"key": "platform",  "label": "QBank source",    "kind": "text",
+                         "placeholder": "e.g. AMBOSS, eMedici"},
+                        {"key": "notes",     "label": "Notes",           "kind": "longtext",
+                         "placeholder": "Optional context, mnemonic, why you got it wrong"},
+                    ],
+                },
+                {
+                    "key": "kg", "name": "KG", "color": "#6b7280",
+                    "description": "Knowledge gap — anything you don't know yet.",
+                    "fields": [
+                        {"key": "notes",     "label": "Notes",           "kind": "longtext",
+                         "placeholder": "What specifically don't you know?"},
+                    ],
+                },
+                {
+                    "key": "lo", "name": "LO", "color": "#9333ea",
+                    "description": "Learning objective — a curriculum statement not yet covered.",
+                    "fields": [
+                        {"key": "lo",        "label": "Learning objective", "kind": "longtext",
+                         "placeholder": "Paste the LO verbatim from the curriculum"},
+                        {"key": "lo_tag",    "label": "Anki tag for LO",    "kind": "tag",
+                         "placeholder": "School::Year3::Cardio::BetaBlockers"},
+                        {"key": "notes",     "label": "Notes",              "kind": "longtext",
+                         "placeholder": "What part of the LO isn't covered yet?"},
+                    ],
+                },
             ],
         },
         "card_creator": {

@@ -100,7 +100,9 @@ def _short_date(iso: str) -> str:
 
 
 def _format_levels(kg: dict) -> str:
-    levels = [kg.get("system", ""), kg.get("subsystem", ""), kg.get("topic", "")]
+    levels = [kg_store.field(kg, "system"),
+              kg_store.field(kg, "subsystem"),
+              kg_store.field(kg, "topic")]
     return " :: ".join(l for l in levels if l)
 
 
@@ -302,33 +304,17 @@ class KGDetailPane(QWidget):
         tag_row.addWidget(self._tags_input, 1)
         root.addLayout(tag_row)
 
-        # System / Subsystem / Topic (hidden when all blank)
-        self._levels_box = QFrame()
-        lv = QHBoxLayout(self._levels_box)
-        lv.setContentsMargins(0, 0, 0, 0)
-        lv.setSpacing(4)
-        self._system    = QLineEdit(); self._system.setPlaceholderText("System")
-        self._subsystem = QLineEdit(); self._subsystem.setPlaceholderText("Subsystem")
-        self._topic     = QLineEdit(); self._topic.setPlaceholderText("Topic")
-        lv.addWidget(QLabel("Path:"))
-        lv.addWidget(self._system)
-        lv.addWidget(self._subsystem)
-        lv.addWidget(self._topic)
-        root.addWidget(self._levels_box)
-
-        # Stem preview (only for KGs with captured stems)
-        self._stem_label = QLabel("<b>Captured stem</b>")
-        self._stem_view = QTextEdit()
-        self._stem_view.setReadOnly(True)
-        self._stem_view.setMaximumHeight(170)
-        root.addWidget(self._stem_label)
-        root.addWidget(self._stem_view)
-
-        # Notes
-        root.addWidget(QLabel("<b>Notes</b>"))
-        self._notes = QPlainTextEdit()
-        self._notes.setMinimumHeight(70)
-        root.addWidget(self._notes)
+        # ── Dynamic schema-driven fields container ───────────────────────────
+        # Built from the active type's `fields` list. Each entry yields a
+        # widget keyed by its field key; values round-trip through kg["fields"].
+        self._schema_container = QWidget()
+        self._schema_layout = QVBoxLayout(self._schema_container)
+        self._schema_layout.setContentsMargins(0, 0, 0, 0)
+        self._schema_layout.setSpacing(6)
+        self._schema_widgets: dict[str, dict] = {}  # key -> {widget, kind, getter, setter}
+        root.addWidget(self._schema_container)
+        # Rebuild whenever the type combo changes (preserves overlapping keys).
+        self._type.currentIndexChanged.connect(self._on_type_changed)
 
         # Resources
         self._res_box = QGroupBox("Resources")
@@ -430,27 +416,11 @@ class KGDetailPane(QWidget):
         self._status.setCurrentIndex(idx if idx >= 0 else 0)
 
         self._tags_input.setText(" ".join(kg.get("tags", [])))
-        self._system.setText(kg.get("system", ""))
-        self._subsystem.setText(kg.get("subsystem", ""))
-        self._topic.setText(kg.get("topic", ""))
-
-        has_levels = bool(kg.get("system") or kg.get("subsystem") or kg.get("topic")
-                          or source == "qbank")
-        self._levels_box.setVisible(has_levels)
 
         self._created_lbl.setText(f"added {_short_date(kg.get('created_at', ''))}")
 
-        stem = kg.get("stem_html", "") or ""
-        has_stem = bool(stem.strip())
-        self._stem_label.setVisible(has_stem)
-        self._stem_view.setVisible(has_stem)
-        if has_stem:
-            if "<" in stem:
-                self._stem_view.setHtml(stem)
-            else:
-                self._stem_view.setPlainText(stem)
-
-        self._notes.setPlainText(kg.get("notes", "") or "")
+        # Build schema-driven fields from the KG's current type.
+        self._rebuild_schema_for_type(type_key, kg=kg)
 
         # Resources
         self._clear_resource_rows()
@@ -464,11 +434,157 @@ class KGDetailPane(QWidget):
 
     def _set_widgets_visible(self, visible: bool) -> None:
         for w in (self._title_input, self._type, self._source_lbl, self._status,
-                  self._created_lbl, self._tags_input, self._levels_box,
-                  self._stem_label, self._stem_view, self._notes,
+                  self._created_lbl, self._tags_input, self._schema_container,
                   self._res_box, self._browse_btn, self._create_btn,
                   self._delete_btn, self._save_btn):
             w.setVisible(visible)
+
+    # ── schema-driven fields ─────────────────────────────────────────────────
+
+    def _schema_for_type(self, type_key: str) -> list[dict]:
+        for t in _load_types():
+            if t["key"] == type_key:
+                fields = t.get("fields") or []
+                # Coerce + de-duplicate.
+                seen: set[str] = set()
+                out: list[dict] = []
+                for spec in fields:
+                    if not isinstance(spec, dict):
+                        continue
+                    key = str(spec.get("key", "")).strip()
+                    if not key or key in seen:
+                        continue
+                    seen.add(key)
+                    out.append({
+                        "key":         key,
+                        "label":       str(spec.get("label", key)),
+                        "kind":        str(spec.get("kind", "text")).lower(),
+                        "placeholder": str(spec.get("placeholder", "")),
+                    })
+                return out
+        # Unknown type — no schema beyond a generic notes field.
+        return [{"key": "notes", "label": "Notes", "kind": "longtext",
+                 "placeholder": ""}]
+
+    def _on_type_changed(self, _idx: int) -> None:
+        if self._current is None:
+            return
+        # Persist current values to a stash keyed by field key so values
+        # survive a type switch where keys overlap.
+        prev_values = self._collect_schema_fields()
+        new_type = self._type.currentData() or "kg"
+        merged = dict(self._current.get("fields") or {})
+        merged.update(prev_values)
+        # Build with merged values so overlapping keys keep what was typed.
+        pseudo_kg = {"fields": merged}
+        self._rebuild_schema_for_type(new_type, kg=pseudo_kg)
+
+    def _rebuild_schema_for_type(self, type_key: str, kg: dict | None = None) -> None:
+        # Tear down existing widgets.
+        while self._schema_layout.count():
+            it = self._schema_layout.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.deleteLater()
+        self._schema_widgets = {}
+
+        schema = self._schema_for_type(type_key)
+        if not schema:
+            empty = QLabel("<i>This type has no fields configured. Edit it in "
+                           "Settings → Knowledge Gaps to add some.</i>")
+            empty.setTextFormat(Qt.TextFormat.RichText)
+            empty.setStyleSheet("color: gray; font-size: 11px;")
+            empty.setWordWrap(True)
+            self._schema_layout.addWidget(empty)
+            return
+
+        existing_values = (kg or {}).get("fields") or {}
+        # Legacy fallback — if old top-level keys exist on the KG dict and the
+        # store hasn't normalised yet, surface those too.
+        if kg is not None and not existing_values:
+            for legacy in ("notes", "stem_html", "system", "subsystem", "topic",
+                           "platform", "lo", "lo_tag"):
+                if kg.get(legacy):
+                    existing_values[legacy] = kg[legacy]
+
+        for spec in schema:
+            row, getter, setter = self._build_field_widget(spec)
+            label_text = spec["label"]
+            kind = spec["kind"]
+            label = QLabel(f"<b>{label_text}</b>")
+            label.setTextFormat(Qt.TextFormat.RichText)
+            self._schema_layout.addWidget(label)
+            self._schema_layout.addWidget(row)
+            self._schema_widgets[spec["key"]] = {
+                "kind":   kind,
+                "widget": row,
+                "getter": getter,
+                "setter": setter,
+            }
+            # Pre-fill from existing values.
+            val = existing_values.get(spec["key"], "")
+            if val:
+                try:
+                    setter(val)
+                except Exception as e:
+                    print(f"[ankisstant] set field {spec['key']!r}: {e}")
+
+    def _build_field_widget(self, spec: dict):
+        """Return (widget, getter, setter) for the given field spec."""
+        kind = spec["kind"]
+        ph   = spec.get("placeholder", "")
+        if kind == "html":
+            # Reuse the screenshot-aware editor from QBank capture.
+            from .qbank.capture_dialog import _StemEdit
+            w = _StemEdit()
+            w.setAcceptRichText(True)
+            w.setPlaceholderText(ph or "Paste text or a screenshot (Cmd/Ctrl+V)")
+            w.setMinimumHeight(110)
+            return w, (lambda: ("" if w.is_empty() else w.get_html())), \
+                      (lambda v: w.setHtml(v) if v else w.clear())
+        if kind == "longtext":
+            w = QPlainTextEdit()
+            w.setPlaceholderText(ph)
+            w.setMinimumHeight(60)
+            return w, (lambda: w.toPlainText().strip()), \
+                      (lambda v: w.setPlainText(str(v) if v is not None else ""))
+        if kind == "url":
+            w = QWidget()
+            h = QHBoxLayout(w)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(4)
+            le = QLineEdit()
+            le.setPlaceholderText(ph or "https://…")
+            open_btn = QPushButton("Open")
+            open_btn.setFixedWidth(58)
+            open_btn.setAutoDefault(False)
+            open_btn.clicked.connect(lambda _c=False, e=le: self._open_url(e.text()))
+            h.addWidget(le, 1)
+            h.addWidget(open_btn)
+            return w, (lambda: le.text().strip()), \
+                      (lambda v: le.setText(str(v) if v is not None else ""))
+        if kind == "tag":
+            w = QLineEdit()
+            w.setPlaceholderText(ph or "School::Year3::…")
+            attach_tag_completer(w, multi=False)
+            return w, (lambda: w.text().strip()), \
+                      (lambda v: w.setText(str(v) if v is not None else ""))
+        # Default: text
+        w = QLineEdit()
+        w.setPlaceholderText(ph)
+        return w, (lambda: w.text().strip()), \
+                  (lambda v: w.setText(str(v) if v is not None else ""))
+
+    def _collect_schema_fields(self) -> dict:
+        out: dict = {}
+        for key, info in self._schema_widgets.items():
+            try:
+                val = info["getter"]()
+            except Exception:
+                val = ""
+            if val:
+                out[key] = val
+        return out
 
     # ── resources ────────────────────────────────────────────────────────────
 
@@ -544,11 +660,12 @@ class KGDetailPane(QWidget):
         kg["type"]      = self._type.currentData() or kg.get("type", "kg")
         kg["status"]    = self._status.currentData() or "open"
         kg["tags"]      = [t for t in self._tags_input.text().split() if t.strip()]
-        kg["system"]    = self._system.text().strip()
-        kg["subsystem"] = self._subsystem.text().strip()
-        kg["topic"]     = self._topic.text().strip()
-        kg["notes"]     = self._notes.toPlainText().strip()
+        kg["fields"]    = self._collect_schema_fields()
         kg["resources"] = self._collect_resources()
+        # Strip legacy top-level keys so they don't shadow the new fields dict.
+        for legacy in ("notes", "stem_html", "system", "subsystem", "topic",
+                       "platform", "lo", "lo_tag"):
+            kg.pop(legacy, None)
         return kg
 
     def _save(self) -> None:
@@ -607,12 +724,18 @@ class KGDetailPane(QWidget):
         if not hasattr(main, "gap_queue"):
             showWarning("Open the KG page from Tools → Ankisstant first.")
             return
-        # Push as a richer dict so Create can use the stem as supplemental context.
+        # Pull supplemental context out of the type-specific fields blob.
+        stem_html = kg_store.field(kg, "stem_html")
+        notes_bits = []
+        for k in ("notes", "concept", "lo"):
+            v = kg_store.field(kg, k)
+            if v:
+                notes_bits.append(v)
         item = {
             "title":     kg.get("title", ""),
             "kg_id":     kg.get("id", ""),
-            "stem_html": kg.get("stem_html", "") or None,
-            "notes":     kg.get("notes", "") or None,
+            "stem_html": stem_html or None,
+            "notes":     "\n\n".join(notes_bits) or None,
         }
         main.gap_queue.append(item)
         if hasattr(main, "refresh_queue_badge"):
