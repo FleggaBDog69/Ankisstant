@@ -39,10 +39,10 @@ NAME = "Knowledge Gaps"
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 SOURCE_LABELS = {
-    "manual":  ("Manual",   "#6b7280"),
-    "analyse": ("Analyse",  "#9333ea"),
-    "qbank":   ("QBank",    "#b45309"),
-    "browse":  ("Browse",   "#0284c7"),
+    "manual":  "Manual",
+    "analyse": "Analyse",
+    "qbank":   "QBank",
+    "browse":  "Browse",
 }
 
 STATUS_LABELS = {
@@ -51,6 +51,48 @@ STATUS_LABELS = {
     "done":        "Done",
     "dismissed":   "Dismissed",
 }
+
+
+def _load_types() -> list[dict]:
+    """Return the configured KG types. Always includes at least the three
+    factory defaults if a user has wiped the list."""
+    cfg = tool_config("knowledge_gaps")
+    types = cfg.get("types") or []
+    cleaned: list[dict] = []
+    for t in types:
+        if not isinstance(t, dict):
+            continue
+        key = str(t.get("key", "") or "").strip().lower()
+        name = str(t.get("name", "") or "").strip()
+        if not key or not name:
+            continue
+        cleaned.append({
+            "key":         key,
+            "name":        name,
+            "color":       str(t.get("color", "") or "#6b7280"),
+            "description": str(t.get("description", "") or ""),
+        })
+    if not cleaned:
+        cleaned = [
+            {"key": "mq", "name": "MQ", "color": "#b45309",
+             "description": "Missed question."},
+            {"key": "kg", "name": "KG", "color": "#6b7280",
+             "description": "Knowledge gap."},
+            {"key": "lo", "name": "LO", "color": "#9333ea",
+             "description": "Learning objective."},
+        ]
+    return cleaned
+
+
+def _type_meta(key: str) -> dict:
+    """Lookup a type by key, falling back to a muted '(removed)' shim so
+    KGs that reference a deleted type still render."""
+    key = (key or "").strip().lower()
+    for t in _load_types():
+        if t["key"] == key:
+            return t
+    return {"key": key or "?", "name": f"({key or '?'})",
+            "color": "#9ca3af", "description": "Type removed from settings."}
 
 
 def _short_date(iso: str) -> str:
@@ -81,6 +123,22 @@ class AddKGDialog(QDialog):
         self._title = QLineEdit()
         self._title.setPlaceholderText("e.g. mechanism of digoxin toxicity in hypokalaemia")
         layout.addWidget(self._title)
+
+        type_row = QHBoxLayout()
+        type_row.addWidget(QLabel("<b>Type</b>"))
+        self._type = QComboBox()
+        for t in _load_types():
+            self._type.addItem(t["name"], t["key"])
+            self._type.setItemData(self._type.count() - 1,
+                                   t.get("description", ""), Qt.ItemDataRole.ToolTipRole)
+        # Default to the configured default_type_on_add (falls back to first).
+        cfg = tool_config("knowledge_gaps")
+        default_type = (cfg.get("default_type_on_add") or "kg").lower()
+        idx = self._type.findData(default_type)
+        if idx >= 0:
+            self._type.setCurrentIndex(idx)
+        type_row.addWidget(self._type, 1)
+        layout.addLayout(type_row)
 
         layout.addWidget(QLabel("<b>Tags</b> <span style='color:gray;font-size:10px'>"
                                 "(space-separated; optional)</span>"))
@@ -115,9 +173,11 @@ class AddKGDialog(QDialog):
             return
         tags = [t for t in self._tags.text().split() if t.strip()]
         notes = self._notes.toPlainText().strip()
+        kg_type = self._type.currentData() or "kg"
         kg_store.add(
             title=title,
             source="manual",
+            type=kg_type,
             status="open",
             tags=tags,
             notes=notes,
@@ -150,15 +210,33 @@ class _KGListItem(QListWidgetItem):
         self.refresh(kg)
 
     def refresh(self, kg: dict) -> None:
-        source_label, _color = SOURCE_LABELS.get(kg.get("source", "manual"),
-                                                 ("?", "#888"))
-        status_label = STATUS_LABELS.get(kg.get("status", "open"), "Open")
+        from aqt.qt import QBrush, QColor, QFont
+        source_label = SOURCE_LABELS.get(kg.get("source", "manual"), "?")
+        type_meta = _type_meta(kg.get("type", "kg"))
+        status = kg.get("status", "open")
+        status_label = STATUS_LABELS.get(status, "Open")
         title = kg.get("title", "(untitled)") or "(untitled)"
-        text = f"{title}"
-        if len(text) > 70:
-            text = text[:70].rstrip() + "…"
+        # Prefix the title with a compact type tag for at-a-glance scanning.
+        text = f"[{type_meta['name']}]  {title}"
+        if len(text) > 80:
+            text = text[:80].rstrip() + "…"
         self.setText(text)
+
+        # Grey done / dismissed items so they stay visible but recede.
+        if status in ("done", "dismissed"):
+            brush = QBrush(QColor(150, 150, 150))
+            self.setForeground(brush)
+            f = QFont(self.font())
+            f.setItalic(True)
+            self.setFont(f)
+        else:
+            # Reset to default if a previously-done item flipped back to open.
+            self.setData(Qt.ItemDataRole.ForegroundRole, None)
+            self.setFont(QFont())
+
         tt_lines = [
+            f"Type: {type_meta['name']}" + (f" — {type_meta['description']}"
+                                            if type_meta.get('description') else ""),
             f"Source: {source_label}",
             f"Status: {status_label}",
         ]
@@ -195,15 +273,20 @@ class KGDetailPane(QWidget):
         root.addWidget(self._title_input)
 
         meta_row = QHBoxLayout()
-        self._source_badge = QLabel("")
-        self._source_badge.setTextFormat(Qt.TextFormat.RichText)
-        meta_row.addWidget(self._source_badge)
+        meta_row.addWidget(QLabel("Type:"))
+        self._type = QComboBox()
+        self._rebuild_type_combo()
+        meta_row.addWidget(self._type)
         meta_row.addSpacing(8)
         meta_row.addWidget(QLabel("Status:"))
         self._status = QComboBox()
         for key, label in STATUS_LABELS.items():
             self._status.addItem(label, key)
         meta_row.addWidget(self._status)
+        meta_row.addSpacing(8)
+        self._source_lbl = QLabel("")
+        self._source_lbl.setStyleSheet("color: gray; font-size: 11px;")
+        meta_row.addWidget(self._source_lbl)
         meta_row.addStretch(1)
         self._created_lbl = QLabel("")
         self._created_lbl.setStyleSheet("color: gray; font-size: 11px;")
@@ -294,6 +377,23 @@ class KGDetailPane(QWidget):
 
         self._clear()
 
+    def _rebuild_type_combo(self) -> None:
+        """Refresh the dropdown items from current config (called on load and
+        after settings save)."""
+        prev = self._type.currentData() if self._type.count() else None
+        self._type.blockSignals(True)
+        self._type.clear()
+        for t in _load_types():
+            self._type.addItem(t["name"], t["key"])
+            self._type.setItemData(self._type.count() - 1,
+                                   t.get("description", ""),
+                                   Qt.ItemDataRole.ToolTipRole)
+        if prev is not None:
+            idx = self._type.findData(prev)
+            if idx >= 0:
+                self._type.setCurrentIndex(idx)
+        self._type.blockSignals(False)
+
     # ── state ────────────────────────────────────────────────────────────────
 
     def load(self, kg: dict | None) -> None:
@@ -306,12 +406,24 @@ class KGDetailPane(QWidget):
 
         self._title_input.setText(kg.get("title", ""))
 
+        # Type combo — may have changed since panel was built.
+        self._rebuild_type_combo()
+        type_key = kg.get("type", "kg")
+        idx = self._type.findData(type_key)
+        if idx < 0:
+            # Type has been deleted from settings — show a sentinel so the
+            # selection isn't silently coerced to the first entry.
+            meta = _type_meta(type_key)
+            self._type.addItem(meta["name"], type_key)
+            idx = self._type.count() - 1
+            self._type.setItemData(idx, "Type removed from settings",
+                                   Qt.ItemDataRole.ToolTipRole)
+        self._type.setCurrentIndex(idx)
+
         source = kg.get("source", "manual")
-        label, color = SOURCE_LABELS.get(source, ("?", "#888"))
-        self._source_badge.setText(
-            f"<span style='background:{color};color:white;padding:2px 6px;"
-            f"border-radius:4px;font-size:10px;'>{label}</span>"
-        )
+        source_label = SOURCE_LABELS.get(source, "?")
+        self._source_lbl.setText(f"from <i>{source_label}</i>")
+        self._source_lbl.setTextFormat(Qt.TextFormat.RichText)
 
         status = kg.get("status", "open")
         idx = self._status.findData(status)
@@ -351,7 +463,7 @@ class KGDetailPane(QWidget):
         self._empty_lbl.setVisible(True)
 
     def _set_widgets_visible(self, visible: bool) -> None:
-        for w in (self._title_input, self._source_badge, self._status,
+        for w in (self._title_input, self._type, self._source_lbl, self._status,
                   self._created_lbl, self._tags_input, self._levels_box,
                   self._stem_label, self._stem_view, self._notes,
                   self._res_box, self._browse_btn, self._create_btn,
@@ -429,6 +541,7 @@ class KGDetailPane(QWidget):
     def _gather(self) -> dict:
         kg = dict(self._current or {})
         kg["title"]     = self._title_input.text().strip()
+        kg["type"]      = self._type.currentData() or kg.get("type", "kg")
         kg["status"]    = self._status.currentData() or "open"
         kg["tags"]      = [t for t in self._tags_input.text().split() if t.strip()]
         kg["system"]    = self._system.text().strip()
@@ -512,22 +625,22 @@ class KGDetailPane(QWidget):
 
 # ── Main panel ───────────────────────────────────────────────────────────────
 
-_FILTERS = [
+_STATUS_FILTERS = [
+    ("active",   "Active"),     # open + in_progress + done (greyed)
     ("all",      "All"),
     ("open",     "Open"),
     ("in_progress", "In Progress"),
-    ("manual",   "Manual"),
-    ("analyse",  "Analyse"),
-    ("qbank",    "QBank"),
-    ("browse",   "Browse"),
     ("done",     "Done"),
+    ("dismissed", "Dismissed"),
 ]
 
 
 class KnowledgeGapsPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._filter = "open"
+        # Default to Active so newly-done items stay visible (greyed) until
+        # the user explicitly hits Clear completed.
+        self._filter = "active"
         self._build()
         self.refresh_list()
 
@@ -573,27 +686,15 @@ class KnowledgeGapsPanel(QWidget):
         intro.setWordWrap(True)
         root.addWidget(intro)
 
-        # Filter chips
-        chip_row = QHBoxLayout()
-        chip_row.setSpacing(4)
+        # Filter chips — two rows: status filters on top, type filters below.
         self._chip_buttons: dict[str, QPushButton] = {}
-        for key, label in _FILTERS:
-            btn = QPushButton(label)
-            btn.setCheckable(True)
-            btn.setAutoExclusive(True)
-            btn.setMinimumHeight(24)
-            btn.setStyleSheet(
-                "QPushButton { padding: 2px 10px; font-size: 11px; border: 1px solid rgba(127,127,127,0.3); "
-                "border-radius: 12px; background: transparent; }"
-                "QPushButton:checked { background: palette(highlight); color: palette(highlighted-text); }"
-                "QPushButton:hover:!checked { background: rgba(127,127,127,0.12); }"
-            )
-            btn.clicked.connect(lambda _c=False, k=key: self._set_filter(k))
-            chip_row.addWidget(btn)
-            self._chip_buttons[key] = btn
-        chip_row.addStretch(1)
-        self._chip_buttons[self._filter].setChecked(True)
-        root.addLayout(chip_row)
+        self._status_chip_row = self._make_chip_row(root, _STATUS_FILTERS)
+        # Types row is rebuilt on every settings save (see refresh_chips).
+        self._type_chip_row_holder = QHBoxLayout()
+        root.addLayout(self._type_chip_row_holder)
+        self._rebuild_type_chip_row()
+        if self._filter in self._chip_buttons:
+            self._chip_buttons[self._filter].setChecked(True)
 
         # Splitter: list / detail
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -627,6 +728,20 @@ class KnowledgeGapsPanel(QWidget):
         btn_row.addStretch(1)
         btn_row.addWidget(refresh_btn)
         lcol.addLayout(btn_row)
+
+        # Clear-completed row — sits below add/analyse so it's out of the way.
+        clear_row = QHBoxLayout()
+        self._clear_btn = QPushButton("Clear completed (0)")
+        self._clear_btn.setAutoDefault(False)
+        self._clear_btn.setStyleSheet("font-size: 11px;")
+        self._clear_btn.setToolTip(
+            "Remove every KG with status Done or Dismissed. "
+            "Other items stay where they are."
+        )
+        self._clear_btn.clicked.connect(self._on_clear_completed)
+        clear_row.addWidget(self._clear_btn)
+        clear_row.addStretch(1)
+        lcol.addLayout(clear_row)
         splitter.addWidget(left)
 
         # Right side
@@ -640,6 +755,76 @@ class KnowledgeGapsPanel(QWidget):
         splitter.setSizes([280, 620])
         root.addWidget(splitter, 1)
 
+    # ── chip rows ────────────────────────────────────────────────────────────
+
+    def _make_chip_row(self, parent_layout, entries) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        for entry in entries:
+            self._add_chip(row, entry)
+        row.addStretch(1)
+        parent_layout.addLayout(row)
+        return row
+
+    def _add_chip(self, row, entry) -> None:
+        # entry = (key, label)  OR (key, label, color)
+        if len(entry) == 3:
+            key, label, color = entry
+        else:
+            key, label = entry
+            color = None
+        btn = QPushButton(label)
+        btn.setCheckable(True)
+        btn.setAutoExclusive(True)
+        btn.setMinimumHeight(24)
+        if color:
+            btn.setStyleSheet(
+                f"QPushButton {{ padding: 2px 10px; font-size: 11px; "
+                f"border: 1px solid {color}; border-radius: 12px; "
+                f"background: transparent; color: {color}; }}"
+                f"QPushButton:checked {{ background: {color}; color: white; }}"
+                f"QPushButton:hover:!checked {{ background: rgba(127,127,127,0.12); }}"
+            )
+        else:
+            btn.setStyleSheet(
+                "QPushButton { padding: 2px 10px; font-size: 11px; "
+                "border: 1px solid rgba(127,127,127,0.3); border-radius: 12px; "
+                "background: transparent; }"
+                "QPushButton:checked { background: palette(highlight); color: palette(highlighted-text); }"
+                "QPushButton:hover:!checked { background: rgba(127,127,127,0.12); }"
+            )
+        btn.clicked.connect(lambda _c=False, k=key: self._set_filter(k))
+        row.addWidget(btn)
+        self._chip_buttons[key] = btn
+
+    def _rebuild_type_chip_row(self) -> None:
+        # Clear out any existing type chips first.
+        for key in list(self._chip_buttons.keys()):
+            if key.startswith("type:"):
+                btn = self._chip_buttons.pop(key)
+                btn.setParent(None)
+                btn.deleteLater()
+        # Strip the prior row's items.
+        while self._type_chip_row_holder.count():
+            item = self._type_chip_row_holder.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        # Build fresh row.
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        prefix_label = QLabel("Types:")
+        prefix_label.setStyleSheet("color: gray; font-size: 11px;")
+        # Wrap in a widget so we can put it inside the holder layout.
+        from aqt.qt import QWidget as _QW
+        wrapper = _QW()
+        wrapper.setLayout(row)
+        row.addWidget(prefix_label)
+        for t in _load_types():
+            self._add_chip(row, (f"type:{t['key']}", t["name"], t["color"]))
+        row.addStretch(1)
+        self._type_chip_row_holder.addWidget(wrapper)
+
     # ── filters / list ───────────────────────────────────────────────────────
 
     def refresh_setup_banner(self) -> None:
@@ -650,10 +835,18 @@ class KnowledgeGapsPanel(QWidget):
 
     def set_filter(self, key: str) -> None:
         """Programmatic filter switch (used by QBank's Review button)."""
-        if key not in self._chip_buttons:
+        # Translate legacy/short keys: source names → type keys, where it
+        # makes sense.
+        translated = {
+            "qbank":   "type:mq",
+            "analyse": "type:lo",
+            "manual":  "type:kg",
+            "browse":  "all",
+        }.get(key, key)
+        if translated not in self._chip_buttons:
             return
-        self._chip_buttons[key].setChecked(True)
-        self._set_filter(key)
+        self._chip_buttons[translated].setChecked(True)
+        self._set_filter(translated)
 
     def _set_filter(self, key: str) -> None:
         self._filter = key
@@ -661,31 +854,37 @@ class KnowledgeGapsPanel(QWidget):
 
     def _matches_filter(self, kg: dict) -> bool:
         f = self._filter
+        status = kg.get("status", "open")
         if f == "all":
             return True
-        if f in ("manual", "analyse", "qbank", "browse"):
-            return kg.get("source") == f
-        if f in ("open", "in_progress", "done"):
-            return kg.get("status") == f
+        if f == "active":
+            # Active = anything not dismissed. Done items show greyed at the
+            # bottom; they don't disappear until the user hits Clear completed.
+            return status != "dismissed"
+        if f in ("open", "in_progress", "done", "dismissed"):
+            return status == f
+        if f.startswith("type:"):
+            return kg.get("type", "kg") == f.split(":", 1)[1]
         return True
 
     def refresh_list(self, preserve_selection: str | None = None) -> None:
         items = kg_store.load_all()
-        # Sort: open first (status open > in_progress > done > dismissed),
-        # then newest first within each group.
+        # Active items above done/dismissed; newest first within each bucket.
+        # Python's sort is stable so we can apply secondary then primary.
         status_order = {"open": 0, "in_progress": 1, "done": 2, "dismissed": 3}
-        items.sort(key=lambda k: (
-            status_order.get(k.get("status", "open"), 4),
-            -1 * len(k.get("created_at", "")),  # newer ISO-strings sort first within the tie
-            k.get("created_at", ""),
-        ), reverse=False)
-        # Quick win: newest by created_at descending.
         items.sort(key=lambda k: k.get("created_at", ""), reverse=True)
+        items.sort(key=lambda k: status_order.get(k.get("status", "open"), 4))
 
         visible = [k for k in items if self._matches_filter(k)]
         self._count_lbl.setText(
             f"{len(visible)} shown · {len(items)} total"
         )
+        done_count = sum(
+            1 for k in items
+            if k.get("status") in ("done", "dismissed")
+        )
+        self._clear_btn.setText(f"Clear completed ({done_count})")
+        self._clear_btn.setEnabled(done_count > 0)
 
         prev_id = preserve_selection
         if prev_id is None:
@@ -728,6 +927,24 @@ class KnowledgeGapsPanel(QWidget):
         if dlg.exec():
             self.refresh_list()
 
+    def _on_clear_completed(self) -> None:
+        items = kg_store.load_all()
+        done_ids = [k["id"] for k in items
+                    if k.get("status") in ("done", "dismissed") and k.get("id")]
+        if not done_ids:
+            tooltip("Nothing to clear — no completed items.")
+            return
+        if not askUser(
+            f"Remove {len(done_ids)} completed knowledge gap(s) from the list?\n\n"
+            "This deletes them permanently — open items are untouched.",
+            defaultno=True,
+        ):
+            return
+        for kid in done_ids:
+            kg_store.remove(kid)
+        tooltip(f"Cleared {len(done_ids)} completed gap(s).")
+        self.refresh_list()
+
     def _on_analyse(self) -> None:
         # Embed the existing GapAnalyserPanel in a dialog. On close we
         # refresh the list to surface any newly-queued gaps.
@@ -767,6 +984,11 @@ def get_panel():
         _scroll.setWidget(_panel)
     else:
         _panel.refresh_setup_banner()
+        # Pick up any newly-added or renamed types from Settings.
+        try:
+            _panel._rebuild_type_chip_row()
+        except Exception:
+            pass
         _panel.refresh_list()
     return _scroll
 

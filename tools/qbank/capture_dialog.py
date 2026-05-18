@@ -162,6 +162,7 @@ class CaptureDialog(QDialog):
         kg_store.add(
             title=title,
             source="qbank",
+            type="mq",
             status="open",
             stem_html=stem,
             platform=self._platform_key,

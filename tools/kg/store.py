@@ -74,6 +74,10 @@ def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def _default_type_for_source(source: str) -> str:
+    return {"qbank": "mq", "analyse": "lo"}.get(source, "kg")
+
+
 def _normalise(item: dict) -> dict:
     """Fill in defaults / coerce types so callers can pass partial dicts."""
     out = dict(item)
@@ -83,6 +87,12 @@ def _normalise(item: dict) -> dict:
     out["source"] = src if src in VALID_SOURCES else "manual"
     st = out.get("status", "open")
     out["status"] = st if st in VALID_STATUSES else "open"
+    # Type is a free-form slug (configurable in settings). Default keyed off
+    # source so legacy entries get a sensible label.
+    tp = str(out.get("type") or "").strip().lower()
+    if not tp:
+        tp = _default_type_for_source(out["source"])
+    out["type"] = tp
     out["notes"] = str(out.get("notes", "") or "")
     tags = out.get("tags") or []
     out["tags"] = [str(t).strip() for t in tags if str(t).strip()]
@@ -199,6 +209,7 @@ def migrate_from_missed_queue() -> int:
         converted.append({
             "title":      title,
             "source":     "qbank",
+            "type":       "mq",
             "status":     "open",
             "notes":      "",
             "stem_html":  stem,

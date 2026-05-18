@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.3.0
+
+Knowledge Gap **types** (MQ / KG / LO + custom), and completed items now
+stay visible-but-greyed until you clear them.
+
+### Added
+- **`type` field on every KG.** Configurable list — defaults are
+  **MQ** (Missed question, routed automatically from QBank captures),
+  **KG** (generic knowledge gap, used for manual adds), and
+  **LO** (learning objective, routed automatically from Analyse-LO results).
+  Add / rename / recolour / delete types in Settings → Knowledge Gaps.
+- **Type chips** below the status chips for one-click type filtering.
+- **Type dropdown** in the ＋ Add KG modal and the per-KG detail pane.
+- **Type editor** in Settings — name, hex colour (with native colour picker),
+  and an optional description shown as the dropdown tooltip.
+- **Clear completed** button on the KG page. Removes every Done / Dismissed
+  KG with a confirm prompt. Counter updates live.
+
+### Changed
+- **Default filter is now "Active"** (open + in_progress + done). Completed
+  items render greyed and sorted to the bottom so you can see what you've
+  finished without it disappearing.
+- **List items show a `[TYPE]` prefix** at-a-glance.
+- QBank's "Review queue" / heatmap 📌 badge translate to **filter:type=mq**
+  on the KG page.
+
 ## 1.2.0
 
 Unified Knowledge Gaps queue: every "thing I don't know" — from Analyse KG,

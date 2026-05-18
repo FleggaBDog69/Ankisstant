@@ -9,10 +9,10 @@ import re
 from datetime import date
 
 from aqt.qt import (
-    QApplication, QCheckBox, QComboBox, QDate, QDateEdit, QDialog,
-    QDialogButtonBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-    QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, Qt, QTabWidget,
-    QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QColor, QColorDialog, QComboBox, QDate,
+    QDateEdit, QDialog, QDialogButtonBox, QFormLayout, QGroupBox, QHBoxLayout,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QPlainTextEdit,
+    QPushButton, QScrollArea, QSpinBox, Qt, QTabWidget, QVBoxLayout, QWidget,
 )
 from aqt.utils import showInfo, showWarning, tooltip
 
@@ -850,39 +850,276 @@ class _GapAnalyserTab(QWidget):
         }
 
 
+def _slugify_type_key(name: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9]+", "_", name or "").strip("_").lower()
+    return s[:24] or "type"
+
+
+class _TypeEditorDialog(QDialog):
+    """Modal for adding/editing a KG type entry. Returns name/color/description."""
+
+    def __init__(self, parent=None, existing: dict | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit type" if existing else "Add type")
+        self.setMinimumWidth(420)
+        layout = _expand_form(QFormLayout(self))
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setVerticalSpacing(8)
+
+        self._name = QLineEdit(str((existing or {}).get("name", "")))
+        self._name.setPlaceholderText("e.g. MQ, Drug fact, Mnemonic")
+        layout.addRow("Name:", self._name)
+
+        # Color row — line edit + a swatch button that opens QColorDialog.
+        color = str((existing or {}).get("color", "#6b7280"))
+        color_row = QHBoxLayout()
+        self._color = QLineEdit(color)
+        self._color.setPlaceholderText("#rrggbb")
+        self._color.setMaximumWidth(120)
+        self._swatch = QPushButton("Pick…")
+        self._swatch.clicked.connect(self._pick_color)
+        color_row.addWidget(self._color)
+        color_row.addWidget(self._swatch)
+        color_row.addStretch(1)
+        self._color_preview = QLabel("  ")
+        self._color_preview.setFixedWidth(28)
+        self._color_preview.setStyleSheet(
+            f"background:{color}; border-radius: 4px; border: 1px solid #999;"
+        )
+        color_row.addWidget(self._color_preview)
+        self._color.textChanged.connect(self._update_preview)
+        wrap = QWidget()
+        wrap.setLayout(color_row)
+        layout.addRow("Colour:", wrap)
+
+        self._description = QPlainTextEdit(str((existing or {}).get("description", "")))
+        self._description.setMinimumHeight(60)
+        self._description.setPlaceholderText("Optional — what is this type for?")
+        layout.addRow("Description:", self._description)
+
+        # Show locked key if editing.
+        if existing:
+            key_lbl = QLabel(f"<small>key: <code>{existing.get('key', '')}</code></small>")
+            key_lbl.setTextFormat(Qt.TextFormat.RichText)
+            key_lbl.setStyleSheet("color: gray;")
+            layout.addRow(key_lbl)
+            self._key = existing.get("key", _slugify_type_key(existing.get("name", "")))
+        else:
+            self._key = None
+
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        bb.accepted.connect(self._on_save)
+        bb.rejected.connect(self.reject)
+        layout.addRow(bb)
+
+    def _pick_color(self):
+        current = QColor(self._color.text().strip() or "#6b7280")
+        chosen = QColorDialog.getColor(current, self, "Pick a colour")
+        if chosen.isValid():
+            self._color.setText(chosen.name())
+
+    def _update_preview(self, txt: str):
+        if re.match(r"^#[0-9A-Fa-f]{6}$", txt or ""):
+            self._color_preview.setStyleSheet(
+                f"background:{txt}; border-radius: 4px; border: 1px solid #999;"
+            )
+
+    def _on_save(self):
+        name = self._name.text().strip()
+        if not name:
+            showWarning("Name is required.")
+            return
+        color = self._color.text().strip() or "#6b7280"
+        if not re.match(r"^#[0-9A-Fa-f]{6}$", color):
+            showWarning(f"Colour {color!r} isn't a valid #rrggbb hex.")
+            return
+        self.accept()
+
+    def values(self, fallback_key: str = "") -> dict:
+        name = self._name.text().strip()
+        return {
+            "key":         self._key or _slugify_type_key(name) or fallback_key,
+            "name":        name,
+            "color":       self._color.text().strip() or "#6b7280",
+            "description": self._description.toPlainText().strip(),
+        }
+
+
 class _KnowledgeGapsTab(QWidget):
     def __init__(self, kg_cfg: dict, parent=None):
         super().__init__(parent)
-        layout = _expand_form(QFormLayout(self))
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setVerticalSpacing(10)
+        # Working copy of the types list — committed on Save.
+        self._types: list[dict] = [dict(t) for t in (kg_cfg.get("types") or [])]
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(10)
+
+        # Basic options form
+        form = _expand_form(QFormLayout())
+        form.setVerticalSpacing(8)
 
         self._enabled = QCheckBox("Enable Knowledge Gaps tab")
         self._enabled.setChecked(bool(kg_cfg.get("enabled", True)))
-        layout.addRow(self._enabled)
+        form.addRow(self._enabled)
 
         self._show_home_button = QCheckBox(
             "Show ＋ KG button on the deck browser home screen"
         )
         self._show_home_button.setChecked(bool(kg_cfg.get("show_home_button", True)))
-        layout.addRow(self._show_home_button)
+        form.addRow(self._show_home_button)
 
-        self._confirm_on_delete = QCheckBox(
-            "Confirm before deleting a KG"
-        )
+        self._confirm_on_delete = QCheckBox("Confirm before deleting a KG")
         self._confirm_on_delete.setChecked(bool(kg_cfg.get("confirm_on_delete", True)))
-        layout.addRow(self._confirm_on_delete)
+        form.addRow(self._confirm_on_delete)
 
+        self._default_type_on_add = QComboBox()
+        self._rebuild_default_type_combo(
+            str(kg_cfg.get("default_type_on_add") or "kg")
+        )
+        form.addRow("Default type on Add:", self._default_type_on_add)
+
+        root.addLayout(form)
+
+        # Types editor section
+        types_box = QGroupBox("KG Types")
+        tv = QVBoxLayout(types_box)
+        tv.setContentsMargins(10, 8, 10, 8)
+        tv.setSpacing(6)
         hint = QLabel(
+            "Categories for KG entries. The three default types — MQ, KG, LO — "
+            "map onto QBank captures, manual entries, and Analyse-LO results. "
+            "Add your own, rename, recolour, or delete."
+        )
+        hint.setStyleSheet("color: gray; font-size: 11px;")
+        hint.setWordWrap(True)
+        tv.addWidget(hint)
+
+        self._types_list = QListWidget()
+        self._types_list.setAlternatingRowColors(True)
+        self._types_list.itemDoubleClicked.connect(lambda _it: self._edit_type())
+        tv.addWidget(self._types_list)
+        self._refresh_types_list()
+
+        type_btn_row = QHBoxLayout()
+        add_btn = QPushButton("＋ Add type")
+        add_btn.clicked.connect(self._add_type)
+        edit_btn = QPushButton("Edit…")
+        edit_btn.clicked.connect(self._edit_type)
+        remove_btn = QPushButton("Remove")
+        remove_btn.clicked.connect(self._remove_type)
+        type_btn_row.addWidget(add_btn)
+        type_btn_row.addWidget(edit_btn)
+        type_btn_row.addWidget(remove_btn)
+        type_btn_row.addStretch(1)
+        tv.addLayout(type_btn_row)
+
+        root.addWidget(types_box)
+
+        outro = QLabel(
             "<small>The Knowledge Gaps tab is the unified queue for things you "
             "don't know — from manual notes, the Analyse KG sub-feature, captured "
             "QBank misses, or items saved from Browse. From any KG you can send "
             "to Browse with Claude, or create a card directly.</small>"
         )
-        hint.setTextFormat(Qt.TextFormat.RichText)
-        hint.setStyleSheet("color: gray;")
-        hint.setWordWrap(True)
-        layout.addRow(hint)
+        outro.setTextFormat(Qt.TextFormat.RichText)
+        outro.setStyleSheet("color: gray;")
+        outro.setWordWrap(True)
+        root.addWidget(outro)
+
+        root.addStretch(1)
+
+    # ── types editor ─────────────────────────────────────────────────────────
+
+    def _refresh_types_list(self):
+        self._types_list.clear()
+        for t in self._types:
+            label = f"  ●  {t.get('name', '')}    "
+            sub = []
+            sub.append(f"key={t.get('key','')}")
+            if t.get("description"):
+                d = t["description"]
+                sub.append(d[:60] + ("…" if len(d) > 60 else ""))
+            li = QListWidgetItem(label + "   ·   ".join(sub))
+            li.setData(Qt.ItemDataRole.UserRole, t.get("key"))
+            # Tint the bullet with the type's color via foreground role.
+            try:
+                li.setForeground(QColor(t.get("color", "#6b7280")))
+            except Exception:
+                pass
+            self._types_list.addItem(li)
+        # Also keep the "Default type on Add" combo in sync.
+        prev = self._default_type_on_add.currentData() if self._default_type_on_add.count() else None
+        self._rebuild_default_type_combo(prev)
+
+    def _rebuild_default_type_combo(self, prev_key: str | None) -> None:
+        self._default_type_on_add.blockSignals(True)
+        self._default_type_on_add.clear()
+        for t in self._types:
+            self._default_type_on_add.addItem(t.get("name", ""), t.get("key", ""))
+        if prev_key:
+            idx = self._default_type_on_add.findData(prev_key)
+            if idx >= 0:
+                self._default_type_on_add.setCurrentIndex(idx)
+        self._default_type_on_add.blockSignals(False)
+
+    def _selected_type_key(self) -> str | None:
+        li = self._types_list.currentItem()
+        if li is None:
+            return None
+        return li.data(Qt.ItemDataRole.UserRole)
+
+    def _add_type(self):
+        dlg = _TypeEditorDialog(self)
+        if not dlg.exec():
+            return
+        v = dlg.values()
+        # Ensure key uniqueness — append a suffix if collision.
+        existing_keys = {t["key"] for t in self._types}
+        base = v["key"]
+        i = 2
+        while v["key"] in existing_keys:
+            v["key"] = f"{base}_{i}"
+            i += 1
+        self._types.append(v)
+        self._refresh_types_list()
+
+    def _edit_type(self):
+        key = self._selected_type_key()
+        if not key:
+            tooltip("Pick a type first.")
+            return
+        idx = next((i for i, t in enumerate(self._types) if t.get("key") == key), -1)
+        if idx < 0:
+            return
+        dlg = _TypeEditorDialog(self, existing=self._types[idx])
+        if not dlg.exec():
+            return
+        self._types[idx] = dlg.values()
+        self._refresh_types_list()
+
+    def _remove_type(self):
+        key = self._selected_type_key()
+        if not key:
+            tooltip("Pick a type first.")
+            return
+        idx = next((i for i, t in enumerate(self._types) if t.get("key") == key), -1)
+        if idx < 0:
+            return
+        name = self._types[idx].get("name", key)
+        ok = showInfo if False else None  # placeholder
+        from aqt.utils import askUser
+        if not askUser(
+            f"Remove the '{name}' type?\n\n"
+            "KGs already tagged with this type will keep the key — they'll "
+            "render with a faded fallback badge until you reassign them.",
+            defaultno=True,
+        ):
+            return
+        self._types.pop(idx)
+        self._refresh_types_list()
 
     def get_values(self) -> dict:
         return {
@@ -890,6 +1127,8 @@ class _KnowledgeGapsTab(QWidget):
             "show_home_button":      self._show_home_button.isChecked(),
             "confirm_on_delete":     self._confirm_on_delete.isChecked(),
             "default_status_on_add": "open",
+            "default_type_on_add":   self._default_type_on_add.currentData() or "kg",
+            "types":                 [dict(t) for t in self._types],
         }
 
 

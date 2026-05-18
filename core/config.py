@@ -67,8 +67,23 @@ DEFAULTS: dict = {
         "knowledge_gaps": {
             "enabled": True,
             "default_status_on_add": "open",
+            "default_type_on_add": "kg",
             "confirm_on_delete": True,
             "show_home_button": True,
+            # Configurable list of KG types. Each item:
+            #   key         — stable id (slug); used by KG entries
+            #   name        — display label
+            #   color       — hex string for the badge background
+            #   description — long-form help text shown in the type picker
+            # Users can add/edit/delete these in Ankisstant Settings → Knowledge Gaps.
+            "types": [
+                {"key": "mq", "name": "MQ", "color": "#b45309",
+                 "description": "Missed question — captured from a QBank or recall."},
+                {"key": "kg", "name": "KG", "color": "#6b7280",
+                 "description": "Knowledge gap — anything you don't know yet."},
+                {"key": "lo", "name": "LO", "color": "#9333ea",
+                 "description": "Learning objective — a curriculum statement not yet covered."},
+            ],
         },
         "card_creator": {
             "enabled": True,

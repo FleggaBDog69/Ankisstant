@@ -351,6 +351,7 @@ class GapAnalyserPanel(QWidget):
             {
                 "title":  gap_text,
                 "source": "analyse",
+                "type":   "lo",
                 "status": "open",
                 "lo":     lo,
                 "lo_tag": tag,
