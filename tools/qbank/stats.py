@@ -61,11 +61,33 @@ def add_session(correct: int, incorrect: int, platform: str = "emedici",
     save_stats(data, platform)
 
 
+def discover_stats_keys() -> list[str]:
+    """Every platform key that has a stats file on disk — including ad-hoc
+    "Other / Manual" entries that aren't in the platforms config."""
+    keys: list[str] = []
+    try:
+        for name in os.listdir(_user_files()):
+            if name == "stats.json":
+                keys.append("emedici")
+            elif name.startswith("stats_") and name.endswith(".json"):
+                keys.append(name[len("stats_"):-len(".json")])
+    except FileNotFoundError:
+        pass
+    return keys
+
+
 def load_combined_stats(platforms: list) -> dict:
-    """Merge all platforms' stats by date."""
+    """Merge stats by date across all on-disk stats files.
+
+    `platforms` is accepted for back-compat but ignored — we discover every
+    stats file so ad-hoc sources (e.g. "Other / Manual: UWorld") show up on
+    the heatmap without needing to be registered in the platforms config."""
     combined: dict = {}
-    for p in platforms:
-        for iso, entry in load_stats(p["key"]).items():
+    keys = set(discover_stats_keys())
+    for p in platforms or []:
+        keys.add(p["key"])
+    for key in keys:
+        for iso, entry in load_stats(key).items():
             day = combined.setdefault(iso, {"correct": 0, "incorrect": 0, "total": 0, "sessions": 0})
             day["correct"]   += entry.get("correct", 0)
             day["incorrect"] += entry.get("incorrect", 0)

@@ -175,6 +175,14 @@ def _on_js_message(handled, message, context):
         if result[0]:
             return result
 
+    if message == "practice_questions:open":
+        try:
+            from practice_questions.library import show_library
+            show_library()
+        except Exception as e:
+            log.error(f"practice_questions:open failed: {e}")
+        return (True, None)
+
     return handled
 
 

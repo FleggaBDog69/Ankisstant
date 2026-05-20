@@ -25,9 +25,10 @@ from aqt.qt import (
 )
 from aqt.utils import askUser, showWarning, tooltip
 
+from ..core import anki_utils, api as core_api
 from ..core.config import tool_config
 from ..core.qt_utils import (
-    attach_tag_completer, make_help_button, make_setup_banner,
+    attach_tag_completer, loading, make_help_button, make_setup_banner,
     provider_configured,
 )
 from .kg import store as kg_store
@@ -46,10 +47,9 @@ SOURCE_LABELS = {
 }
 
 STATUS_LABELS = {
-    "open":        "Open",
-    "in_progress": "In Progress",
-    "done":        "Done",
-    "dismissed":   "Dismissed",
+    "open":      "Open",
+    "done":      "Done",
+    "dismissed": "Dismissed",
 }
 
 
@@ -249,6 +249,252 @@ class _KGListItem(QListWidgetItem):
         self.setToolTip("\n".join(tt_lines))
 
 
+# ── LO analyser (inline section, only shown on type=lo KGs) ─────────────────
+
+class _LOAnalyserSection(QGroupBox):
+    """Inline Analyse-LO panel — appears on the KG detail pane for LO-type
+    KGs. Reads the LO text + tag from the KG's own schema fields, runs the
+    gap analysis, and appends accepted gaps into the KG's notes field."""
+
+    def __init__(self, detail_pane):
+        super().__init__("🔬 Analyse this LO")
+        self._pane = detail_pane
+        self._build()
+
+    def _build(self) -> None:
+        v = QVBoxLayout(self)
+        v.setContentsMargins(8, 6, 8, 6)
+        v.setSpacing(6)
+
+        hint = QLabel(
+            "Pulls cards under this LO's tag and flags concepts the cards "
+            "don't cover. Accepted gaps are appended to this LO's <b>Notes</b>."
+        )
+        hint.setTextFormat(Qt.TextFormat.RichText)
+        hint.setStyleSheet("color: gray; font-size: 11px;")
+        hint.setWordWrap(True)
+        v.addWidget(hint)
+
+        self._status = QLabel("")
+        self._status.setStyleSheet("color: gray; font-size: 11px;")
+        self._status.setWordWrap(True)
+        v.addWidget(self._status)
+
+        btn_row = QHBoxLayout()
+        self._count_btn = QPushButton("Count cards")
+        self._count_btn.setAutoDefault(False)
+        self._count_btn.clicked.connect(self._on_count)
+        btn_row.addWidget(self._count_btn)
+        self._analyse_btn = QPushButton("🔍 Analyse Gaps")
+        self._analyse_btn.setAutoDefault(False)
+        self._analyse_btn.clicked.connect(self._on_analyse)
+        btn_row.addWidget(self._analyse_btn)
+        btn_row.addStretch(1)
+        v.addLayout(btn_row)
+
+        self._gaps_box = QGroupBox("Suggested gaps")
+        gv = QVBoxLayout(self._gaps_box)
+        gv.setContentsMargins(8, 6, 8, 6)
+        gv.setSpacing(4)
+        self._gaps_list = QListWidget()
+        self._gaps_list.setAlternatingRowColors(True)
+        self._gaps_list.setMaximumHeight(180)
+        gv.addWidget(self._gaps_list, 1)
+        ctrl_row = QHBoxLayout()
+        sa = QPushButton("Select all")
+        sa.setAutoDefault(False)
+        sa.clicked.connect(self._select_all)
+        sn = QPushButton("Select none")
+        sn.setAutoDefault(False)
+        sn.clicked.connect(self._select_none)
+        ctrl_row.addWidget(sa)
+        ctrl_row.addWidget(sn)
+        ctrl_row.addStretch(1)
+        self._append_btn = QPushButton("Append checked → Notes")
+        self._append_btn.setAutoDefault(False)
+        self._append_btn.clicked.connect(self._append_to_notes)
+        ctrl_row.addWidget(self._append_btn)
+        gv.addLayout(ctrl_row)
+        self._gaps_box.setVisible(False)
+        v.addWidget(self._gaps_box)
+
+    def reset(self) -> None:
+        """Wipe transient state — called when the selected KG changes."""
+        self._gaps_list.clear()
+        self._gaps_box.setVisible(False)
+        self._status.setText("")
+
+    # ── inputs ───────────────────────────────────────────────────────────────
+
+    def _current_lo_and_tag(self) -> tuple[str, str]:
+        widgets = self._pane._schema_widgets
+        lo = ""
+        tag = ""
+        if "lo" in widgets:
+            try:
+                lo = widgets["lo"]["getter"]()
+            except Exception:
+                pass
+        if "lo_tag" in widgets:
+            try:
+                tag = widgets["lo_tag"]["getter"]()
+            except Exception:
+                pass
+        # Fall back to KG title if there's no `lo` field on the schema.
+        if not lo and self._pane._current:
+            lo = self._pane._current.get("title", "")
+        return lo.strip(), tag.strip()
+
+    # ── helpers (re-use gap_analyser's prompt + tag query) ───────────────────
+
+    def _config(self) -> dict:
+        return tool_config("gap_analyser")
+
+    # ── actions ──────────────────────────────────────────────────────────────
+
+    def _on_count(self) -> None:
+        if not anki_utils.require_col():
+            return
+        _, tag = self._current_lo_and_tag()
+        if not tag:
+            tooltip("This LO has no tag set yet — fill the LO tag field above.")
+            return
+        from .gap_analyser import _build_tag_query
+        cfg = self._config()
+        notetype_filter = (cfg.get("notetype_filter") or "").strip()
+        try:
+            nids = list(mw.col.find_notes(_build_tag_query(tag, notetype_filter)))
+        except Exception as e:
+            showWarning(f"Couldn't search tag: {e}")
+            return
+        suffix = f" (notetype filter: {notetype_filter})" if notetype_filter else ""
+        self._status.setText(f"{len(nids)} note(s) under '{tag}'{suffix}")
+
+    def _on_analyse(self) -> None:
+        if not anki_utils.require_col():
+            return
+        lo, tag = self._current_lo_and_tag()
+        if not lo or not tag:
+            tooltip("Set both the LO text and the LO tag on this KG first.")
+            return
+        from .gap_analyser import GAP_SYSTEM_TMPL, _build_tag_query, _front_preview
+        cfg = self._config()
+        notetype_filter = (cfg.get("notetype_filter") or "").strip()
+        front_field = cfg.get("front_field", "Text")
+        max_cards = int(cfg.get("max_cards", 80))
+        try:
+            nids = list(mw.col.find_notes(_build_tag_query(tag, notetype_filter)))
+        except Exception as e:
+            showWarning(f"Couldn't search tag: {e}")
+            return
+        if not nids:
+            self._status.setText(f"No notes under tag '{tag}' — nothing to analyse.")
+            return
+        if len(nids) > max_cards:
+            if not askUser(
+                f"{len(nids)} cards under '{tag}' — that's more than the cap "
+                f"({max_cards}). Only the first {max_cards} will be sent. Continue?"
+            ):
+                return
+            nids = nids[:max_cards]
+
+        fronts: list[str] = []
+        for nid in nids:
+            try:
+                note = mw.col.get_note(nid)
+            except Exception:
+                continue
+            p = _front_preview(note, front_field)
+            if p:
+                fronts.append(p)
+        if not fronts:
+            showWarning("Couldn't read the front field on any card under that tag.")
+            return
+
+        max_n = int(cfg.get("max_gaps", 10))
+        system = GAP_SYSTEM_TMPL.format(max_n=max_n)
+        user_msg = (
+            "Learning objective:\n" + lo + "\n\n"
+            f"Cards currently tagged for this LO ({len(fronts)}):\n"
+            + "\n".join(f"- {c}" for c in fronts)
+        )
+        self._status.setText(
+            f"Asking Claude what's missing from {len(fronts)} card(s) under '{tag}'…"
+        )
+        model = cfg.get("model") or None
+        with loading(self._analyse_btn, "Analysing…"):
+            gaps = core_api.ask_claude_json(
+                prompt=user_msg, system=system, max_tokens=1024, model=model,
+            )
+
+        if not isinstance(gaps, list):
+            self._status.setText("")
+            return
+        gaps = [g.strip() for g in gaps if isinstance(g, str) and g.strip()]
+        if not gaps:
+            self._gaps_box.setVisible(False)
+            self._status.setText(
+                f"No gaps found — your cards under '{tag}' appear to cover this LO well."
+            )
+            return
+
+        self._gaps_list.clear()
+        for g in gaps:
+            item = QListWidgetItem(g)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked)
+            self._gaps_list.addItem(item)
+        self._gaps_box.setVisible(True)
+        self._status.setText(
+            f"Claude found {len(gaps)} gap(s) across {len(fronts)} card(s)."
+        )
+
+    def _select_all(self) -> None:
+        for i in range(self._gaps_list.count()):
+            self._gaps_list.item(i).setCheckState(Qt.CheckState.Checked)
+
+    def _select_none(self) -> None:
+        for i in range(self._gaps_list.count()):
+            self._gaps_list.item(i).setCheckState(Qt.CheckState.Unchecked)
+
+    def _append_to_notes(self) -> None:
+        if self._pane._current is None:
+            return
+        approved: list[str] = []
+        for i in range(self._gaps_list.count()):
+            it = self._gaps_list.item(i)
+            if it.checkState() == Qt.CheckState.Checked:
+                t = it.text().strip()
+                if t:
+                    approved.append(t)
+        if not approved:
+            tooltip("Nothing checked.")
+            return
+        notes_widget = self._pane._schema_widgets.get("notes")
+        if notes_widget is None:
+            showWarning(
+                "This LO type doesn't have a 'notes' field. Add one in "
+                "Settings → Knowledge Gaps → edit the LO type."
+            )
+            return
+        try:
+            current = notes_widget["getter"]() or ""
+        except Exception:
+            current = ""
+        bullets = "\n".join(f"- {g}" for g in approved)
+        new_val = (current.rstrip() + "\n\n" + bullets).strip() if current.strip() else bullets
+        try:
+            notes_widget["setter"](new_val)
+        except Exception as e:
+            showWarning(f"Couldn't write to notes: {e}")
+            return
+        # Persist so the appended gaps survive a navigate-away.
+        self._pane._save()
+        self._gaps_list.clear()
+        self._gaps_box.setVisible(False)
+        self._status.setText(f"Appended {len(approved)} gap(s) to this LO's notes.")
+
+
 # ── Detail pane ──────────────────────────────────────────────────────────────
 
 class KGDetailPane(QWidget):
@@ -331,6 +577,11 @@ class KGDetailPane(QWidget):
         add_res_btn.clicked.connect(self._add_resource_row)
         rl.addWidget(add_res_btn, 0, Qt.AlignmentFlag.AlignLeft)
         root.addWidget(self._res_box)
+
+        # LO analyser — only shown when the active KG's type is "lo".
+        self._lo_analyser = _LOAnalyserSection(self)
+        self._lo_analyser.setVisible(False)
+        root.addWidget(self._lo_analyser)
 
         # Actions
         actions_row = QHBoxLayout()
@@ -427,6 +678,10 @@ class KGDetailPane(QWidget):
         for r in kg.get("resources", []) or []:
             self._add_resource_row(r.get("label", ""), r.get("url", ""))
 
+        # LO analyser visibility — reset its transient state on KG change.
+        self._lo_analyser.reset()
+        self._lo_analyser.setVisible(type_key == "lo")
+
     def _clear(self) -> None:
         self._current = None
         self._set_widgets_visible(False)
@@ -438,6 +693,10 @@ class KGDetailPane(QWidget):
                   self._res_box, self._browse_btn, self._create_btn,
                   self._delete_btn, self._save_btn):
             w.setVisible(visible)
+        # The LO analyser stays hidden when nothing is selected; load() re-
+        # shows it only for type=lo KGs.
+        if not visible:
+            self._lo_analyser.setVisible(False)
 
     # ── schema-driven fields ─────────────────────────────────────────────────
 
@@ -478,6 +737,9 @@ class KGDetailPane(QWidget):
         # Build with merged values so overlapping keys keep what was typed.
         pseudo_kg = {"fields": merged}
         self._rebuild_schema_for_type(new_type, kg=pseudo_kg)
+        # Show/hide the inline LO analyser to match the new type.
+        self._lo_analyser.reset()
+        self._lo_analyser.setVisible(new_type == "lo")
 
     def _rebuild_schema_for_type(self, type_key: str, kg: dict | None = None) -> None:
         # Tear down existing widgets.
@@ -742,18 +1004,15 @@ class KGDetailPane(QWidget):
             main.refresh_queue_badge()
         if hasattr(main, "show_create_tool"):
             main.show_create_tool()
-        kg_store.update(kg["id"], status="in_progress")
+        # Leave status as open — Create marks it done on a successful Add.
         self._parent_panel.refresh_list(preserve_selection=kg["id"])
 
 
 # ── Main panel ───────────────────────────────────────────────────────────────
 
 _STATUS_FILTERS = [
-    ("active",   "Active"),     # open + in_progress + done (greyed)
-    ("all",      "All"),
-    ("open",     "Open"),
-    ("in_progress", "In Progress"),
-    ("done",     "Done"),
+    ("open",      "Open"),
+    ("done",      "Done"),
     ("dismissed", "Dismissed"),
 ]
 
@@ -761,9 +1020,7 @@ _STATUS_FILTERS = [
 class KnowledgeGapsPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        # Default to Active so newly-done items stay visible (greyed) until
-        # the user explicitly hits Clear completed.
-        self._filter = "active"
+        self._filter = "open"
         self._build()
         self.refresh_list()
 
@@ -786,15 +1043,17 @@ class KnowledgeGapsPanel(QWidget):
             "Knowledge Gaps — help",
             "<h3>What it does</h3>"
             "<p>One unified queue of things you don't know — from any source: "
-            "manual notes, the Analyse LO feature, captured QBank misses, or "
-            "things Browse couldn't find.</p>"
+            "manual notes, captured QBank misses, or things Browse couldn't find.</p>"
             "<h3>Workflow</h3>"
             "<ol>"
-            "<li>Add a KG via <b>＋ Add KG</b> (here or from the home screen), "
-            "or generate gaps via <b>Analyse LO…</b>.</li>"
+            "<li>Add a KG via <b>＋ Add KG</b> (here or from the home screen).</li>"
             "<li>Pick a KG. Either <b>Send to Browse</b> to find existing cards, "
             "or <b>Create card from this KG</b> to draft a new one.</li>"
-            "<li>When the card is added (or matching cards re-graded), the KG "
+            "<li>For <b>LO</b>-type KGs, the detail pane shows an inline "
+            "<i>Analyse this LO</i> section that pulls cards under the LO's tag "
+            "and flags concepts they don't cover — accepted gaps append into "
+            "the LO's Notes.</li>"
+            "<li>When a card is added (or matching cards re-graded), the KG "
             "is marked Done automatically.</li>"
             "</ol>",
             self,
@@ -839,15 +1098,11 @@ class KnowledgeGapsPanel(QWidget):
         add_btn = QPushButton("＋ Add KG")
         add_btn.setAutoDefault(False)
         add_btn.clicked.connect(self._on_add_kg)
-        analyse_btn = QPushButton("Analyse LO…")
-        analyse_btn.setAutoDefault(False)
-        analyse_btn.clicked.connect(self._on_analyse)
         refresh_btn = QPushButton("⟳")
         refresh_btn.setFixedWidth(28)
         refresh_btn.setAutoDefault(False)
         refresh_btn.clicked.connect(lambda: self.refresh_list())
         btn_row.addWidget(add_btn)
-        btn_row.addWidget(analyse_btn)
         btn_row.addStretch(1)
         btn_row.addWidget(refresh_btn)
         lcol.addLayout(btn_row)
@@ -978,13 +1233,7 @@ class KnowledgeGapsPanel(QWidget):
     def _matches_filter(self, kg: dict) -> bool:
         f = self._filter
         status = kg.get("status", "open")
-        if f == "all":
-            return True
-        if f == "active":
-            # Active = anything not dismissed. Done items show greyed at the
-            # bottom; they don't disappear until the user hits Clear completed.
-            return status != "dismissed"
-        if f in ("open", "in_progress", "done", "dismissed"):
+        if f in ("open", "done", "dismissed"):
             return status == f
         if f.startswith("type:"):
             return kg.get("type", "kg") == f.split(":", 1)[1]
@@ -994,7 +1243,7 @@ class KnowledgeGapsPanel(QWidget):
         items = kg_store.load_all()
         # Active items above done/dismissed; newest first within each bucket.
         # Python's sort is stable so we can apply secondary then primary.
-        status_order = {"open": 0, "in_progress": 1, "done": 2, "dismissed": 3}
+        status_order = {"open": 0, "done": 1, "dismissed": 2}
         items.sort(key=lambda k: k.get("created_at", ""), reverse=True)
         items.sort(key=lambda k: status_order.get(k.get("status", "open"), 4))
 
@@ -1067,25 +1316,6 @@ class KnowledgeGapsPanel(QWidget):
             kg_store.remove(kid)
         tooltip(f"Cleared {len(done_ids)} completed gap(s).")
         self.refresh_list()
-
-    def _on_analyse(self) -> None:
-        # Embed the existing GapAnalyserPanel in a dialog. On close we
-        # refresh the list to surface any newly-queued gaps.
-        from .gap_analyser import GapAnalyserPanel
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Analyse Knowledge Gaps")
-        dlg.resize(720, 600)
-        layout = QVBoxLayout(dlg)
-        layout.setContentsMargins(0, 0, 0, 0)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        panel = GapAnalyserPanel()
-        scroll.setWidget(panel)
-        layout.addWidget(scroll)
-        dlg.exec()
-        self.refresh_list()
-
 
 # ── Tool contract ────────────────────────────────────────────────────────────
 

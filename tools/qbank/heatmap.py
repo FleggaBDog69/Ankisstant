@@ -14,6 +14,22 @@ from .stats import load_combined_stats, get_streak
 from .targets import get_target, get_exam_dates
 
 
+def _practice_questions_available() -> bool:
+    """True iff the practice_questions addon is installed and importable.
+    Used to surface its launcher button + roll its stats into the heatmap."""
+    try:
+        import practice_questions  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+# Synthetic platform entry merged into the stats list when practice_questions
+# is present. Key matches the file practice_questions writes to
+# (`stats_practice_questions.json` inside ankisstant/user_files/).
+_PRACTICE_QS_PLATFORM = {"key": "practice_questions", "name": "Practice Qs"}
+
+
 def _qbank_open_kg_count() -> int:
     return kg_store.count(
         lambda kg: kg.get("source") == "qbank" and kg.get("status") == "open"
@@ -96,7 +112,9 @@ def _compute_window(stats: dict, cfg: dict) -> tuple[date, int]:
 def build_card_html(platforms: list, cfg: dict) -> str:
     """Return the full heatmap card HTML (CSS inline). The Ankisstant button is
     rendered separately by the caller — this function only returns the heatmap."""
-    stats  = load_combined_stats(platforms)
+    pq_present = _practice_questions_available()
+    stats_platforms = list(platforms) + ([_PRACTICE_QS_PLATFORM] if pq_present else [])
+    stats  = load_combined_stats(stats_platforms)
     today  = date.today()
     start, num_weeks = _compute_window(stats, cfg)
 
@@ -213,6 +231,11 @@ def build_card_html(platforms: list, cfg: dict) -> str:
         f'<button class="ec-btn" onclick="pycmd(\'qbank:open:{p["key"]}\')"'
         f' title="{p["name"]}{ " (Q)" if i == 0 else "" }">{p["name"]}{ " <kbd>Q</kbd>" if i == 0 else "" }</button>'
         for i, p in enumerate(platforms)
+    )
+    practice_qs_btn = (
+        '<button class="ec-btn" onclick="pycmd(\'practice_questions:open\')"'
+        ' title="Practice Questions addon — local screenshot library">Practice Qs</button>'
+        if pq_present else ""
     )
     settings_btn = '<button class="ec-btn ec-settings-btn" onclick="pycmd(\'ankisstant:settings\')" title="Settings">⚙</button>'
     log_btn      = '<button class="ec-btn" onclick="pycmd(\'qbank:log_session\')" title="Log a session manually (e.g. from phone)">+ Log</button>'
@@ -342,7 +365,7 @@ def build_card_html(platforms: list, cfg: dict) -> str:
       </div>
       {today_line}
     </div>
-    <div class="ec-btns">{review_btn}{add_kg_btn}{launch_buttons}{log_btn}{settings_btn}</div>
+    <div class="ec-btns">{review_btn}{add_kg_btn}{launch_buttons}{practice_qs_btn}{log_btn}{settings_btn}</div>
   </div>
   <div class="ec-body">
     <div class="ec-dow">{dow_html}</div>

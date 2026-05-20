@@ -765,10 +765,6 @@ class _BrowseTab(QWidget):
         self._audit_tag.setPlaceholderText("e.g. Ankisstant::AI::Browse")
         layout.addRow("Audit tag:", self._audit_tag)
 
-        self._gap = QCheckBox("Enable post-search gap report (asks Claude what's missing)")
-        self._gap.setChecked(bool(br_cfg.get("enable_gap_report", False)))
-        layout.addRow(self._gap)
-
         st_hint = QLabel("<small>Source-deck badges are edited in the addon config JSON.</small>")
         st_hint.setStyleSheet("color: gray;")
         st_hint.setTextFormat(Qt.TextFormat.RichText)
@@ -785,68 +781,7 @@ class _BrowseTab(QWidget):
             "notetype_filter":   self._notetype_filter.text().strip(),
             "front_field":       self._front_field.text().strip() or "Text",
             "audit_tag":         self._audit_tag.text().strip(),
-            "enable_gap_report": self._gap.isChecked(),
             "source_tags":       self._source_tags,
-        }
-
-
-class _GapAnalyserTab(QWidget):
-    def __init__(self, ga_cfg: dict, parent=None):
-        super().__init__(parent)
-        layout = _expand_form(QFormLayout(self))
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setVerticalSpacing(10)
-
-        self._enabled = QCheckBox("Enable Analyse Knowledge Gaps")
-        self._enabled.setChecked(bool(ga_cfg.get("enabled", True)))
-        layout.addRow(self._enabled)
-
-        self._model = QLineEdit(ga_cfg.get("model", "claude-sonnet-4-6"))
-        self._model.setMinimumWidth(420)
-        layout.addRow("Model:", self._model)
-
-        self._front_field = QLineEdit(ga_cfg.get("front_field", "Text"))
-        self._front_field.setMinimumWidth(420)
-        layout.addRow("Front field:", self._front_field)
-
-        self._notetype_filter = QLineEdit(ga_cfg.get("notetype_filter", ""))
-        self._notetype_filter.setMinimumWidth(420)
-        self._notetype_filter.setPlaceholderText("blank = search all notetypes")
-        layout.addRow("Notetype filter:", self._notetype_filter)
-
-        self._last_tag = QLineEdit(ga_cfg.get("last_used_tag", ""))
-        self._last_tag.setMinimumWidth(420)
-        self._last_tag.setPlaceholderText("most-recent tag used (auto-saved)")
-        layout.addRow("Last-used tag:", self._last_tag)
-
-        self._max_cards = QSpinBox()
-        self._max_cards.setRange(5, 500)
-        self._max_cards.setValue(int(ga_cfg.get("max_cards", 80)))
-        layout.addRow("Max cards sent to Claude:", self._max_cards)
-
-        self._max_gaps = QSpinBox()
-        self._max_gaps.setRange(1, 30)
-        self._max_gaps.setValue(int(ga_cfg.get("max_gaps", 10)))
-        layout.addRow("Max gaps to return:", self._max_gaps)
-
-        hint = QLabel(
-            "<small>This tool pulls cards under a tag, asks Claude what's missing, "
-            "and pushes the approved gaps into the Knowledge Gaps queue.</small>"
-        )
-        hint.setTextFormat(Qt.TextFormat.RichText)
-        hint.setStyleSheet("color: gray;")
-        hint.setWordWrap(True)
-        layout.addRow(hint)
-
-    def get_values(self) -> dict:
-        return {
-            "enabled":         self._enabled.isChecked(),
-            "model":           self._model.text().strip() or "claude-sonnet-4-6",
-            "front_field":     self._front_field.text().strip() or "Text",
-            "notetype_filter": self._notetype_filter.text().strip(),
-            "last_used_tag":   self._last_tag.text().strip(),
-            "max_cards":       int(self._max_cards.value()),
-            "max_gaps":        int(self._max_gaps.value()),
         }
 
 
@@ -1144,10 +1079,11 @@ class _TypeEditorDialog(QDialog):
 
 
 class _KnowledgeGapsTab(QWidget):
-    def __init__(self, kg_cfg: dict, parent=None):
+    def __init__(self, kg_cfg: dict, ga_cfg: dict | None = None, parent=None):
         super().__init__(parent)
         # Working copy of the types list — committed on Save.
         self._types: list[dict] = [dict(t) for t in (kg_cfg.get("types") or [])]
+        ga_cfg = ga_cfg or {}
 
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 14, 14, 14)
@@ -1213,6 +1149,52 @@ class _KnowledgeGapsTab(QWidget):
         tv.addLayout(type_btn_row)
 
         root.addWidget(types_box)
+
+        # ── Analyse KG (formerly its own settings tab) ────────────────────────
+        analyse_box = QGroupBox("Analyse KG (AI sub-feature)")
+        ab = QFormLayout(analyse_box)
+        ab.setContentsMargins(10, 8, 10, 8)
+        ab.setVerticalSpacing(8)
+
+        self._ga_enabled = QCheckBox("Enable Analyse KG")
+        self._ga_enabled.setChecked(bool(ga_cfg.get("enabled", True)))
+        ab.addRow(self._ga_enabled)
+
+        self._ga_model = QLineEdit(ga_cfg.get("model", "claude-sonnet-4-6"))
+        self._ga_model.setMinimumWidth(420)
+        ab.addRow("Model:", self._ga_model)
+
+        self._ga_front_field = QLineEdit(ga_cfg.get("front_field", "Text"))
+        ab.addRow("Front field:", self._ga_front_field)
+
+        self._ga_notetype_filter = QLineEdit(ga_cfg.get("notetype_filter", ""))
+        self._ga_notetype_filter.setPlaceholderText("blank = search all notetypes")
+        ab.addRow("Notetype filter:", self._ga_notetype_filter)
+
+        self._ga_last_tag = QLineEdit(ga_cfg.get("last_used_tag", ""))
+        self._ga_last_tag.setPlaceholderText("most-recent tag used (auto-saved)")
+        ab.addRow("Last-used tag:", self._ga_last_tag)
+
+        self._ga_max_cards = QSpinBox()
+        self._ga_max_cards.setRange(5, 500)
+        self._ga_max_cards.setValue(int(ga_cfg.get("max_cards", 80)))
+        ab.addRow("Max cards sent to Claude:", self._ga_max_cards)
+
+        self._ga_max_gaps = QSpinBox()
+        self._ga_max_gaps.setRange(1, 30)
+        self._ga_max_gaps.setValue(int(ga_cfg.get("max_gaps", 10)))
+        ab.addRow("Max gaps to return:", self._ga_max_gaps)
+
+        ga_hint = QLabel(
+            "<small>Pulls cards under a tag, asks Claude what's missing, and "
+            "pushes the approved gaps into the queue above.</small>"
+        )
+        ga_hint.setTextFormat(Qt.TextFormat.RichText)
+        ga_hint.setStyleSheet("color: gray;")
+        ga_hint.setWordWrap(True)
+        ab.addRow(ga_hint)
+
+        root.addWidget(analyse_box)
 
         outro = QLabel(
             "<small>The Knowledge Gaps tab is the unified queue for things you "
@@ -1327,6 +1309,17 @@ class _KnowledgeGapsTab(QWidget):
             "default_status_on_add": "open",
             "default_type_on_add":   self._default_type_on_add.currentData() or "kg",
             "types":                 [dict(t) for t in self._types],
+        }
+
+    def get_gap_analyser_values(self) -> dict:
+        return {
+            "enabled":         self._ga_enabled.isChecked(),
+            "model":           self._ga_model.text().strip() or "claude-sonnet-4-6",
+            "front_field":     self._ga_front_field.text().strip() or "Text",
+            "notetype_filter": self._ga_notetype_filter.text().strip(),
+            "last_used_tag":   self._ga_last_tag.text().strip(),
+            "max_cards":       int(self._ga_max_cards.value()),
+            "max_gaps":        int(self._ga_max_gaps.value()),
         }
 
 
@@ -1606,15 +1599,16 @@ class SettingsDialog(QDialog):
         self._global_tab  = _GlobalTab(self._original_cfg)
         self._qbank_tab   = _QBankTab(self._original_cfg.get("tools", {}).get("qbank", {}))
         self._browse_tab  = _BrowseTab(self._original_cfg.get("tools", {}).get("browse", {}))
-        self._gap_tab     = _GapAnalyserTab(self._original_cfg.get("tools", {}).get("gap_analyser", {}))
-        self._kg_tab      = _KnowledgeGapsTab(self._original_cfg.get("tools", {}).get("knowledge_gaps", {}))
+        self._kg_tab      = _KnowledgeGapsTab(
+            self._original_cfg.get("tools", {}).get("knowledge_gaps", {}),
+            self._original_cfg.get("tools", {}).get("gap_analyser", {}),
+        )
         self._creator_tab = _CreatorTab(self._original_cfg.get("tools", {}).get("card_creator", {}))
         self._about_tab   = _AboutTab()
         tabs.addTab(_wrap_scroll(self._global_tab),  "Global")
         tabs.addTab(_wrap_scroll(self._qbank_tab),   "QBank with Claude")
         tabs.addTab(_wrap_scroll(self._browse_tab),  "Browse with Claude")
         tabs.addTab(_wrap_scroll(self._kg_tab),      "Knowledge Gaps")
-        tabs.addTab(_wrap_scroll(self._gap_tab),     "Analyse Knowledge Gaps")
         tabs.addTab(_wrap_scroll(self._creator_tab), "Create with Claude")
         tabs.addTab(_wrap_scroll(self._about_tab),   "About")
         root.addWidget(tabs)
@@ -1641,8 +1635,8 @@ class SettingsDialog(QDialog):
         cfg.setdefault("tools", {})
         cfg["tools"]["qbank"]        = {**cfg["tools"].get("qbank", {}),        **self._qbank_tab.get_values()}
         cfg["tools"]["browse"]       = {**cfg["tools"].get("browse", {}),       **self._browse_tab.get_values()}
-        cfg["tools"]["gap_analyser"]   = {**cfg["tools"].get("gap_analyser", {}),   **self._gap_tab.get_values()}
         cfg["tools"]["knowledge_gaps"] = {**cfg["tools"].get("knowledge_gaps", {}), **self._kg_tab.get_values()}
+        cfg["tools"]["gap_analyser"]   = {**cfg["tools"].get("gap_analyser", {}),   **self._kg_tab.get_gap_analyser_values()}
         cfg["tools"]["card_creator"]   = {**cfg["tools"].get("card_creator", {}),   **self._creator_tab.get_values()}
         save_config(cfg)
         tooltip("Settings saved.")

@@ -22,6 +22,25 @@ from .stats import load_combined_stats, get_streak
 from .targets import get_target
 
 
+def _practice_questions_available() -> bool:
+    try:
+        import practice_questions  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _open_practice_questions() -> None:
+    try:
+        from practice_questions.library import show_library  # type: ignore
+        show_library()
+    except Exception as e:
+        print(f"[ankisstant] practice_questions launch failed: {e}")
+
+
+_PRACTICE_QS_PLATFORM = {"key": "practice_questions", "name": "Practice Qs"}
+
+
 def _qbank_open_kg_count() -> int:
     return kg_store.count(
         lambda kg: kg.get("source") == "qbank" and kg.get("status") == "open"
@@ -114,8 +133,11 @@ class QBankPanel(QWidget):
         summary_layout = QHBoxLayout(summary_frame)
         summary_layout.setContentsMargins(14, 10, 14, 10)
 
+        pq_present = _practice_questions_available()
+        stats_platforms = list(platforms) + ([_PRACTICE_QS_PLATFORM] if pq_present else [])
+
         try:
-            stats = load_combined_stats(platforms)
+            stats = load_combined_stats(stats_platforms)
             today_iso = date.today().isoformat()
             today_done = stats.get(today_iso, {}).get("total", 0)
             today_target = get_target(date.today(), cfg)
@@ -148,16 +170,24 @@ class QBankPanel(QWidget):
 
         # ── Platform launchers ───────────────────────────────────────────────
         root.addWidget(QLabel("<b>Open QBank</b>"))
-        if platforms:
+        if platforms or pq_present:
             grid = QGridLayout()
             grid.setSpacing(8)
-            for i, p in enumerate(platforms):
+            slot = 0
+            for p in platforms:
                 btn = QPushButton(p["name"])
                 btn.setMinimumHeight(36)
                 btn.clicked.connect(
                     lambda _checked=False, _p=p: open_platform(_p["key"], _p["name"], _p["url"])
                 )
-                grid.addWidget(btn, i // 3, i % 3)
+                grid.addWidget(btn, slot // 3, slot % 3)
+                slot += 1
+            if pq_present:
+                pq_btn = QPushButton("Practice Qs")
+                pq_btn.setMinimumHeight(36)
+                pq_btn.setToolTip("Practice Questions addon — local screenshot library")
+                pq_btn.clicked.connect(lambda _checked=False: _open_practice_questions())
+                grid.addWidget(pq_btn, slot // 3, slot % 3)
             wrapper = QWidget()
             wrapper.setLayout(grid)
             root.addWidget(wrapper)

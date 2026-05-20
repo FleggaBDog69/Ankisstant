@@ -1,5 +1,73 @@
 # Changelog
 
+## 1.5.0
+
+Sidebar reorder, **tag-search mode in Browse**, heatmap fixes, and a
+**QBank picker** for the Practice Questions addon. All Analyse-KG
+settings now live on the Knowledge Gaps tab.
+
+### Added
+- **Browse → Tags mode.** A new Notes / Tags toggle at the top of the
+  Browse panel. In Tags mode, Claude returns `{keyword, resource, step}`
+  triples for the topic; matching tags from your collection are listed
+  with note-counts, the suggested resource (e.g. Boards & Beyond), and
+  the step level. Double-click a tag row to open `tag:"X"` in the Anki
+  browser. Confirm tags + unsuspends every note under the selected tags
+  via the existing tag/unsuspend path.
+- **Practice-Qs QBank attribution dialog.** When a Practice Questions
+  session ends, a small picker asks which QBank it was from (lists every
+  manual-logger profile, plus "Mixed / multiple QBanks", plus a "Don't
+  log" button). Per-QBank picks consolidate into the matching
+  `stats_<slug>.json`; Mixed routes to `stats_practice_questions.json`.
+  Picker is skipped entirely when ankisstant isn't installed.
+
+### Changed
+- **Knowledge Gaps moved to the top of the Ankisstant sidebar.**
+- **Analyse-KG settings folded into the Knowledge Gaps settings tab** as
+  an "Analyse KG (AI sub-feature)" sub-group. The standalone Gap
+  Analyser tab is gone; both `tools.knowledge_gaps` and
+  `tools.gap_analyser` config namespaces continue to be written so no
+  tool code had to change.
+
+### Fixed
+- **UWorld manual sessions now show on the heatmap.**
+  `load_combined_stats` auto-discovers every `stats_*.json` in
+  `user_files/` instead of iterating only the configured QBank
+  platforms, so ad-hoc sources (UWorld, etc.) consolidate into the
+  heatmap without being added to `config.platforms`.
+- **"Open Practice Questions" button above the heatmap now works.**
+  Added a `practice_questions:open` pycmd route that soft-imports
+  `practice_questions.library.show_library`.
+
+## 1.4.1
+
+LO analyser is now embedded **inline on the LO-type KG detail pane** —
+not a standalone page or dialog. Status filters simplified, screenshots
+restored in the UI, and the post-search gap report retired.
+
+### Added
+- **Inline "Analyse this LO" section** on the KG detail pane, visible only
+  when the active KG's type is `lo`. Reads the LO text + tag straight from
+  the KG's schema fields, counts matched cards, and asks Claude what's
+  missing. Accepted gaps are appended into this LO's own **Notes** field —
+  no longer spun out as separate KG entries.
+
+### Changed
+- **Status simplified** to just **Open / Done / Dismissed**. The
+  `in_progress` status is gone; legacy entries carrying it are coerced to
+  `open` on read. Filter chips now match: Open / Done / Dismissed.
+- **`Analyse LO…` dialog removed** from the KG page button row — replaced
+  by the inline section above.
+- **KG detail screenshot rendering fixed.** `_StemEdit` now sets a base URL
+  pointing at Anki's media folder, so saved `<img src="qbank_capture_*.png">`
+  references resolve. Previously-captured QBank items now show their stems
+  in the UI without a re-capture.
+
+### Removed
+- **Browse → "post-search gap report"** retired (settings checkbox,
+  Browse-side code path, and the `enable_gap_report` config key). The
+  inline LO analyser fully covers the same workflow.
+
 ## 1.4.0
 
 Per-type **custom field schemas** for Knowledge Gaps. Each type now owns

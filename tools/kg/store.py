@@ -8,7 +8,7 @@
 #                  missed_queue.json store before unification)
 #   - "browse"   — saved from Browse with Claude when nothing matched
 #
-# Statuses: "open" | "in_progress" | "done" | "dismissed".
+# Statuses: "open" | "done" | "dismissed".
 
 from __future__ import annotations
 
@@ -67,7 +67,9 @@ def save_all(items: list[dict]) -> None:
 # ── normalisation ────────────────────────────────────────────────────────────
 
 VALID_SOURCES = {"manual", "analyse", "qbank", "browse"}
-VALID_STATUSES = {"open", "in_progress", "done", "dismissed"}
+VALID_STATUSES = {"open", "done", "dismissed"}
+# Statuses that no longer exist but may still be in old saved data.
+LEGACY_STATUS_ALIASES = {"in_progress": "open"}
 
 
 def _now() -> str:
@@ -96,6 +98,7 @@ def _normalise(item: dict) -> dict:
     src = out.get("source", "manual")
     out["source"] = src if src in VALID_SOURCES else "manual"
     st = out.get("status", "open")
+    st = LEGACY_STATUS_ALIASES.get(st, st)
     out["status"] = st if st in VALID_STATUSES else "open"
     # Type is a free-form slug (configurable in settings). Default keyed off
     # source so legacy entries get a sensible label.

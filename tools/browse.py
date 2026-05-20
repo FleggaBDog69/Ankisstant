@@ -5,13 +5,11 @@
 
 from __future__ import annotations
 
-import html as _html
-
 from aqt import mw
 from aqt.qt import (
-    QApplication, QCheckBox, QDialog, QDialogButtonBox, QHBoxLayout, QLabel,
-    QLineEdit, QListWidget, QListWidgetItem, QPlainTextEdit, QPushButton, Qt,
-    QVBoxLayout, QWidget,
+    QApplication, QButtonGroup, QCheckBox, QDialogButtonBox, QHBoxLayout,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QPlainTextEdit,
+    QPushButton, QRadioButton, Qt, QVBoxLayout, QWidget,
 )
 from aqt.utils import showWarning, tooltip
 
@@ -55,14 +53,26 @@ RESCOPE_SYSTEM = (
     "Same JSON-array-of-strings format as before. 3–6 items. No prose."
 )
 
-GAP_SYSTEM = (
-    "You audit Anki tag coverage for a medical topic. Given the topic and a list "
-    "of tags present across the matched cards, identify what important sub-areas "
-    "of the topic appear to be missing or under-represented. "
-    "Return a JSON array of short strings (3–8 items), each naming one gap. "
-    "Keep each item under 12 words. No prose, just the JSON array."
+TAG_SEARCH_SYSTEM = (
+    "You generate Anki tag-name keywords for a medical student. Given a topic, "
+    "return a JSON array of 3 to 6 short, specific keyword strings that are "
+    "likely to appear inside that student's Anki tag tree for that topic. "
+    "For each keyword, also suggest a favourite study resource and the USMLE "
+    "step level it's most relevant to.\n\n"
+    "Format — JSON array of objects exactly like:\n"
+    '[{"keyword": "multiple_sclerosis", "resource": "Boards & Beyond — Neuro: MS", "step": "Step 1"}, ...]\n\n'
+    "RULES:\n"
+    "- keyword is matched case-insensitively as a substring against existing tag names, "
+    "so prefer the canonical form (snake_case or PascalCase, no spaces).\n"
+    "- Avoid 1–3 letter abbreviations on their own. Disambiguate them (e.g. 'multiple_sclerosis', "
+    "not 'MS').\n"
+    "- resource is a concise study reference (Boards & Beyond chapter, Pathoma section, "
+    "First Aid page-range, etc.).\n"
+    "- step is one of 'Step 1', 'Step 2 CK', 'Step 3', or 'Step 1+2' if it spans both. "
+    "Use 'AMC' for Australian-context entries when clearly post-graduation.\n"
+    "- 3–6 items, quality over quantity.\n\n"
+    "Return ONLY the JSON array. No prose."
 )
-
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -97,6 +107,9 @@ class BrowsePanel(QWidget):
         self._results: list = []
         self._last_topic = ""
         self._last_terms: list[str] = []
+        # "notes" — Claude → search terms → notes (the original behaviour).
+        # "tags" — Claude → tag keywords → matching tags (study-planning mode).
+        self._mode: str = "notes"
         # When preloaded from a KG, stamp the id here so a successful
         # tag+unsuspend can mark that KG done.
         self._linked_kg_id: str | None = None
@@ -149,6 +162,22 @@ class BrowsePanel(QWidget):
             self,
         ))
         root.addLayout(title_row)
+
+        # Mode toggle — Notes vs Tags.
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Mode:"))
+        self._notes_radio = QRadioButton("Notes")
+        self._notes_radio.setToolTip("Find individual cards/notes matching a topic.")
+        self._tags_radio = QRadioButton("Tags")
+        self._tags_radio.setToolTip(
+            "Find tag groups for a topic — useful for planning study before creating cards."
+        )
+        self._notes_radio.setChecked(True)
+        self._notes_radio.toggled.connect(self._on_mode_changed)
+        mode_row.addWidget(self._notes_radio)
+        mode_row.addWidget(self._tags_radio)
+        mode_row.addStretch(1)
+        root.addLayout(mode_row)
 
         root.addWidget(QLabel("Topic (broad or narrow — Claude figures out the search terms):"))
         topic_row = QHBoxLayout()
@@ -232,6 +261,20 @@ class BrowsePanel(QWidget):
 
     # ── search ────────────────────────────────────────────────────────────────
 
+    def _on_mode_changed(self, _checked: bool) -> None:
+        self._mode = "tags" if self._tags_radio.isChecked() else "notes"
+        # Different result kinds → clear what's there so the UI is consistent.
+        self.results_list.clear()
+        self._results = []
+        self._last_terms = []
+        self.broader_btn.setEnabled(False)
+        self.narrower_btn.setEnabled(False)
+        self.confirm_btn.setEnabled(False)
+        if self._mode == "tags":
+            self.status.setText("Tags mode — find tag groups for study planning.")
+        else:
+            self.status.setText("")
+
     def _on_search(self):
         if not anki_utils.require_col():
             return
@@ -239,10 +282,13 @@ class BrowsePanel(QWidget):
         if not topic:
             return
         self._last_topic = topic
-        self._search_with_system(
-            SEARCH_TERMS_SYSTEM, f"Topic: {topic}",
-            status_label="Asking Claude for search terms…",
-        )
+        if self._mode == "tags":
+            self._search_tags(topic)
+        else:
+            self._search_with_system(
+                SEARCH_TERMS_SYSTEM, f"Topic: {topic}",
+                status_label="Asking Claude for search terms…",
+            )
 
     def _rescope(self, direction: str):
         if not self._last_topic or not self._last_terms:
@@ -297,9 +343,101 @@ class BrowsePanel(QWidget):
         self._refresh_rescope_enabled()
 
     def _refresh_rescope_enabled(self):
-        ok = bool(self._last_topic and self._last_terms)
+        # Broader / Narrower are notes-mode-only — tag-mode prompts are different.
+        ok = bool(self._last_topic and self._last_terms) and self._mode == "notes"
         self.broader_btn.setEnabled(ok)
         self.narrower_btn.setEnabled(ok)
+
+    # ── tag-search mode ───────────────────────────────────────────────────────
+
+    def _search_tags(self, topic: str) -> None:
+        self.broader_btn.setEnabled(False)
+        self.narrower_btn.setEnabled(False)
+        self.status.setText("Asking Claude for tag keywords…")
+
+        model = self.cfg.get("model") or None
+        with loading(self.search_btn, "Asking Claude…"):
+            entries = core_api.ask_claude_json(
+                prompt=f"Topic: {topic}",
+                system=TAG_SEARCH_SYSTEM,
+                max_tokens=768,
+                model=model,
+            )
+        if not isinstance(entries, list):
+            self.status.setText("")
+            return
+
+        cleaned: list[dict] = []
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            kw = (e.get("keyword") or "").strip()
+            if not kw:
+                continue
+            cleaned.append({
+                "keyword":  kw,
+                "resource": (e.get("resource") or "").strip(),
+                "step":     (e.get("step") or "").strip(),
+            })
+        if not cleaned:
+            self.status.setText("Claude returned no usable tag keywords.")
+            return
+
+        self._last_terms = [e["keyword"] for e in cleaned]
+        self.status.setText("Scanning your tags…")
+        QApplication.processEvents()
+
+        with loading(self.search_btn, "Scanning tags…"):
+            tag_rows = self._resolve_tags(cleaned)
+        self._populate_tag_results(tag_rows, cleaned)
+
+    def _resolve_tags(self, entries: list[dict]) -> list[dict]:
+        """For each keyword, find matching tag names in the collection and
+        produce one row per unique tag (preferring the first keyword that
+        matched, so display order is stable)."""
+        all_tags = list(mw.col.tags.all())
+        seen: dict[str, dict] = {}
+        for entry in entries:
+            needle = entry["keyword"].lower()
+            for t in all_tags:
+                if needle in t.lower() and t not in seen:
+                    nids = list(mw.col.find_notes(f'tag:"{t}"'))
+                    seen[t] = {
+                        "tag":      t,
+                        "keyword":  entry["keyword"],
+                        "resource": entry["resource"],
+                        "step":     entry["step"],
+                        "nids":     nids,
+                        "n_notes":  len(nids),
+                    }
+        # Sort by note-count desc — most populated tags first.
+        return sorted(seen.values(), key=lambda r: -r["n_notes"])
+
+    def _populate_tag_results(self, tag_rows: list[dict], entries: list[dict]) -> None:
+        self.results_list.blockSignals(True)
+        self.results_list.clear()
+        self._results = tag_rows
+        for row in tag_rows:
+            meta_bits = [f"{row['n_notes']} note{'s' if row['n_notes'] != 1 else ''}"]
+            if row["resource"]:
+                meta_bits.append(row["resource"])
+            if row["step"]:
+                meta_bits.append(row["step"])
+            label = f"{row['tag']}   ·   {'  ·  '.join(meta_bits)}"
+            item = QListWidgetItem(label)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Unchecked)
+            item.setData(Qt.ItemDataRole.UserRole, row["tag"])
+            self.results_list.addItem(item)
+        self.results_list.blockSignals(False)
+
+        breakdown = ", ".join(e["keyword"] for e in entries)
+        self.status.setText(
+            f"Found {len(tag_rows)} matching tag(s) for: {breakdown}. "
+            "Double-click to open a tag in the browser."
+        )
+        self._update_count()
+        self.confirm_btn.setEnabled(len(tag_rows) > 0)
 
     def _run_searches(self, terms, notetype_filter, max_results):
         seen: set[int] = set()
@@ -395,22 +533,30 @@ class BrowsePanel(QWidget):
         return nids
 
     def _on_item_double_clicked(self, item):
-        nid = int(item.data(Qt.ItemDataRole.UserRole))
+        if self._mode == "tags":
+            tag = str(item.data(Qt.ItemDataRole.UserRole) or "")
+            if not tag:
+                return
+            query = f'tag:"{tag}"'
+        else:
+            nid = int(item.data(Qt.ItemDataRole.UserRole))
+            query = f"nid:{nid}"
         try:
             from aqt import dialogs
             browser = dialogs.open("Browser", mw)
-            query = f"nid:{nid}"
             if hasattr(browser, "search_for_terms"):
                 browser.search_for_terms(query)
             else:
                 browser.form.searchEdit.lineEdit().setText(query)
                 browser.onSearchActivated()
         except Exception as e:
-            print(f"[ankisstant] couldn't open browser for nid {nid}: {e}")
+            print(f"[ankisstant] couldn't open browser for {query!r}: {e}")
 
     # ── confirm ───────────────────────────────────────────────────────────────
 
     def _refresh_badges(self):
+        if self._mode != "notes":
+            return  # tag-mode rows don't carry per-note suspension state
         front_field = self.cfg.get("front_field", "Text")
         source_tags = self.cfg.get("source_tags", []) or []
         for i in range(self.results_list.count()):
@@ -432,17 +578,44 @@ class BrowsePanel(QWidget):
             prefix = " ".join(prefix_bits)
             item.setText(f"{prefix}  {preview}" if prefix else preview)
 
+    def _selected_tag_rows(self) -> list[dict]:
+        rows: list[dict] = []
+        by_tag = {r["tag"]: r for r in self._results} if self._mode == "tags" else {}
+        for i in range(self.results_list.count()):
+            item = self.results_list.item(i)
+            if item.checkState() != Qt.CheckState.Checked:
+                continue
+            tag = str(item.data(Qt.ItemDataRole.UserRole) or "")
+            row = by_tag.get(tag)
+            if row is not None:
+                rows.append(row)
+        return rows
+
     def _on_confirm(self):
         if not anki_utils.require_col():
-            return
-        nids = self._selected_nids()
-        if not nids:
-            tooltip("No notes selected.")
             return
         tag = self.tag_input.text().strip()
         if not tag:
             showWarning("Tag is empty. Type a tag before confirming.")
             return
+
+        if self._mode == "tags":
+            rows = self._selected_tag_rows()
+            if not rows:
+                tooltip("No tags selected.")
+                return
+            nid_set: set[int] = set()
+            for row in rows:
+                nid_set.update(row.get("nids") or [])
+            nids = list(nid_set)
+            if not nids:
+                tooltip("Selected tags had no notes.")
+                return
+        else:
+            nids = self._selected_nids()
+            if not nids:
+                tooltip("No notes selected.")
+                return
 
         cids = []
         for nid in nids:
@@ -491,47 +664,6 @@ class BrowsePanel(QWidget):
             except Exception as e:
                 print(f"[ankisstant] mark KG done from Browse failed: {e}")
             self._linked_kg_id = None
-
-        if self.cfg.get("enable_gap_report", False):
-            self._show_gap_report()
-
-    def _show_gap_report(self):
-        topic = self.topic.text().strip()
-        all_tags = set()
-        for _nid, _p, tags, _src, _s, _t in self._results:
-            for t in tags:
-                all_tags.add(t)
-
-        self.status.setText("Asking Claude what's missing…")
-        QApplication.processEvents()
-
-        prompt = (
-            f"Topic: {topic}\n\n"
-            f"Tags present across the {len(self._results)} matched notes:\n"
-            + "\n".join(f"- {t}" for t in sorted(all_tags))
-        )
-        gaps = core_api.ask_claude_json(
-            prompt=prompt, system=GAP_SYSTEM, max_tokens=400,
-            model=self.cfg.get("model") or None,
-        )
-        if not isinstance(gaps, list):
-            self.status.setText("")
-            return
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle(f"Possible gaps for: {topic}")
-        dlg.setMinimumWidth(480)
-        v = QVBoxLayout(dlg)
-        v.addWidget(QLabel(f"<b>Possible gaps for &quot;{_html.escape(topic)}&quot;:</b>"))
-        body = QPlainTextEdit()
-        body.setReadOnly(True)
-        body.setPlainText("\n".join(f"• {g}" for g in gaps))
-        v.addWidget(body, 1)
-        close = QPushButton("Close")
-        close.clicked.connect(dlg.accept)
-        v.addWidget(close)
-        self.status.setText("Done.")
-        dlg.exec()
 
 
 # ── Tool contract ────────────────────────────────────────────────────────────

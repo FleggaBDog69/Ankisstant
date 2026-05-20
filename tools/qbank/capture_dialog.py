@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 
 from aqt import mw
 from aqt.qt import (
     QBuffer, QDialog, QHBoxLayout, QImage, QIODevice, QKeySequence, QLabel,
-    QLineEdit, QPushButton, QShortcut, Qt, QTextEdit, QVBoxLayout,
+    QLineEdit, QPushButton, QShortcut, Qt, QTextEdit, QUrl, QVBoxLayout,
 )
 
 from ...core.config import tool_config, save_tool_config
@@ -17,6 +18,30 @@ from ..kg import store as kg_store
 
 class _StemEdit(QTextEdit):
     """Accepts pasted images, saving them to Anki's media folder."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # Resolve relative <img src="qbank_capture_*.png"> references against
+        # Anki's media folder. Without this, saved screenshots come back as
+        # broken-image icons after the dialog reopens.
+        self._apply_media_base_url()
+
+    def _apply_media_base_url(self) -> None:
+        try:
+            if mw.col is None:
+                return
+            media_dir = mw.col.media.dir()
+            if not media_dir.endswith(os.sep):
+                media_dir += os.sep
+            self.document().setBaseUrl(QUrl.fromLocalFile(media_dir))
+        except Exception as e:
+            print(f"[ankisstant] _StemEdit base url failed: {e}")
+
+    def setHtml(self, html) -> None:
+        # Re-assert the base URL on every reload — Qt resets the document on
+        # setHtml in some versions, which loses the resolver.
+        self._apply_media_base_url()
+        super().setHtml(html)
 
     def insertFromMimeData(self, source) -> None:
         if source.hasImage():

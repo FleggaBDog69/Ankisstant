@@ -52,7 +52,6 @@ DEFAULTS: dict = {
             "notetype_filter": "",
             "front_field": "Text",
             "audit_tag": "Ankisstant::AI::Browse",
-            "enable_gap_report": False,
             "source_tags": [],
         },
         "gap_analyser": {

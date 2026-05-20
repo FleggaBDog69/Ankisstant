@@ -89,6 +89,15 @@ def handle_pycmd(message: str) -> tuple[bool, object]:
         open_session_dialog()
         return (True, None)
 
+    if message == "practice_questions:open":
+        # Soft bridge to the practice_questions addon if it's installed.
+        try:
+            from practice_questions.library import show_library  # type: ignore
+            show_library()
+        except Exception as e:
+            print(f"[ankisstant] practice_questions launch failed: {e}")
+        return (True, None)
+
     if message in ("qbank:heatmap:prev", "qbank:heatmap:next", "qbank:heatmap:today"):
         if message == "qbank:heatmap:prev":
             _heatmap.shift_offset(-1)

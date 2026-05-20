@@ -171,7 +171,6 @@ def _migrate_config() -> None:
             ("notetype_filter", "notetype_filter"),
             ("front_field", "front_field"),
             ("audit_tag", "audit_tag"),
-            ("enable_gap_report", "enable_gap_report"),
             ("source_tags", "source_tags"),
         ]:
             if src_key in br:

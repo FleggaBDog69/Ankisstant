@@ -18,9 +18,9 @@ from ..core.config import (
 
 # (tool_key, display_label, module_dotted_path)
 TOOLS: list[tuple[str, str, str]] = [
+    ("knowledge_gaps",   "Knowledge Gaps",      "ankisstant.tools.knowledge_gaps"),
     ("qbank",            "QBank with Claude",   "ankisstant.tools.qbank"),
     ("browse",           "Browse with Claude",  "ankisstant.tools.browse"),
-    ("knowledge_gaps",   "Knowledge Gaps",      "ankisstant.tools.knowledge_gaps"),
     ("card_creator",     "Create with Claude",  "ankisstant.tools.card_creator"),
 ]
 
