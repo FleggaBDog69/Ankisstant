@@ -94,4 +94,4 @@ the *Card Management* addon (©  Ren Tatsumoto, AGPL v3). See `NOTICES.md`.
 
 ## Bug reports / feedback
 
-Right now: just message Fletcher directly.
+Right now: just message Flegga directly.

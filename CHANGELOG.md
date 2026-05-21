@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.5.1
+
+Housekeeping: author/repo identity updated.
+
+### Changed
+- Author renamed from "Fletcher Bucat" to "Flegga" in `manifest.json`.
+- Homepage URL updated to `https://github.com/FleggaBDog69/Ankisstant`.
+- Stray name references in README and earlier changelog entries updated to "Flegga".
+
 ## 1.5.0
 
 Sidebar reorder, **tag-search mode in Browse**, heatmap fixes, and a
@@ -169,7 +178,7 @@ QBank misses, and manual additions — flows through one persistent list.
 
 ## 1.1.0
 
-Hardening pass before sharing the addon outside Fletcher's profile.
+Hardening pass before sharing the addon outside Flegga's profile.
 
 ### Added
 - First-launch **welcome wizard** (`ui/welcome.py`) — pick provider, test
