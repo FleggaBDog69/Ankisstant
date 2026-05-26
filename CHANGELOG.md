@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.6.5
+
+### Fixed
+- **All tools showed "Tool disabled — enable in Settings" after an AnkiWeb
+  install.** The main window loaded each tool panel via a hardcoded
+  `ankisstant.tools.*` module path. AnkiWeb names the add-on folder by its
+  numeric ID, not `ankisstant`, so every panel import failed and fell back to
+  the disabled placeholder — even though the tools were enabled in Settings.
+  Local "Install from file" builds were unaffected (the folder is literally
+  `ankisstant`), which is why it only surfaced on the first AnkiWeb download.
+  Module paths are now derived from the package's real name at runtime.
+
 ## 1.6.4
 
 ### Fixed

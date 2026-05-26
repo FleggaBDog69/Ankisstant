@@ -16,12 +16,18 @@ from ..core.config import (
 )
 
 
+# Root package name as actually loaded. Installing from AnkiWeb names the
+# add-on folder by its numeric ID (e.g. "123456789"), not "ankisstant", so the
+# module path must be derived at runtime — hardcoding "ankisstant.*" only works
+# for local "Install from file" builds and breaks every AnkiWeb download.
+_PKG = __name__.split(".")[0]
+
 # (tool_key, display_label, module_dotted_path)
 TOOLS: list[tuple[str, str, str]] = [
-    ("knowledge_gaps",   "Knowledge Gaps",      "ankisstant.tools.knowledge_gaps"),
-    ("qbank",            "AI QBank",   "ankisstant.tools.qbank"),
-    ("browse",           "AI Browse",  "ankisstant.tools.browse"),
-    ("card_creator",     "AI Create",  "ankisstant.tools.card_creator"),
+    ("knowledge_gaps",   "Knowledge Gaps",  f"{_PKG}.tools.knowledge_gaps"),
+    ("qbank",            "AI QBank",        f"{_PKG}.tools.qbank"),
+    ("browse",           "AI Browse",       f"{_PKG}.tools.browse"),
+    ("card_creator",     "AI Create",       f"{_PKG}.tools.card_creator"),
 ]
 
 
