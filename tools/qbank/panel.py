@@ -91,21 +91,21 @@ class QBankPanel(QWidget):
         root.setSpacing(14)
 
         title_row = QHBoxLayout()
-        title = QLabel("<h2 style='margin:0'>QBank with Claude</h2>")
+        title = QLabel("<h2 style='margin:0'>AI QBank</h2>")
         title.setTextFormat(Qt.TextFormat.RichText)
         title_row.addWidget(title)
         title_row.addStretch(1)
         title_row.addWidget(make_help_button(
-            "QBank with Claude — help",
+            "AI QBank — help",
             "<h3>What it does</h3>"
             "<p>Open a QBank platform inside Anki, capture questions you got "
-            "wrong, and queue them for review. Claude finds the matching Anki "
+            "wrong, and queue them for review. AI finds the matching Anki "
             "cards so you can re-rate them as Again.</p>"
             "<h3>Workflow</h3>"
             "<ol>"
             "<li>Click <b>Capture missed</b> (or open one of the platform "
             "buttons) and paste the stem + correct answer.</li>"
-            "<li>Open <b>Review</b> — Claude searches your collection. "
+            "<li>Open <b>Review</b> — AI searches your collection. "
             "Tag &amp; re-grade matching cards, or create a new one.</li>"
             "<li>Watch the daily heatmap on the deck browser fill up.</li>"
             "</ol>"
@@ -114,7 +114,7 @@ class QBankPanel(QWidget):
             "On older schedulers the addon falls back to a queue reset.</p>"
             "<h3>Settings</h3>"
             "<p>Platforms, targets, default notetype, and the 'missed questions' "
-            "field name are in <b>Ankisstant Settings → QBank with Claude</b>.</p>",
+            "field name are in <b>Ankisstant Settings → AI QBank</b>.</p>",
             self,
         ))
         root.addLayout(title_row)

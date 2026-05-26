@@ -19,9 +19,9 @@ from ..core.config import (
 # (tool_key, display_label, module_dotted_path)
 TOOLS: list[tuple[str, str, str]] = [
     ("knowledge_gaps",   "Knowledge Gaps",      "ankisstant.tools.knowledge_gaps"),
-    ("qbank",            "QBank with Claude",   "ankisstant.tools.qbank"),
-    ("browse",           "Browse with Claude",  "ankisstant.tools.browse"),
-    ("card_creator",     "Create with Claude",  "ankisstant.tools.card_creator"),
+    ("qbank",            "AI QBank",   "ankisstant.tools.qbank"),
+    ("browse",           "AI Browse",  "ankisstant.tools.browse"),
+    ("card_creator",     "AI Create",  "ankisstant.tools.card_creator"),
 ]
 
 
@@ -67,6 +67,11 @@ class MainWindow(QDialog):
         # pops one at a time, and a kg_id (when set) is marked done in the
         # KG store on successful Add.
         self.gap_queue: list[dict] = []
+        # Session-scoped queue of KGs waiting to be looked up in Browse.
+        # Items are full KG dicts (id, title, fields, tags, type). The
+        # Knowledge Gaps page pushes here; Browse works through them and a
+        # successful Tag & Unsuspend marks the KG done and advances.
+        self.browse_queue: list[dict] = []
 
         self._build()
         self.refresh_queue_badge()
@@ -155,18 +160,24 @@ class MainWindow(QDialog):
     # ── queue handoff (Browse → Create) ───────────────────────────────────────
 
     def refresh_queue_badge(self) -> None:
-        """Update the Create-with-Claude nav button label to show the queued
-        gap count, if any. Called by Browse after pushing, and by Create after
-        popping."""
-        btn = self._nav_buttons.get("card_creator")
-        if btn is None:
-            return
-        base = "Create with Claude"
-        n = len(self.gap_queue)
-        btn.setText(f"{base}  ●{n}" if n else base)
-        btn.setToolTip(
-            f"{n} gap{'s' if n != 1 else ''} queued from Browse" if n else ""
-        )
+        """Update the Create and Browse nav button labels to show their queued
+        counts. Called whenever either queue changes."""
+        create_btn = self._nav_buttons.get("card_creator")
+        if create_btn is not None:
+            n = len(self.gap_queue)
+            base = "AI Create"
+            create_btn.setText(f"{base}  ●{n}" if n else base)
+            create_btn.setToolTip(
+                f"{n} gap{'s' if n != 1 else ''} queued for Create" if n else ""
+            )
+        browse_btn = self._nav_buttons.get("browse")
+        if browse_btn is not None:
+            n = len(self.browse_queue)
+            base = "AI Browse"
+            browse_btn.setText(f"{base}  ●{n}" if n else base)
+            browse_btn.setToolTip(
+                f"{n} KG{'s' if n != 1 else ''} queued for Browse" if n else ""
+            )
 
     def show_create_tool(self) -> None:
         """Programmatic switch to the Create tool — used after Browse hands off
@@ -175,6 +186,14 @@ class MainWindow(QDialog):
         if btn is not None and btn.isEnabled():
             btn.setChecked(True)
         self._show_tool("card_creator")
+
+    def show_browse_tool(self) -> None:
+        """Programmatic switch to the Browse tool — used after the KG page
+        queues gaps for Browse."""
+        btn = self._nav_buttons.get("browse")
+        if btn is not None and btn.isEnabled():
+            btn.setChecked(True)
+        self._show_tool("browse")
 
     def _show_tool(self, key: str) -> None:
         # Pick a panel: tool's get_panel() if enabled, else a placeholder.

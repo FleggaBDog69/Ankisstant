@@ -234,7 +234,7 @@ def build_card_html(platforms: list, cfg: dict) -> str:
     )
     practice_qs_btn = (
         '<button class="ec-btn" onclick="pycmd(\'practice_questions:open\')"'
-        ' title="Practice Questions addon — local screenshot library">Practice Qs</button>'
+        ' title="Practice Questions addon — launcher">Practice Qs</button>'
         if pq_present else ""
     )
     settings_btn = '<button class="ec-btn ec-settings-btn" onclick="pycmd(\'ankisstant:settings\')" title="Settings">⚙</button>'

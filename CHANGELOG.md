@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.6
+
+Documentation overhaul: all five providers now fully documented with per-path setup guides.
+UI polish and usability improvements.
+
+### Added
+- `docs/setup-paste.md` — zero-friction paste import guide (any free chatbot)
+- `docs/setup-gemini.md` — Gemini free tier setup (5 steps, no payment required)
+- `docs/setup-ollama.md` — Ollama local AI setup guide
+- `docs/setup-claude-cli.md` — Claude CLI and Anthropic API setup
+- `docs/customising-cards.md` — card format customisation guide (system prompt override, skills, per-notetype profiles)
+- Credits: Dr Patrick Lee (drpatricklee.substack.com) and Review Heatmap addon
+
+### Changed
+- README rewritten: outcome-first, provider-tier table, ChatGPT Plus ≠ API callout, Gemini privacy caveat
+- ANKIWEB.md updated to reflect all providers; paste import path highlighted
+- `manifest.json` description updated to reflect multi-provider support
+
 ## 1.5.1
 
 Housekeeping: author/repo identity updated.

@@ -15,7 +15,7 @@ from .session_dialog import open_session_dialog
 from .stats import ensure_storage
 
 
-NAME = "QBank with Claude"
+NAME = "AI QBank"
 
 _panel: QBankPanel | None = None
 _scroll: QScrollArea | None = None
@@ -92,8 +92,8 @@ def handle_pycmd(message: str) -> tuple[bool, object]:
     if message == "practice_questions:open":
         # Soft bridge to the practice_questions addon if it's installed.
         try:
-            from practice_questions.library import show_library  # type: ignore
-            show_library()
+            from practice_questions.launcher import show_launcher  # type: ignore
+            show_launcher()
         except Exception as e:
             print(f"[ankisstant] practice_questions launch failed: {e}")
         return (True, None)

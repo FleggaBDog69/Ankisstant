@@ -1,4 +1,4 @@
-# Create Cards with Claude — propose cloze cards from source or topic, review,
+# AI Create — propose cloze cards from source or topic, review,
 # then create or open in Add Screen.
 #
 # Exposes init() and get_panel() per the Ankisstant tool contract.
@@ -25,14 +25,18 @@ from aqt.qt import (
 from aqt.utils import askUser, showWarning, tooltip
 
 from ..core import anki_utils, api as core_api, log
-from ..core.config import load_config, tool_config, save_tool_config
+from ..core.config import (
+    active_family, auto_tag_base, format_hierarchical_tag, load_config, month_tag,
+    tool_config, tool_model, save_tool_config,
+)
 from ..core.qt_utils import (
-    attach_tag_completer, loading, make_help_button, make_setup_banner,
-    provider_configured,
+    attach_tag_completer, is_manual_provider, loading, make_help_button,
+    make_setup_banner, provider_configured, run_claude_json,
+    set_ai_buttons_enabled,
 )
 
 
-NAME = "Create with Claude"
+NAME = "AI Create"
 
 
 # ── prompts ───────────────────────────────────────────────────────────────────
@@ -132,6 +136,148 @@ ONE_BY_ONE_SYSTEM = (
 )
 
 
+AUTO_TAG_SYSTEM = (
+    "You extract a hierarchical Anki tag path from a clinical concept.\n\n"
+    "Given the title and optional context of a knowledge gap, return a JSON "
+    "object: {\"system\": \"...\", \"subsystem\": \"...\", \"topic\": \"...\"}.\n\n"
+    "RULES:\n"
+    "- system: top-level body system or domain — e.g. Cardio, Neuro, Endo, GI, "
+    "Resp, Renal, Heme, MSK, Derm, Repro, Psych, ID, Onc, Pharm, Stats, "
+    "Genetics, Biochem, Immuno. Pick the single best fit.\n"
+    "- subsystem: more specific anatomy / disease category within the system — "
+    "e.g. Arrhythmias for Cardio, Stroke for Neuro, Diabetes for Endo.\n"
+    "- topic: the most specific clinical entity, drug, sign, or mechanism — "
+    "e.g. AFib, MCA_stroke, Digoxin, McDonald_criteria.\n"
+    "- Use PascalCase or snake_case (no spaces, no '::', no slashes).\n"
+    "- Avoid generic placeholders ('General', 'Misc', 'Other'). If a level is "
+    "genuinely unclear, return an empty string for that level — the caller "
+    "will skip it.\n\n"
+    "Return ONLY the JSON object. No prose, no markdown fences."
+)
+
+
+def _kg_type_meta(kg_type_key: str) -> dict | None:
+    """Look up a KG type's settings (auto_tag flag + prefix) from config.
+    Returns None if no matching type exists."""
+    if not kg_type_key:
+        return None
+    try:
+        types = tool_config("knowledge_gaps").get("types") or []
+    except Exception:
+        return None
+    key = kg_type_key.lower().strip()
+    for t in types:
+        if isinstance(t, dict) and str(t.get("key", "")).lower() == key:
+            return t
+    return None
+
+
+def _default_kg_type_meta() -> dict | None:
+    """The KG type used to tag pasted cards when no gap is loaded — the
+    configured default-on-add type, else the first defined type."""
+    try:
+        kgc = tool_config("knowledge_gaps")
+        types = kgc.get("types") or []
+        default_key = str(kgc.get("default_type_on_add") or "kg").lower()
+        for t in types:
+            if isinstance(t, dict) and str(t.get("key", "")).lower() == default_key:
+                return t
+        return types[0] if types and isinstance(types[0], dict) else None
+    except Exception:
+        return None
+
+
+def _apply_tag_levels(gap: dict, type_meta: dict, levels: dict) -> str:
+    """Format {system, subsystem, topic} levels into the consolidated
+    {base}::{type}::… tag, cache it on the gap, and persist it to the KG store.
+    Returns '' if unusable (tagging off, no base, or this type opted out)."""
+    if not isinstance(type_meta, dict) or not type_meta.get("auto_tag"):
+        return ""
+    base = auto_tag_base()
+    if not base:
+        return ""
+    type_seg = type_meta.get("name") or type_meta.get("key") or ""
+    tag = format_hierarchical_tag(base, levels or {}, type_seg=type_seg)
+    if not tag or tag == base:
+        return ""
+    gap["auto_tag"] = tag
+    kg_id = gap.get("kg_id")
+    if kg_id:
+        try:
+            from .kg import store as kg_store
+            existing = kg_store.get(kg_id)
+            if existing:
+                fields = dict(existing.get("fields") or {})
+                fields["auto_tag"] = tag
+                kg_store.update(kg_id, fields=fields)
+        except Exception as e:
+            print(f"[ankisstant] auto-tag persist failed: {e}")
+    return tag
+
+
+# Appended to the card-gen system prompt to fold tag classification into the
+# SAME request (one round-trip — important in manual mode, where each call is a
+# copy/paste dialog). The reply becomes an object instead of a bare array.
+MERGED_TAG_INSTRUCTIONS = (
+    "\n\nTAG CLASSIFICATION (REQUIRED)\n"
+    "In addition to the cards, classify this material into a hierarchical tag. "
+    "Return your ENTIRE answer as a JSON OBJECT (not a bare array):\n"
+    '  {"tags": {"system": "...", "subsystem": "...", "topic": "..."}, '
+    '"cards": [ ...the card objects exactly as specified above... ]}\n'
+    "Tag rules:\n"
+    "- system: top-level body system/domain — Cardio, Neuro, Endo, GI, Resp, "
+    "Renal, Heme, MSK, Derm, Repro, Psych, ID, Onc, Pharm, Stats, Genetics, "
+    "Biochem, Immuno. Single best fit.\n"
+    "- subsystem: more specific category within the system (e.g. Arrhythmias, "
+    "Stroke, Diabetes).\n"
+    "- topic: most specific entity/drug/sign/mechanism (e.g. AFib, Digoxin).\n"
+    "- PascalCase or snake_case; no spaces, '::', or slashes. Use an empty "
+    "string for any level that's genuinely unclear.\n"
+    'The "cards" array uses EXACTLY the card object shape described above.'
+)
+
+
+def _generate_auto_tag_for_gap(gap: dict, type_meta: dict, model: str | None = None) -> str:
+    """Ask Claude for {system, subsystem, topic} for this KG and format the
+    tag. Returns '' on failure. Cached on the gap dict to avoid re-calls."""
+    if not isinstance(gap, dict) or not isinstance(type_meta, dict):
+        return ""
+    if not type_meta.get("auto_tag"):
+        return ""
+    # Cached on the gap dict (set by previous Generate run for the same KG).
+    cached = (gap.get("auto_tag") or "").strip()
+    if cached:
+        return cached
+    if not auto_tag_base():
+        return ""
+    title = (gap.get("title") or "").strip()
+    if not title:
+        return ""
+    # Build a compact context — title + stripped stem + notes.
+    context_bits = [f"Title: {title}"]
+    stem = (gap.get("stem_html") or "").strip()
+    if stem:
+        plain = re.sub(r"<[^>]+>", " ", stem)
+        plain = re.sub(r"\s+", " ", plain).strip()
+        if plain:
+            context_bits.append(f"Stem: {plain[:600]}")
+    notes = (gap.get("notes") or "").strip()
+    if notes:
+        context_bits.append(f"Notes: {notes[:300]}")
+    user_msg = "\n".join(context_bits)
+    try:
+        resp = core_api.ask_claude_json(
+            prompt=user_msg, system=AUTO_TAG_SYSTEM,
+            max_tokens=256, model=model,
+        )
+    except Exception as e:
+        print(f"[ankisstant] auto-tag Claude call failed: {e}")
+        return ""
+    if not isinstance(resp, dict):
+        return ""
+    return _apply_tag_levels(gap, type_meta, resp)
+
+
 # ── small helpers ────────────────────────────────────────────────────────────
 
 def _profile_for(cfg: dict, name: str) -> dict | None:
@@ -172,29 +318,30 @@ def _resolve_skill(profile: dict | None) -> tuple[str, str]:
       - api_skill_id     → Anthropic custom skill ID passed to the skills
                            beta (forces the API path in api.py).
 
-    Mode rules:
-      - provider_mode=cli  → invocation only (ignore API ID).
-      - provider_mode=api  → API skill ID only (ignore invocation).
-      - provider_mode=auto → if API ID is set, use it (forces API path);
-                            otherwise fall back to the CLI invocation.
+    Mode rules (provider is cfg["provider"]):
+      - cli       → invocation only (ignore API ID).
+      - anthropic → API skill ID only (ignore invocation).
+      - auto / gemini / openai → if API ID is set, use it (forces the Anthropic
+                    API skills path); otherwise fall back to the CLI invocation.
+                    (Skills are Anthropic-only, so gemini/openai behave like auto.)
     """
     if not profile:
         return ("", "")
     cfg = load_config()
-    mode = (cfg.get("provider_mode") or "auto").lower()
+    provider = (cfg.get("provider") or "auto").lower()
     skill_id = (profile.get("card_creation_skill_id") or "").strip()
     invocation = (profile.get("card_creation_skill_invocation") or "").strip()
-    if mode == "cli":
+    if provider == "cli":
         return (invocation, "")
-    if mode == "api":
+    if provider == "anthropic":
         if invocation and not skill_id:
             log.warning(
                 f"card_creator: profile '{profile.get('name', '?')}' has a CLI "
-                "skill invocation but provider_mode=api; upload the skill to "
+                "skill invocation but provider=anthropic; upload the skill to "
                 "Anthropic and paste its skill_… ID to activate it."
             )
         return ("", skill_id)
-    # auto
+    # auto / gemini / openai
     if skill_id:
         return ("", skill_id)
     return (invocation, "")
@@ -316,6 +463,69 @@ def _append_session(mode, source, topic, cards_proposed, cards_created, card_ids
 
 # ── input panel ──────────────────────────────────────────────────────────────
 
+def _prompt_for_pasted_cards(parent):
+    """A single paste box for the user to drop the card JSON their own AI
+    produced — a bare [...] array, or a {"tags":…, "cards":[…]} object. Code
+    fences and surrounding chatter are tolerated (core_api.extract_json).
+    Returns the parsed value, or None if cancelled / nothing usable found."""
+    dlg = QDialog(parent)
+    dlg.setWindowTitle("Paste cards from your AI")
+    dlg.setMinimumSize(560, 460)
+    v = QVBoxLayout(dlg)
+
+    intro = QLabel(
+        "Paste the JSON your AI produced — either a bare array of "
+        "<code>{\"front\", \"extra\"}</code> cards, or a "
+        "<code>{\"tags\": …, \"cards\": […]}</code> object. Code fences and "
+        "surrounding text are fine."
+    )
+    intro.setTextFormat(Qt.TextFormat.RichText)
+    intro.setWordWrap(True)
+    v.addWidget(intro)
+
+    box = QPlainTextEdit()
+    box.setPlaceholderText('[{"front": "…{{c1::…}}…", "extra": "…"}]')
+    v.addWidget(box, 1)
+
+    err = QLabel("")
+    err.setStyleSheet("color: #c0392b;")
+    err.setWordWrap(True)
+    err.setVisible(False)
+    v.addWidget(err)
+
+    bb = QDialogButtonBox(
+        QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+    )
+    bb.button(QDialogButtonBox.StandardButton.Ok).setText("Review cards")
+    v.addWidget(bb)
+
+    holder: dict = {"value": None}
+
+    def _accept():
+        raw = box.toPlainText().strip()
+        if not raw:
+            err.setText("Paste your AI's reply first.")
+            err.setVisible(True)
+            return
+        parsed = core_api.extract_json(raw)
+        if parsed is None:
+            err.setText(
+                "Couldn't find valid JSON in that paste. Make sure you copied "
+                "the whole reply (the array or object), then try again."
+            )
+            err.setVisible(True)
+            return
+        holder["value"] = parsed
+        dlg.accept()
+
+    bb.accepted.connect(_accept)
+    bb.rejected.connect(dlg.reject)
+
+    if dlg.exec() != QDialog.DialogCode.Accepted:
+        return None
+    return holder["value"]
+
+
 class CreatorPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -347,20 +557,20 @@ class CreatorPanel(QWidget):
         self.refresh_setup_banner()
 
         title_row = QHBoxLayout()
-        title = QLabel("<h2 style='margin:0'>Create with Claude</h2>")
+        title = QLabel("<h2 style='margin:0'>AI Create</h2>")
         title.setTextFormat(Qt.TextFormat.RichText)
         title_row.addWidget(title)
         title_row.addStretch(1)
         title_row.addWidget(make_help_button(
-            "Create with Claude — help",
+            "AI Create — help",
             "<h3>What it does</h3>"
             "<p>Draft Anki cloze cards from a topic, pasted text, a URL, "
             "or attached PDFs / PowerPoints. Review each card before adding.</p>"
             "<h3>Input modes</h3>"
             "<ul>"
-            "<li><b>From topic</b> — Claude writes cards from scratch on a topic.</li>"
+            "<li><b>From topic</b> — AI writes cards from scratch on a topic.</li>"
             "<li><b>From source</b> — paste text, fetch a URL, or attach a PDF / PPTX. "
-            "PDFs are passed to Claude directly. PPTX files have their text "
+            "PDFs are passed to AI directly. PPTX files have their text "
             "extracted locally (image-only slides won't work).</li>"
             "</ul>"
             "<h3>Workflow</h3>"
@@ -376,7 +586,7 @@ class CreatorPanel(QWidget):
             "</ul></ol>"
             "<h3>Settings</h3>"
             "<p>Default deck, notetype, audit tag, and field names are in "
-            "<b>Ankisstant Settings → Create with Claude</b>.</p>",
+            "<b>Ankisstant Settings → AI Create</b>.</p>",
             self,
         ))
         root.addLayout(title_row)
@@ -429,12 +639,24 @@ class CreatorPanel(QWidget):
         self.queue_remove_btn.clicked.connect(self._on_remove_selected_gap)
         queue_btn_row.addWidget(self.queue_remove_btn)
         queue_btn_row.addStretch(1)
+        # Load Next force-fills the form from queue[0]. Replaces the
+        # implicit behaviour where typing in the topic field silently
+        # blocked the queue from ever populating.
+        self.queue_load_btn = QPushButton("Load next →")
+        self.queue_load_btn.setAutoDefault(False)
+        self.queue_load_btn.setToolTip(
+            "Take the top item from the queue and fill the form with it "
+            "(topic, focus context, KG images). Asks before overwriting "
+            "anything you've already typed."
+        )
+        self.queue_load_btn.clicked.connect(self._on_load_top_gap)
         self.queue_skip_btn = QPushButton("Skip current")
         self.queue_skip_btn.setAutoDefault(False)
         self.queue_skip_btn.clicked.connect(self._on_skip_gap)
         self.queue_clear_btn = QPushButton("Clear queue")
         self.queue_clear_btn.setAutoDefault(False)
         self.queue_clear_btn.clicked.connect(self._on_clear_queue)
+        queue_btn_row.addWidget(self.queue_load_btn)
         queue_btn_row.addWidget(self.queue_skip_btn)
         queue_btn_row.addWidget(self.queue_clear_btn)
         qbl.addLayout(queue_btn_row)
@@ -530,7 +752,7 @@ class CreatorPanel(QWidget):
         self.notetype_settings_btn = QPushButton("Manage…")
         self.notetype_settings_btn.setAutoDefault(False)
         self.notetype_settings_btn.setToolTip(
-            "Open Ankisstant Settings → Create with Claude to add or edit notetype profiles."
+            "Open Ankisstant Settings → AI Create to add or edit notetype profiles."
         )
         self.notetype_settings_btn.clicked.connect(self._on_open_notetype_settings)
         nt_row.addWidget(self.notetype_settings_btn)
@@ -565,6 +787,16 @@ class CreatorPanel(QWidget):
             audit_hint.setTextFormat(Qt.TextFormat.RichText)
             audit_hint.setStyleSheet("color: gray;")
             f.addRow("", audit_hint)
+
+        # Shown only when the loaded KG's type has auto-tag on: a hierarchical
+        # tag is generated and added automatically, so the user needn't add
+        # their own. Hidden until a qualifying gap is loaded.
+        self._autotag_hint = QLabel("")
+        self._autotag_hint.setTextFormat(Qt.TextFormat.RichText)
+        self._autotag_hint.setStyleSheet("color: #2563eb;")
+        self._autotag_hint.setWordWrap(True)
+        self._autotag_hint.setVisible(False)
+        f.addRow("", self._autotag_hint)
 
         self.focus = QLineEdit()
         self.focus.setMinimumWidth(500)
@@ -607,6 +839,15 @@ class CreatorPanel(QWidget):
         # Buttons
         btn_row = QHBoxLayout()
         btn_row.addStretch(1)
+        self.paste_btn = QPushButton("📋 Paste cards")
+        self.paste_btn.setAutoDefault(False)
+        self.paste_btn.setToolTip(
+            "Already made the cards in your own ChatGPT / Claude? Paste their "
+            "JSON straight in — no prompt round-trip, no copying from a box."
+        )
+        self.paste_btn.clicked.connect(self._on_paste_cards)
+        self.paste_btn.setVisible(is_manual_provider())  # no-sub provider only
+        btn_row.addWidget(self.paste_btn)
         self.go_btn = QPushButton("Generate")
         self.go_btn.setDefault(True)
         self.go_btn.clicked.connect(self._on_generate)
@@ -616,6 +857,16 @@ class CreatorPanel(QWidget):
     def _sync_mode(self):
         self.source_box.setVisible(self.rb_source.isChecked())
         self.topic_box.setVisible(self.rb_topic.isChecked())
+
+    def showEvent(self, ev):
+        super().showEvent(ev)
+        # Tag completer reads mw.col.tags.all() once at attach time. Rebuild
+        # on every show so tags added since (via Anki, Browse, or another
+        # session) appear in the completion list.
+        try:
+            attach_tag_completer(self.tags, multi=True)
+        except Exception as e:
+            print(f"[ankisstant] tag completer refresh failed: {e}")
 
     # ── notetype dropdown ────────────────────────────────────────────────────
 
@@ -718,7 +969,15 @@ class CreatorPanel(QWidget):
 
     def refresh_setup_banner(self) -> None:
         try:
-            self._setup_banner.setVisible(not provider_configured())
+            ok = provider_configured()
+            self._setup_banner.setVisible(not ok)
+            set_ai_buttons_enabled([getattr(self, "go_btn", None)], ok)
+            # Paste cards is only for the no-subscription "BYO AI — paste from
+            # any chatbot" provider; hide it for every other provider, which
+            # generates cards in-app and has no reply to paste back.
+            paste_btn = getattr(self, "paste_btn", None)
+            if paste_btn is not None:
+                paste_btn.setVisible(is_manual_provider())
         except Exception:
             pass
 
@@ -728,34 +987,44 @@ class CreatorPanel(QWidget):
         queue = getattr(main_window, "gap_queue", []) or []
         if not queue:
             self._current_gap = None
+            self._update_autotag_hint(None)
             return
 
         gap = queue[0]
         if gap == self._current_gap:
             return  # already pre-filled with this gap
 
-        gap_text = self._gap_title(gap)
-        # Only pre-fill if the user hasn't typed their own content in the
-        # topic field. Tracking `_current_gap` lets the pop-on-success check
-        # know whether this generation came from the queue.
+        # Only pre-fill if the user hasn't typed their own content. The
+        # explicit "Load next →" button bypasses this guard so the queue
+        # never gets silently stuck.
         current_topic = self.topic.text().strip()
         prev_title = self._gap_title(self._current_gap)
         can_overwrite = (not current_topic) or (current_topic == prev_title)
         if not can_overwrite:
             self._current_gap = None
             return
+        self._prefill_form_from_gap(gap)
+
+    def _prefill_form_from_gap(self, gap) -> None:
+        """Unconditionally write the gap's title / focus / card-count into
+        the form. Sets `_current_gap` so the post-Accept pop-on-success
+        path knows to dequeue."""
         self._current_gap = gap
+        gap_text = self._gap_title(gap)
         try:
             self.rb_topic.setChecked(True)
             self._sync_mode()
             self.topic.setText(gap_text)
-            focus_bits = [gap_text]
+            # Focus is left for the user to fill in. We only pre-seed it with
+            # supplemental source context (stem / notes) so Claude still sees
+            # the underlying material — the topic itself already lives in the
+            # Topic field, so we don't duplicate it here.
+            focus_bits = []
             if isinstance(gap, dict):
                 # Strip HTML from any captured stem so we can surface the
-                # underlying question text as a focus hint. (Screenshots
-                # can't be carried through this path; the qbank-source
-                # "Create from KG" flow bypasses gap_queue and uses
-                # open_add_card_prefilled with the stem html intact.)
+                # underlying question text as a focus hint. Image filenames
+                # ride along on the gap dict (`images`) and get rendered
+                # into the MQ field at create time via _kg_content_html.
                 stem = gap.get("stem_html") or ""
                 notes = gap.get("notes") or ""
                 if stem:
@@ -768,8 +1037,56 @@ class CreatorPanel(QWidget):
                     focus_bits.append("Notes: " + notes[:300])
             self.focus.setText(" — ".join(focus_bits))
             self.n_cards.setValue(int(self.cfg.get("gap_n_cards", 3)))
+            self._update_autotag_hint(gap)
         except Exception as e:
-            print(f"[ankisstant] refresh_queue_state pre-fill failed: {e}")
+            print(f"[ankisstant] gap pre-fill failed: {e}")
+
+    def _update_autotag_hint(self, gap) -> None:
+        """Show a notice when the loaded gap's type will auto-tag, so the user
+        knows not to add their own hierarchical tag by hand."""
+        try:
+            kg_type = ""
+            if isinstance(gap, dict):
+                kg_type = (gap.get("kg_type") or gap.get("type") or "").lower()
+            meta = _kg_type_meta(kg_type)
+            base = auto_tag_base()
+            type_seg = (meta.get("name") or kg_type.upper()) if meta else ""
+            active = bool(meta and meta.get("auto_tag") and base)
+            if active:
+                self._autotag_hint.setText(
+                    f"<small>🏷️ Auto-tag is on for <b>{type_seg}</b> "
+                    f"— a tag under <code>{base}::{type_seg}</code> will be generated and "
+                    "added automatically. No need to add your own.</small>"
+                )
+            self._autotag_hint.setVisible(active)
+        except Exception as e:
+            print(f"[ankisstant] autotag hint update failed: {e}")
+            self._autotag_hint.setVisible(False)
+
+    def _form_is_dirty(self) -> bool:
+        """True if the user has typed something that the next pre-fill
+        would clobber."""
+        return bool(self.topic.text().strip() or self.focus.text().strip())
+
+    def _on_load_top_gap(self) -> None:
+        if self._main_window is None:
+            return
+        queue = getattr(self._main_window, "gap_queue", None) or []
+        if not queue:
+            tooltip("Queue is empty.")
+            return
+        gap = queue[0]
+        # Only ask before clobbering content that doesn't match what would
+        # already be there from a prior pre-fill of the same gap.
+        if (self._form_is_dirty()
+                and self.topic.text().strip() != self._gap_title(gap)
+                and not askUser(
+                    "Overwrite the topic / focus fields with the next queued KG?",
+                    defaultno=True,
+                )):
+            return
+        self._prefill_form_from_gap(gap)
+        tooltip(f"Loaded: {self._gap_title(gap)[:60]}")
 
     def _rebuild_queue_view(self) -> None:
         """Rebuild the queue list widget from the main-window queue. Does NOT
@@ -786,6 +1103,7 @@ class CreatorPanel(QWidget):
             )
             self.queue_list.setVisible(False)
             self.queue_remove_btn.setVisible(False)
+            self.queue_load_btn.setVisible(False)
             self.queue_skip_btn.setVisible(False)
             self.queue_clear_btn.setVisible(False)
             return
@@ -803,6 +1121,7 @@ class CreatorPanel(QWidget):
         )
         self.queue_list.setVisible(True)
         self.queue_remove_btn.setVisible(True)
+        self.queue_load_btn.setVisible(True)
         self.queue_skip_btn.setVisible(True)
         self.queue_clear_btn.setVisible(True)
 
@@ -935,12 +1254,16 @@ class CreatorPanel(QWidget):
         audit_tag = (self.cfg.get("audit_tag") or "").strip()
         if audit_tag and audit_tag not in tags_raw:
             tags_raw.append(audit_tag)
+        # Month tag for temporality (global toggle in Settings → Global).
+        mtag = month_tag()
+        if mtag and mtag not in tags_raw:
+            tags_raw.append(mtag)
 
         notetype_name = self._current_notetype_name()
         if not notetype_name or notetype_name.startswith("("):
             showWarning(
                 "No notetype selected.\n\n"
-                "Open Ankisstant Settings → Create with Claude and add at least "
+                "Open Ankisstant Settings → AI Create and add at least "
                 "one notetype profile, then pick it in the dropdown."
             )
             return
@@ -1033,35 +1356,194 @@ class CreatorPanel(QWidget):
                 + (f"Focus: {focus}\n" if focus else "")
             )
 
-        model = self.cfg.get("model") or None
+        model = tool_model(self.cfg, "model", active_family())
         loading_label = (
-            "Asking Claude (reading attachments)…" if attachments_for_api
-            else "Asking Claude…"
+            "Asking AI (reading attachments)…" if attachments_for_api
+            else "Asking AI…"
         )
         skill_invocation, skill_id = _resolve_skill(profile)
         system_prompt = _augment_system(CARD_GEN_SYSTEM, profile)
-        with loading(self.go_btn, loading_label):
-            cards = core_api.ask_claude_json(
-                prompt=user_msg, system=system_prompt, max_tokens=4096, model=model,
-                skill_id=skill_id, skill_invocation=skill_invocation,
-                attachments=attachments_for_api or None,
-            )
 
-        if not isinstance(cards, list) or not all(
+        # Auto-tag: per-KG-type opt-in. When the active KG's type has auto_tag
+        # enabled we want a hierarchical {system::subsystem::topic} tag. Normally
+        # this is a separate AI call, but with no skill in play we fold it into
+        # the SAME request (one object reply) — critical in manual mode, where
+        # each call is its own copy/paste dialog. Skill flows keep the separate
+        # call so the skill's tuned array output isn't disturbed.
+        gap = self._current_gap if isinstance(self._current_gap, dict) else None
+        type_meta = _kg_type_meta((gap.get("kg_type") or "").lower()) if gap else None
+        cached_tag = (gap.get("auto_tag") or "").strip() if gap else ""
+        want_tag = bool(gap and type_meta and type_meta.get("auto_tag")
+                        and auto_tag_base())
+        merge_tag = want_tag and not cached_tag and not skill_id and not skill_invocation
+        if merge_tag:
+            system_prompt += MERGED_TAG_INSTRUCTIONS
+            ctx = []
+            if (gap.get("title") or "").strip():
+                ctx.append(f"Title: {gap['title'].strip()}")
+            stem = re.sub(r"<[^>]+>", " ", str(gap.get("stem_html") or ""))
+            stem = re.sub(r"\s+", " ", stem).strip()
+            if stem:
+                ctx.append(f"Question/stem: {stem[:600]}")
+            if (gap.get("notes") or "").strip():
+                ctx.append(f"Notes: {gap['notes'].strip()[:300]}")
+            if ctx:
+                user_msg += "\n\nCLASSIFY THIS MATERIAL for the tag:\n" + "\n".join(ctx)
+
+        reply = run_claude_json(
+            self.go_btn, loading_label,
+            prompt=user_msg, system=system_prompt, max_tokens=4096, model=model,
+            skill_id=skill_id, skill_invocation=skill_invocation,
+            attachments=attachments_for_api or None,
+        )
+
+        # Merged replies are {"tags": {...}, "cards": [...]}; otherwise a bare
+        # array. Pull the tag levels out before validating the card list.
+        merged_tag_levels = None
+        cards = reply
+        if merge_tag and isinstance(reply, dict):
+            merged_tag_levels = reply.get("tags")
+            cards = reply.get("cards")
+
+        if reply is None:
+            return  # cancelled, or a parse failure already surfaced
+
+        self.cfg["default_n_cards"] = n
+        self._finalize_review(
+            cards=cards, merged_tag_levels=merged_tag_levels, mode=mode,
+            source_label=source_label, topic_label=topic_label, focus=focus,
+            deck_name=deck_name, notetype_name=notetype_name, tags_raw=tags_raw,
+            profile=profile, gap=gap, type_meta=type_meta,
+            cached_tag=cached_tag, want_tag=want_tag, model=model,
+        )
+
+    def _on_paste_cards(self):
+        """No-AI 'paste straight in' path: the user generated cards (and tags)
+        in their own ChatGPT / Claude using the standalone Ankisstant prompt,
+        and pastes the JSON here. No prompt is built and no model is called —
+        we parse, apply tags, and jump straight to the review dialog."""
+        if not anki_utils.require_col():
+            return
+        deck_name = self.deck.currentText().strip()
+        focus = self.focus.text().strip()
+        tags_raw = [t.strip() for t in self.tags.text().split(",") if t.strip()]
+        audit_tag = (self.cfg.get("audit_tag") or "").strip()
+        if audit_tag and audit_tag not in tags_raw:
+            tags_raw.append(audit_tag)
+        mtag = month_tag()
+        if mtag and mtag not in tags_raw:
+            tags_raw.append(mtag)
+
+        notetype_name = self._current_notetype_name()
+        if not notetype_name or notetype_name.startswith("("):
+            showWarning(
+                "No notetype selected.\n\n"
+                "Open Ankisstant Settings → AI Create and add at least "
+                "one notetype profile, then pick it in the dropdown."
+            )
+            return
+        profile = _resolved_profile(self.cfg, notetype_name)
+
+        parsed = _prompt_for_pasted_cards(self)
+        if parsed is None:
+            return  # cancelled or unparseable (a message was already shown)
+
+        # Accept a bare [...] array, a {"cards": [...]} / {"tags":…, "cards":…}
+        # object, or even a single {"front","extra"} object.
+        merged_tag_levels = None
+        cards = parsed
+        if isinstance(parsed, dict):
+            if isinstance(parsed.get("tags"), dict):
+                merged_tag_levels = parsed["tags"]
+            cards = parsed.get("cards")
+            if cards is None and "front" in parsed:
+                cards = [parsed]
+
+        gap = self._current_gap if isinstance(self._current_gap, dict) else None
+        type_meta = _kg_type_meta((gap.get("kg_type") or "").lower()) if gap else None
+        cached_tag = (gap.get("auto_tag") or "").strip() if gap else ""
+
+        # want_tag=False: in paste mode we never fall back to an AI auto-tag
+        # call (that would defeat the point). Pasted tag levels still apply.
+        self._finalize_review(
+            cards=cards, merged_tag_levels=merged_tag_levels, mode="source",
+            source_label="(pasted from your AI)", topic_label=None, focus=focus,
+            deck_name=deck_name, notetype_name=notetype_name, tags_raw=tags_raw,
+            profile=profile, gap=gap, type_meta=type_meta,
+            cached_tag=cached_tag, want_tag=False, model=None,
+        )
+
+    def _finalize_review(self, *, cards, merged_tag_levels, mode, source_label,
+                         topic_label, focus, deck_name, notetype_name, tags_raw,
+                         profile, gap, type_meta, cached_tag, want_tag, model):
+        """Validate the card list, resolve the auto-tag, and open the review
+        dialog. Shared by Generate (AI round-trip) and Paste cards (user brings
+        their own JSON). Returns False on malformed input (a warning is shown)."""
+        if not isinstance(cards, list) or not cards or not all(
             isinstance(c, dict) and "front" in c and "extra" in c for c in cards
         ):
-            return  # ask_claude_json already showed a tooltip
+            showWarning(
+                "That isn't in the expected card format.\n\n"
+                "It needs a JSON array where each card has a \"front\" and an "
+                "\"extra\" field. If you pasted from your own AI, include its "
+                "FULL reply (the whole JSON), then try again."
+            )
+            return False
 
         self.cfg["default_deck"] = deck_name
-        self.cfg["default_n_cards"] = n
         self.cfg["selected_notetype"] = notetype_name
         save_tool_config("card_creator", self.cfg)
+
+        kg_image_filenames: list[str] = []
+        kg_type_for_image = ""
+        kg_stem_html = ""
+        kg_notes = ""
+        if gap is not None:
+            kg_image_filenames = list(gap.get("images") or [])
+            kg_type_for_image = (gap.get("kg_type") or "").lower()
+            # Captured MQ question + freeform notes flow into the MQ field
+            # alongside any screenshots so the card carries the original
+            # source of confusion, not just the image.
+            kg_stem_html = str(gap.get("stem_html") or "")
+            kg_notes = str(gap.get("notes") or "")
+            # Resolve the auto-tag: cached → merged-from-this-reply → separate
+            # call (skill flows). Append it to every card from this gap.
+            auto_tag = cached_tag
+            try:
+                if not auto_tag and merged_tag_levels is not None and type_meta:
+                    auto_tag = _apply_tag_levels(gap, type_meta, merged_tag_levels)
+                elif not auto_tag and want_tag and type_meta is not None:
+                    with loading(self.go_btn, "Generating auto-tag…"):
+                        auto_tag = _generate_auto_tag_for_gap(
+                            gap, type_meta, model=model,
+                        )
+            except Exception as e:
+                print(f"[ankisstant] auto-tag generation skipped: {e}")
+            if auto_tag and auto_tag not in tags_raw:
+                tags_raw.append(auto_tag)
+        elif merged_tag_levels and auto_tag_base():
+            # Paste mode with no loaded KG: still honour the system/subsystem/
+            # topic the user's GPT returned, under the base + default KG type.
+            try:
+                dmeta = _default_kg_type_meta()
+                type_seg = (dmeta.get("name") or dmeta.get("key") or "") if dmeta else ""
+                tag = format_hierarchical_tag(
+                    auto_tag_base(), merged_tag_levels, type_seg=type_seg,
+                )
+                if tag and tag != auto_tag_base() and tag not in tags_raw:
+                    tags_raw.append(tag)
+            except Exception as e:
+                print(f"[ankisstant] paste-mode tag build skipped: {e}")
 
         dlg = ReviewDialog(
             cards=cards, mode=mode,
             source_label=source_label, topic_label=topic_label, focus=focus,
             deck_name=deck_name, tags=tags_raw,
             profile=profile, panel_image_paths=list(self._extra_image_paths),
+            kg_image_filenames=kg_image_filenames,
+            kg_type_for_image=kg_type_for_image,
+            kg_stem_html=kg_stem_html,
+            kg_notes=kg_notes,
             parent=self,
         )
         result = dlg.exec()
@@ -1096,6 +1578,7 @@ class CreatorPanel(QWidget):
             if hasattr(self._main_window, "refresh_queue_badge"):
                 self._main_window.refresh_queue_badge()
             self.refresh_queue_state(self._main_window)
+        return True
 
 
 # ── review dialog (separate window) ──────────────────────────────────────────
@@ -1260,6 +1743,8 @@ class _CardRow(QFrame):
 class ReviewDialog(QDialog):
     def __init__(self, cards, mode, source_label, topic_label, focus,
                  deck_name, tags, profile=None, panel_image_paths=None,
+                 kg_image_filenames=None, kg_type_for_image="",
+                 kg_stem_html="", kg_notes="",
                  parent=None):
         super().__init__(parent)
         self.cfg = tool_config("card_creator")
@@ -1277,6 +1762,18 @@ class ReviewDialog(QDialog):
             self.cfg, (self.cfg.get("selected_notetype") or self.cfg.get("default_notetype") or "").strip()
         )
         self.panel_image_paths: list[str] = list(panel_image_paths or [])
+        # KG-attached images live in the Anki media folder already (added on
+        # KG save), so we carry filenames + emit <img> HTML directly. MQ-type
+        # KGs route the image into the Missed Questions field; everything
+        # else falls through to the normal Extra/image field.
+        self.kg_image_filenames: list[str] = list(kg_image_filenames or [])
+        self.kg_type_for_image: str = (kg_type_for_image or "").lower()
+        # MQ-type KGs also carry the captured question stem (HTML) and any
+        # freeform notes. We append these into the Missed Questions field
+        # together with the images so every card created from the MQ
+        # carries the original missed question for reference.
+        self.kg_stem_html: str = str(kg_stem_html or "")
+        self.kg_notes: str = str(kg_notes or "")
         self.rows: list[_CardRow] = []
         self.setWindowTitle("Review proposed cards")
         self.setMinimumSize(800, 700)
@@ -1405,7 +1902,7 @@ class ReviewDialog(QDialog):
         new = core_api.ask_claude_json(
             prompt=prompt,
             system=_augment_system(SINGLE_REGEN_SYSTEM, self.profile),
-            max_tokens=1024, model=self.cfg.get("model") or None,
+            max_tokens=1024, model=tool_model(self.cfg, "model", active_family()),
             skill_id=skill_id, skill_invocation=skill_invocation,
         )
         if not isinstance(new, dict) or "front" not in new or "extra" not in new:
@@ -1426,7 +1923,7 @@ class ReviewDialog(QDialog):
         new = core_api.ask_claude_json(
             prompt=prompt,
             system=_augment_system(ONE_BY_ONE_SYSTEM, self.profile),
-            max_tokens=1024, model=self.cfg.get("model") or None,
+            max_tokens=1024, model=tool_model(self.cfg, "model", active_family()),
             skill_id=skill_id, skill_invocation=skill_invocation,
         )
         if not isinstance(new, dict) or "front" not in new or "extra" not in new:
@@ -1450,7 +1947,7 @@ class ReviewDialog(QDialog):
         new_cards = core_api.ask_claude_json(
             prompt=prompt,
             system=_augment_system(SPLIT_SYSTEM, self.profile),
-            max_tokens=2048, model=self.cfg.get("model") or None,
+            max_tokens=2048, model=tool_model(self.cfg, "model", active_family()),
             skill_id=skill_id, skill_invocation=skill_invocation,
         )
         if (not isinstance(new_cards, list) or not new_cards
@@ -1494,6 +1991,41 @@ class ReviewDialog(QDialog):
                 out = (out + "<br>" if out else "") + cite
         return out
 
+    def _kg_image_html(self) -> str:
+        """<img> HTML for KG-attached images (filenames already in media)."""
+        bits = [f'<img src="{html.escape(f, quote=True)}">'
+                for f in self.kg_image_filenames if f]
+        return "<br>".join(bits)
+
+    def _kg_content_html(self) -> str:
+        """Full HTML to append to the KG target field — for MQ-type KGs
+        this includes the captured question stem and any freeform notes
+        above the screenshot(s). For non-MQ KGs it's just the images.
+
+        Returns "" if there's nothing to append."""
+        parts: list[str] = []
+        if self.kg_type_for_image == "mq":
+            if self.kg_stem_html.strip():
+                parts.append(self.kg_stem_html.strip())
+            if self.kg_notes.strip():
+                # Notes are plain-text; escape for safety.
+                parts.append(html.escape(self.kg_notes.strip()).replace("\n", "<br>"))
+        img_html = self._kg_image_html()
+        if img_html:
+            parts.append(img_html)
+        return "<br>".join(parts)
+
+    def _kg_image_target_field(self) -> str:
+        """Field that KG-attached images should land in. MQ-type KGs route to
+        the qbank Missed Questions field; everything else uses Extra."""
+        if self.kg_type_for_image == "mq":
+            try:
+                qb_cfg = tool_config("qbank")
+                return qb_cfg.get("missed_q_field") or "Missed Questions"
+            except Exception:
+                return "Missed Questions"
+        return self.profile.get("extra_field", "Extra")
+
     def _images_for(self, card) -> str:
         """Build an <img>-tag fragment combining panel-level images and any
         per-card images attached during review. Files are copied into Anki
@@ -1511,7 +2043,7 @@ class ReviewDialog(QDialog):
         if not name:
             showWarning(
                 "No notetype configured.\n\n"
-                "Open Ankisstant Settings → Create with Claude and add a "
+                "Open Ankisstant Settings → AI Create and add a "
                 "notetype profile."
             )
             return None
@@ -1520,7 +2052,7 @@ class ReviewDialog(QDialog):
             showWarning(
                 f"Notetype not found: {name}\n\n"
                 "Edit or remove this notetype profile under Settings → "
-                "Create with Claude."
+                "AI Create."
             )
             return None
         front_field = (self.profile.get("front_field") or "Text").strip()
@@ -1529,7 +2061,7 @@ class ReviewDialog(QDialog):
             showWarning(
                 f"Notetype '{name}' has no field named '{front_field}'.\n\n"
                 f"Available fields: {', '.join(sorted(field_names)) or '(none)'}\n\n"
-                "Update the profile's 'Front field' under Settings → Create with Claude."
+                "Update the profile's 'Front field' under Settings → AI Create."
             )
             return None
         # Cloze sanity check — non-cloze notetypes will silently swallow {{c1::…}}.
@@ -1568,6 +2100,15 @@ class ReviewDialog(QDialog):
                 note[sources_field] = (existing + "<br>" if existing else "") + source_html
             else:
                 note[sources_field] = source_html
+        # KG-attached content: for MQ-type KGs this is the captured question
+        # stem + freeform notes + screenshot(s) routed to Missed Questions.
+        # Non-MQ KGs just contribute their images to Extra (or image_field).
+        kg_content = self._kg_content_html()
+        if kg_content:
+            target = self._kg_image_target_field()
+            if target and target in note:
+                existing = note[target] or ""
+                note[target] = (existing + "<br>" if existing else "") + kg_content
         if card.get("one_by_one") and obo_field in note:
             note[obo_field] = "y"
         for t in self.tags:
@@ -1588,7 +2129,7 @@ class ReviewDialog(QDialog):
         deck_id = self._get_deck_id()
         created_ids = []
         if hasattr(mw, "checkpoint"):
-            mw.checkpoint("Create with Claude")
+            mw.checkpoint("AI Create")
         for card in approved:
             note = mw.col.new_note(nt)
             self._set_fields(note, card)
@@ -1626,6 +2167,11 @@ class ReviewDialog(QDialog):
             "obo_field":     self.profile.get("one_by_one_field", "One by one"),
             "enricher":      self._enrich_extra,
             "images_for":    self._images_for,
+            # `kg_content_html` includes the captured MQ stem + notes + images
+            # for MQ-type KGs (just images otherwise). Replaces the older
+            # `kg_image_html` ctx key, which only carried screenshots.
+            "kg_content_html": self._kg_content_html(),
+            "kg_image_field":  self._kg_image_target_field(),
         }
         # First card now, rest auto-loaded after each Anki "Add" click.
         _start_add_queue(approved, ctx)
@@ -1673,6 +2219,12 @@ def _fill_addcards(ac, card: dict, ctx: dict) -> None:
             new_note[sources_field] = (existing + "<br>" if existing else "") + source_html
         else:
             new_note[sources_field] = source_html
+    kg_content = ctx.get("kg_content_html") or ""
+    if kg_content:
+        target = ctx.get("kg_image_field") or extra_field
+        if target in new_note:
+            existing = new_note[target] or ""
+            new_note[target] = (existing + "<br>" if existing else "") + kg_content
     if card.get("one_by_one") and obo_field in new_note:
         new_note[obo_field] = "y"
     for t in ctx["tags"]:
@@ -1704,6 +2256,18 @@ def _start_add_queue(cards: list[dict], ctx: dict) -> None:
     _add_queue_ctx = ctx
 
     _fill_addcards(ac, cards[0], ctx)
+
+    # Float AddCards over the Ankisstant window so it isn't buried under
+    # the Create panel after opening. WindowStaysOnTopHint is sticky — we
+    # only want it raised, not pinned, so use show()+raise_()+activate
+    # plus a deferred call after Qt's own focus settles.
+    try:
+        ac.show()
+        ac.raise_()
+        ac.activateWindow()
+        QTimer.singleShot(50, lambda a=ac: (a.raise_(), a.activateWindow()))
+    except Exception as e:
+        print(f"[ankisstant] couldn't raise AddCards: {e}")
 
     if _add_queue:
         _attach_add_hook()

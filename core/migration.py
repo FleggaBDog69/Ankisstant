@@ -127,13 +127,13 @@ def _migrate_config() -> None:
     # (auto|cli|api). Prefer qbank's 3-way if present; otherwise map browse's 2-way.
     qb_method = (qb.get("card_gen_method") or "").lower()
     if qb_method in ("auto", "cli", "api"):
-        new["provider_mode"] = qb_method
+        new["provider"] = "anthropic" if qb_method == "api" else qb_method
     else:
         prov = (br.get("provider") or cc.get("provider") or "").lower()
-        new["provider_mode"] = prov if prov in ("cli", "api") else "auto"
-    new["model_default"] = (
-        cc.get("model") or br.get("model") or new["model_default"]
-    )
+        new["provider"] = {"api": "anthropic"}.get(prov, prov if prov == "cli" else "auto")
+    legacy_default = (cc.get("model") or br.get("model") or "").strip()
+    if legacy_default:
+        new.setdefault("model_defaults", {})["anthropic"] = legacy_default
 
     # QBank section
     qb_section = new["tools"]["qbank"]

@@ -43,9 +43,9 @@ _patch_progress_show_win()
 
 
 from aqt import mw, gui_hooks
-from aqt.qt import QAction, QTimer
+from aqt.qt import QAction, QKeySequence, QShortcut, Qt, QTimer
 
-from .core.config import ensure_config, load_config, tool_enabled
+from .core.config import ensure_config, load_config, tool_config, tool_enabled
 from .core.migration import run_once_if_needed
 from .core import log
 from .tools import qbank as _qbank
@@ -81,6 +81,35 @@ def _setup_menu() -> None:
         log.error(f"setup_menu failed: {e}")
 
 
+# ── Global capture shortcut ───────────────────────────────────────────────────
+#
+# A single application-wide QShortcut so "capture a missed Q" works from
+# anywhere — including mid-review, where the reviewer eats most key events.
+# Re-created on every profile load so a settings change takes effect without
+# an Anki restart.
+_capture_shortcut: QShortcut | None = None
+
+
+def _setup_capture_shortcut() -> None:
+    global _capture_shortcut
+    try:
+        if _capture_shortcut is not None:
+            _capture_shortcut.setParent(None)
+            _capture_shortcut.deleteLater()
+            _capture_shortcut = None
+        if not tool_enabled("qbank"):
+            return
+        seq = (tool_config("qbank").get("capture_shortcut") or "").strip()
+        if not seq:
+            return
+        sc = QShortcut(QKeySequence(seq), mw)
+        sc.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        sc.activated.connect(lambda: _qbank.open_capture("", ""))
+        _capture_shortcut = sc
+    except Exception as e:
+        log.error(f"capture shortcut setup failed: {e}")
+
+
 # ── Profile load — entry point for all per-profile init ──────────────────────
 
 def _on_profile_loaded() -> None:
@@ -99,6 +128,7 @@ def _on_profile_loaded() -> None:
             log.error(f"init({key}) failed: {e}")
 
     _setup_menu()
+    _setup_capture_shortcut()
 
     # First-run welcome — defer so the main window is up and ready to be
     # focused after the dialog closes.
@@ -177,8 +207,8 @@ def _on_js_message(handled, message, context):
 
     if message == "practice_questions:open":
         try:
-            from practice_questions.library import show_library
-            show_library()
+            from practice_questions.launcher import show_launcher
+            show_launcher()
         except Exception as e:
             log.error(f"practice_questions:open failed: {e}")
         return (True, None)

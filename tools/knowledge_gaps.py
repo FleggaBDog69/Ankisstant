@@ -18,18 +18,19 @@ from typing import Callable
 
 from aqt import mw
 from aqt.qt import (
-    QComboBox, QDialog, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
-    QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSplitter, Qt,
-    QTextEdit, QVBoxLayout, QWidget,
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QFileDialog, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QInputDialog,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QPlainTextEdit,
+    QPushButton, QScrollArea, QSizePolicy, QSplitter, Qt, QTextEdit,
+    QVBoxLayout, QWidget,
 )
 from aqt.utils import askUser, showWarning, tooltip
 
-from ..core import anki_utils, api as core_api
-from ..core.config import tool_config
+from ..core import anki_utils
+from ..core.config import active_family, tool_config, tool_model
 from ..core.qt_utils import (
-    attach_tag_completer, loading, make_help_button, make_setup_banner,
-    provider_configured,
+    attach_tag_completer, make_help_button, make_setup_banner,
+    provider_configured, run_claude_json, set_ai_buttons_enabled,
 )
 from .kg import store as kg_store
 
@@ -49,7 +50,6 @@ SOURCE_LABELS = {
 STATUS_LABELS = {
     "open":      "Open",
     "done":      "Done",
-    "dismissed": "Dismissed",
 }
 
 
@@ -155,6 +155,24 @@ class AddKGDialog(QDialog):
         self._notes.setMinimumHeight(80)
         layout.addWidget(self._notes)
 
+        # Image attach — copied into Anki media on Save, surfaced to Create
+        # (Extra field, or Missed Questions for MQ-type) and Browse (appended
+        # to the same field on each tagged note).
+        self._image_filenames: list[str] = []
+        img_row = QHBoxLayout()
+        img_btn = QPushButton("📷 Attach image…")
+        img_btn.setAutoDefault(False)
+        img_btn.clicked.connect(self._on_attach_image)
+        img_row.addWidget(img_btn)
+        self._img_label = QLabel("")
+        self._img_label.setStyleSheet("color: gray; font-size: 11px;")
+        img_row.addWidget(self._img_label, 1)
+        img_clear = QPushButton("Clear")
+        img_clear.setAutoDefault(False)
+        img_clear.clicked.connect(self._on_clear_images)
+        img_row.addWidget(img_clear)
+        layout.addLayout(img_row)
+
         btn_row = QHBoxLayout()
         btn_row.addStretch(1)
         cancel = QPushButton("Cancel")
@@ -168,6 +186,37 @@ class AddKGDialog(QDialog):
 
         self._title.setFocus()
 
+    def _on_attach_image(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Attach image(s)",
+            "", "Images (*.png *.jpg *.jpeg *.gif *.webp *.bmp);;All files (*)",
+        )
+        if not paths:
+            return
+        added = 0
+        for p in paths:
+            try:
+                fname = mw.col.media.add_file(p)
+            except Exception as e:
+                print(f"[ankisstant] media.add_file failed for {p}: {e}")
+                continue
+            if fname and fname not in self._image_filenames:
+                self._image_filenames.append(fname)
+                added += 1
+        if added:
+            self._refresh_img_label()
+
+    def _on_clear_images(self) -> None:
+        self._image_filenames.clear()
+        self._refresh_img_label()
+
+    def _refresh_img_label(self) -> None:
+        n = len(self._image_filenames)
+        if n == 0:
+            self._img_label.setText("")
+        else:
+            self._img_label.setText(f"{n} image{'s' if n != 1 else ''} attached")
+
     def _save(self) -> None:
         title = self._title.text().strip()
         if not title:
@@ -176,6 +225,9 @@ class AddKGDialog(QDialog):
         tags = [t for t in self._tags.text().split() if t.strip()]
         notes = self._notes.toPlainText().strip()
         kg_type = self._type.currentData() or "kg"
+        fields: dict = {}
+        if self._image_filenames:
+            fields["images"] = list(self._image_filenames)
         kg_store.add(
             title=title,
             source="manual",
@@ -183,6 +235,7 @@ class AddKGDialog(QDialog):
             status="open",
             tags=tags,
             notes=notes,
+            fields=fields,
         )
         try:
             mw.deckBrowser.refresh()
@@ -216,7 +269,10 @@ class _KGListItem(QListWidgetItem):
         source_label = SOURCE_LABELS.get(kg.get("source", "manual"), "?")
         type_meta = _type_meta(kg.get("type", "kg"))
         status = kg.get("status", "open")
+        dismissed = bool(kg.get("dismissed", False))
         status_label = STATUS_LABELS.get(status, "Open")
+        if status == "done" and dismissed:
+            status_label = "Done (dismissed)"
         title = kg.get("title", "(untitled)") or "(untitled)"
         # Prefix the title with a compact type tag for at-a-glance scanning.
         text = f"[{type_meta['name']}]  {title}"
@@ -224,8 +280,8 @@ class _KGListItem(QListWidgetItem):
             text = text[:80].rstrip() + "…"
         self.setText(text)
 
-        # Grey done / dismissed items so they stay visible but recede.
-        if status in ("done", "dismissed"):
+        # Grey done items so they stay visible but recede.
+        if status == "done":
             brush = QBrush(QColor(150, 150, 150))
             self.setForeground(brush)
             f = QFont(self.font())
@@ -419,13 +475,13 @@ class _LOAnalyserSection(QGroupBox):
             + "\n".join(f"- {c}" for c in fronts)
         )
         self._status.setText(
-            f"Asking Claude what's missing from {len(fronts)} card(s) under '{tag}'…"
+            f"Asking AI what's missing from {len(fronts)} card(s) under '{tag}'…"
         )
-        model = cfg.get("model") or None
-        with loading(self._analyse_btn, "Analysing…"):
-            gaps = core_api.ask_claude_json(
-                prompt=user_msg, system=system, max_tokens=1024, model=model,
-            )
+        model = tool_model(cfg, "model", active_family())
+        gaps = run_claude_json(
+            self._analyse_btn, "Analysing…",
+            prompt=user_msg, system=system, max_tokens=1024, model=model,
+        )
 
         if not isinstance(gaps, list):
             self._status.setText("")
@@ -446,7 +502,7 @@ class _LOAnalyserSection(QGroupBox):
             self._gaps_list.addItem(item)
         self._gaps_box.setVisible(True)
         self._status.setText(
-            f"Claude found {len(gaps)} gap(s) across {len(fronts)} card(s)."
+            f"AI found {len(gaps)} gap(s) across {len(fronts)} card(s)."
         )
 
     def _select_all(self) -> None:
@@ -531,6 +587,14 @@ class KGDetailPane(QWidget):
         for key, label in STATUS_LABELS.items():
             self._status.addItem(label, key)
         meta_row.addWidget(self._status)
+        # "Dismissed" is a sub-flag that's only meaningful when status=done.
+        # Replaces the old standalone "dismissed" status.
+        self._dismissed = QCheckBox("Dismissed")
+        self._dismissed.setToolTip(
+            "Mark this Done item as dismissed (won't be revisited). "
+            "Hidden unless 'Include dismissed' is on."
+        )
+        meta_row.addWidget(self._dismissed)
         meta_row.addSpacing(8)
         self._source_lbl = QLabel("")
         self._source_lbl.setStyleSheet("color: gray; font-size: 11px;")
@@ -540,6 +604,11 @@ class KGDetailPane(QWidget):
         self._created_lbl.setStyleSheet("color: gray; font-size: 11px;")
         meta_row.addWidget(self._created_lbl)
         root.addLayout(meta_row)
+
+        # Status change & dismissed flag auto-persist so users don't have to
+        # remember to hit Save just to mark a KG closed.
+        self._status.currentIndexChanged.connect(self._on_status_changed)
+        self._dismissed.toggled.connect(self._on_dismissed_changed)
 
         # Tags
         tag_row = QHBoxLayout()
@@ -585,7 +654,7 @@ class KGDetailPane(QWidget):
 
         # Actions
         actions_row = QHBoxLayout()
-        self._browse_btn = QPushButton("🔍 Send to Browse with Claude")
+        self._browse_btn = QPushButton("🔍 Send to AI Browse")
         self._browse_btn.setAutoDefault(False)
         self._browse_btn.clicked.connect(self._send_to_browse)
         actions_row.addWidget(self._browse_btn)
@@ -643,19 +712,25 @@ class KGDetailPane(QWidget):
 
         self._title_input.setText(kg.get("title", ""))
 
-        # Type combo — may have changed since panel was built.
+        # Type combo — may have changed since panel was built. Block
+        # signals during load so the auto-save handler doesn't fire on
+        # programmatic selection changes.
         self._rebuild_type_combo()
         type_key = kg.get("type", "kg")
-        idx = self._type.findData(type_key)
-        if idx < 0:
-            # Type has been deleted from settings — show a sentinel so the
-            # selection isn't silently coerced to the first entry.
-            meta = _type_meta(type_key)
-            self._type.addItem(meta["name"], type_key)
-            idx = self._type.count() - 1
-            self._type.setItemData(idx, "Type removed from settings",
-                                   Qt.ItemDataRole.ToolTipRole)
-        self._type.setCurrentIndex(idx)
+        self._type.blockSignals(True)
+        try:
+            idx = self._type.findData(type_key)
+            if idx < 0:
+                # Type has been deleted from settings — show a sentinel so the
+                # selection isn't silently coerced to the first entry.
+                meta = _type_meta(type_key)
+                self._type.addItem(meta["name"], type_key)
+                idx = self._type.count() - 1
+                self._type.setItemData(idx, "Type removed from settings",
+                                       Qt.ItemDataRole.ToolTipRole)
+            self._type.setCurrentIndex(idx)
+        finally:
+            self._type.blockSignals(False)
 
         source = kg.get("source", "manual")
         source_label = SOURCE_LABELS.get(source, "?")
@@ -663,8 +738,15 @@ class KGDetailPane(QWidget):
         self._source_lbl.setTextFormat(Qt.TextFormat.RichText)
 
         status = kg.get("status", "open")
+        self._status.blockSignals(True)
         idx = self._status.findData(status)
         self._status.setCurrentIndex(idx if idx >= 0 else 0)
+        self._status.blockSignals(False)
+        self._dismissed.blockSignals(True)
+        self._dismissed.setChecked(bool(kg.get("dismissed", False)))
+        # Dismissed only makes sense as a sub-flag of Done.
+        self._dismissed.setEnabled(status == "done")
+        self._dismissed.blockSignals(False)
 
         self._tags_input.setText(" ".join(kg.get("tags", [])))
 
@@ -689,9 +771,9 @@ class KGDetailPane(QWidget):
 
     def _set_widgets_visible(self, visible: bool) -> None:
         for w in (self._title_input, self._type, self._source_lbl, self._status,
-                  self._created_lbl, self._tags_input, self._schema_container,
-                  self._res_box, self._browse_btn, self._create_btn,
-                  self._delete_btn, self._save_btn):
+                  self._dismissed, self._created_lbl, self._tags_input,
+                  self._schema_container, self._res_box, self._browse_btn,
+                  self._create_btn, self._delete_btn, self._save_btn):
             w.setVisible(visible)
         # The LO analyser stays hidden when nothing is selected; load() re-
         # shows it only for type=lo KGs.
@@ -740,6 +822,56 @@ class KGDetailPane(QWidget):
         # Show/hide the inline LO analyser to match the new type.
         self._lo_analyser.reset()
         self._lo_analyser.setVisible(new_type == "lo")
+        # Auto-persist the type change. Without this, switching the type
+        # and navigating away silently reverts because the explicit Save
+        # button is the only thing that wrote the new type to disk.
+        try:
+            updated = kg_store.update(
+                self._current["id"], type=new_type, fields=merged,
+            )
+            if updated:
+                self._current = updated
+                self._parent_panel.refresh_list(preserve_selection=updated["id"])
+        except Exception as e:
+            print(f"[ankisstant] auto-save type change failed: {e}")
+
+    def _on_status_changed(self, _idx: int) -> None:
+        if self._current is None:
+            return
+        new_status = self._status.currentData() or "open"
+        # Dismissed is only meaningful for Done items — disable + clear when
+        # switching back to Open.
+        self._dismissed.blockSignals(True)
+        if new_status != "done":
+            self._dismissed.setChecked(False)
+        self._dismissed.setEnabled(new_status == "done")
+        self._dismissed.blockSignals(False)
+        try:
+            updated = kg_store.update(
+                self._current["id"],
+                status=new_status,
+                dismissed=bool(self._dismissed.isChecked()) if new_status == "done" else False,
+            )
+            if updated:
+                self._current = updated
+                self._parent_panel.refresh_list(preserve_selection=updated["id"])
+        except Exception as e:
+            print(f"[ankisstant] auto-save status change failed: {e}")
+
+    def _on_dismissed_changed(self, checked: bool) -> None:
+        if self._current is None:
+            return
+        # Only persist when the status is Done (the checkbox is disabled
+        # otherwise, but guard anyway).
+        if (self._status.currentData() or "open") != "done":
+            return
+        try:
+            updated = kg_store.update(self._current["id"], dismissed=bool(checked))
+            if updated:
+                self._current = updated
+                self._parent_panel.refresh_list(preserve_selection=updated["id"])
+        except Exception as e:
+            print(f"[ankisstant] auto-save dismissed flag failed: {e}")
 
     def _rebuild_schema_for_type(self, type_key: str, kg: dict | None = None) -> None:
         # Tear down existing widgets.
@@ -846,6 +978,15 @@ class KGDetailPane(QWidget):
                 val = ""
             if val:
                 out[key] = val
+        # Preserve any existing fields that aren't part of the current
+        # type's schema. Without this, saving an MQ KG that was captured
+        # with stem_html / images / system / subsystem / topic would wipe
+        # everything except whatever the (often-empty) schema exposes.
+        if self._current:
+            schema_keys = set(self._schema_widgets.keys())
+            for k, v in (self._current.get("fields") or {}).items():
+                if k not in schema_keys and k not in out and v:
+                    out[k] = v
         return out
 
     # ── resources ────────────────────────────────────────────────────────────
@@ -921,6 +1062,7 @@ class KGDetailPane(QWidget):
         kg["title"]     = self._title_input.text().strip()
         kg["type"]      = self._type.currentData() or kg.get("type", "kg")
         kg["status"]    = self._status.currentData() or "open"
+        kg["dismissed"] = bool(self._dismissed.isChecked()) if kg["status"] == "done" else False
         kg["tags"]      = [t for t in self._tags_input.text().split() if t.strip()]
         kg["fields"]    = self._collect_schema_fields()
         kg["resources"] = self._collect_resources()
@@ -963,19 +1105,22 @@ class KGDetailPane(QWidget):
             return
         # Persist any local edits first so the Browse handoff sees fresh data.
         self._save()
-        kg = self._current
+        kg_id = self._current.get("id")
+        # Re-read so the queued snapshot includes the edits we just saved.
+        kg = kg_store.get(kg_id) or self._current
         main = self.window()
-        if not hasattr(main, "_show_tool"):
+        if not hasattr(main, "browse_queue"):
             showWarning("Open the KG page from Tools → Ankisstant first.")
             return
-        # Switch to Browse and preload it.
-        try:
-            from .browse import preload_for_kg
-            main._show_tool("browse")
-            preload_for_kg(kg)
-        except Exception as e:
-            print(f"[ankisstant] send to Browse failed: {e}")
-            showWarning(f"Couldn't open Browse: {e}")
+        if not any(isinstance(q, dict) and q.get("id") == kg_id
+                   for q in main.browse_queue):
+            main.browse_queue.append(kg)
+        if hasattr(main, "refresh_queue_badge"):
+            main.refresh_queue_badge()
+        if hasattr(main, "show_browse_tool"):
+            main.show_browse_tool()
+        # Leave status open — Browse marks it done on a successful Tag & Unsuspend.
+        self._parent_panel.refresh_list(preserve_selection=kg_id)
 
     def _send_to_create(self) -> None:
         if not self._current:
@@ -993,11 +1138,14 @@ class KGDetailPane(QWidget):
             v = kg_store.field(kg, k)
             if v:
                 notes_bits.append(v)
+        images = (kg.get("fields") or {}).get("images") or []
         item = {
             "title":     kg.get("title", ""),
             "kg_id":     kg.get("id", ""),
             "stem_html": stem_html or None,
             "notes":     "\n\n".join(notes_bits) or None,
+            "images":    list(images),
+            "kg_type":   (kg.get("type") or "").lower(),
         }
         main.gap_queue.append(item)
         if hasattr(main, "refresh_queue_badge"):
@@ -1008,12 +1156,229 @@ class KGDetailPane(QWidget):
         self._parent_panel.refresh_list(preserve_selection=kg["id"])
 
 
+# ── Bulk import modal ──────────────────────────────────────────────────────────
+
+_BULK_PARSE_SYSTEM = (
+    "You normalise a student's rough list of knowledge gaps. You are given a "
+    "numbered list of raw lines. For EACH line, return one JSON object with: "
+    "\"title\" (a concise, cleaned-up gap title), and best-effort medical "
+    "\"system\", \"subsystem\", and \"topic\" strings (empty string if unsure). "
+    "Return ONLY a JSON array, one object per input line, in the same order. "
+    "Do not merge, split, or drop lines."
+)
+
+
+_PDF_EXTRACT_SYSTEM = (
+    "You read a PDF a medical student attached — it may be a list of learning "
+    "objectives (LOs), a set of knowledge gaps, lecture notes, or exam topics. "
+    "Extract each DISTINCT learnable item as its own entry. Return ONLY a JSON "
+    "array; one object per item, each with: \"title\" (a concise, self-contained "
+    "gap/LO statement) and best-effort medical \"system\", \"subsystem\" and "
+    "\"topic\" strings (empty string if unsure). Do not merge unrelated items, "
+    "do not invent items that aren't in the document, and don't add commentary."
+)
+
+
+def _coerce_parsed_list(parsed) -> list | None:
+    """Normalise Claude's bulk-parse output into a list of objects.
+
+    Accepts a bare JSON array, or a dict wrapper like {"gaps": [...]} /
+    {"items": [...]} (models sometimes wrap the array). Returns None if there's
+    nothing list-shaped to use."""
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict):
+        for v in parsed.values():
+            if isinstance(v, list):
+                return v
+    return None
+
+
+class _BulkImportDialog(QDialog):
+    """Paste many gaps at once — one per line. Optionally let Claude clean the
+    titles and infer System/Subsystem/Topic for each line."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.imported_count = 0
+        # title -> {system, subsystem, topic} captured from a PDF load, so the
+        # inferred levels survive into the import without a second Claude call.
+        self._pdf_enrich: dict[str, dict] = {}
+        self.setWindowTitle("Bulk import knowledge gaps")
+        self.setMinimumSize(560, 480)
+        self._build()
+
+    def _build(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(8)
+
+        intro = QLabel(
+            "Paste your gaps below — <b>one per line</b>, or <b>load a PDF</b> "
+            "of LOs / gaps and let AI pull them out. Each line becomes a "
+            "Knowledge Gap of the chosen type."
+        )
+        intro.setTextFormat(Qt.TextFormat.RichText)
+        intro.setWordWrap(True)
+        root.addWidget(intro)
+
+        self._text = QPlainTextEdit()
+        self._text.setPlaceholderText(
+            "e.g.\n"
+            "Digoxin toxicity worsened by hypokalaemia\n"
+            "Mechanism of action of beta-blockers in heart failure\n"
+            "When to image a headache with neuro deficit"
+        )
+        root.addWidget(self._text, 1)
+
+        type_row = QHBoxLayout()
+        type_row.addWidget(QLabel("Type:"))
+        self._type = QComboBox()
+        for t in _load_types():
+            self._type.addItem(t["name"], t["key"])
+        # Default to the configured default-on-add type if present.
+        default_key = (tool_config("knowledge_gaps").get("default_type_on_add") or "kg")
+        idx = max(0, self._type.findData(default_key))
+        self._type.setCurrentIndex(idx)
+        type_row.addWidget(self._type)
+        type_row.addStretch(1)
+        self._pdf_btn = QPushButton("📄 Load from PDF…")
+        self._pdf_btn.setAutoDefault(False)
+        self._pdf_btn.setEnabled(provider_configured())
+        if not provider_configured():
+            self._pdf_btn.setToolTip("Set up an AI provider in Settings first.")
+        self._pdf_btn.clicked.connect(self._on_load_pdf)
+        type_row.addWidget(self._pdf_btn)
+        root.addLayout(type_row)
+
+        self._use_claude = QCheckBox(
+            "Use AI to clean up titles and infer System / Subsystem / Topic"
+        )
+        self._use_claude.setEnabled(provider_configured())
+        if not provider_configured():
+            self._use_claude.setToolTip("Set up an AI provider in Settings first.")
+        root.addWidget(self._use_claude)
+
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        self._import_btn = bb.button(QDialogButtonBox.StandardButton.Ok)
+        self._import_btn.setText("Import")
+        self._import_btn.setAutoDefault(False)
+        bb.accepted.connect(self._on_import)
+        bb.rejected.connect(self.reject)
+        root.addWidget(bb)
+
+    def _on_load_pdf(self) -> None:
+        if not provider_configured():
+            showWarning("Set up an AI provider in Settings first.")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose a PDF of LOs / knowledge gaps", "",
+            "PDF (*.pdf);;All files (*)",
+        )
+        if not path:
+            return
+        parsed = _coerce_parsed_list(run_claude_json(
+            self._pdf_btn, "Reading PDF…",
+            prompt="Extract the knowledge gaps / learning objectives from the "
+                   "attached PDF.",
+            system=_PDF_EXTRACT_SYSTEM, max_tokens=8000,
+            attachments=[path],
+        ))
+        if not parsed:
+            tooltip("Couldn't pull any items from that PDF.", period=4000)
+            return
+        titles: list[str] = []
+        enrich: dict[str, dict] = {}
+        for obj in parsed:
+            if not isinstance(obj, dict):
+                continue
+            title = str(obj.get("title") or "").strip()
+            if not title:
+                continue
+            titles.append(title)
+            levels = {k: str(obj.get(k) or "").strip()
+                      for k in ("system", "subsystem", "topic")}
+            enrich[title] = {k: v for k, v in levels.items() if v}
+        if not titles:
+            tooltip("Couldn't pull any items from that PDF.", period=4000)
+            return
+        self._pdf_enrich = enrich
+        # Append to whatever's already in the box so a PDF adds to a manual list.
+        existing = self._text.toPlainText().strip()
+        block = "\n".join(titles)
+        self._text.setPlainText(f"{existing}\n{block}" if existing else block)
+        tooltip(f"Loaded {len(titles)} item(s) from PDF — review, then Import.",
+                period=3500)
+
+    def _lines(self) -> list[str]:
+        seen: list[str] = []
+        for raw in self._text.toPlainText().splitlines():
+            line = raw.strip().lstrip("-•*").strip()
+            if line:
+                seen.append(line)
+        return seen
+
+    def _on_import(self) -> None:
+        lines = self._lines()
+        if not lines:
+            tooltip("Nothing to import — paste some lines first.")
+            return
+        type_key = self._type.currentData() or "kg"
+        parsed = None
+        if self._use_claude.isChecked() and provider_configured():
+            numbered = "\n".join(f"{i + 1}. {ln}" for i, ln in enumerate(lines))
+            # Scale the token budget with the list length so long lists don't
+            # get truncated mid-JSON (which previously parsed to None and
+            # silently fell back to raw titles).
+            budget = min(8000, max(2000, len(lines) * 120))
+            raw_parsed = run_claude_json(
+                self._import_btn, "Structuring…",
+                prompt=numbered, system=_BULK_PARSE_SYSTEM, max_tokens=budget,
+            )
+            parsed = _coerce_parsed_list(raw_parsed)
+            if parsed is None:
+                # Claude was requested but produced nothing usable — tell the
+                # user instead of silently importing raw lines.
+                tooltip("AI couldn't structure the list — importing raw titles.",
+                        period=4000)
+
+        records: list[dict] = []
+        for i, ln in enumerate(lines):
+            title = ln
+            fields: dict = {}
+            # Apply per-index: even if Claude returned a different count, we
+            # use whatever lines up and fall back to the raw line otherwise.
+            obj = parsed[i] if (parsed is not None and i < len(parsed)) else None
+            if isinstance(obj, dict):
+                title = str(obj.get("title") or ln).strip() or ln
+                for k in ("system", "subsystem", "topic"):
+                    v = str(obj.get(k) or "").strip()
+                    if v:
+                        fields[k] = v
+            # Reuse System/Subsystem/Topic captured at PDF-load time for any
+            # line that still matches its extracted title (no re-call needed).
+            elif ln in self._pdf_enrich:
+                for k, v in self._pdf_enrich[ln].items():
+                    fields[k] = v
+            records.append({
+                "title":  title,
+                "source": "manual",
+                "type":   type_key,
+                "status": "open",
+                "fields": fields,
+            })
+        kg_store.add_many(records)
+        self.imported_count = len(records)
+        self.accept()
+
+
 # ── Main panel ───────────────────────────────────────────────────────────────
 
 _STATUS_FILTERS = [
     ("open",      "Open"),
     ("done",      "Done"),
-    ("dismissed", "Dismissed"),
 ]
 
 
@@ -1021,8 +1386,20 @@ class KnowledgeGapsPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._filter = "open"
+        # Sub-toggle on the Done filter — false by default so dismissed
+        # items stay hidden unless explicitly requested.
+        self._include_dismissed: bool = False
         self._build()
         self.refresh_list()
+
+    def showEvent(self, ev):
+        super().showEvent(ev)
+        # Tag completer on the detail pane's tag field is stale after a
+        # session of adding new tags; rebuild on every show.
+        try:
+            attach_tag_completer(self._detail._tags_input, multi=True)
+        except Exception as e:
+            print(f"[ankisstant] KG tag completer refresh failed: {e}")
 
     def _build(self) -> None:
         root = QVBoxLayout(self)
@@ -1070,13 +1447,30 @@ class KnowledgeGapsPanel(QWidget):
 
         # Filter chips — two rows: status filters on top, type filters below.
         self._chip_buttons: dict[str, QPushButton] = {}
-        self._status_chip_row = self._make_chip_row(root, _STATUS_FILTERS)
+        # Status row is built directly so we can wedge the "Include dismissed"
+        # toggle onto the end after the Open / Done chips.
+        status_row = QHBoxLayout()
+        status_row.setSpacing(4)
+        for entry in _STATUS_FILTERS:
+            self._add_chip(status_row, entry)
+        # Include-dismissed sub-toggle, only meaningful when Done is active.
+        self._include_dismissed_cb = QCheckBox("Include dismissed")
+        self._include_dismissed_cb.setStyleSheet("font-size: 11px; color: gray;")
+        self._include_dismissed_cb.setToolTip(
+            "Dismissed Done items are hidden by default. Tick to include them "
+            "in the Done view."
+        )
+        self._include_dismissed_cb.toggled.connect(self._on_include_dismissed_toggled)
+        status_row.addWidget(self._include_dismissed_cb)
+        status_row.addStretch(1)
+        root.addLayout(status_row)
         # Types row is rebuilt on every settings save (see refresh_chips).
         self._type_chip_row_holder = QHBoxLayout()
         root.addLayout(self._type_chip_row_holder)
         self._rebuild_type_chip_row()
         if self._filter in self._chip_buttons:
             self._chip_buttons[self._filter].setChecked(True)
+        self._refresh_include_dismissed_visibility()
 
         # Splitter: list / detail
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -1092,17 +1486,31 @@ class KnowledgeGapsPanel(QWidget):
         lcol.addWidget(self._count_lbl)
         self._list = QListWidget()
         self._list.setAlternatingRowColors(True)
+        self._list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._list.customContextMenuRequested.connect(self._on_list_context_menu)
         self._list.itemSelectionChanged.connect(self._on_select)
         lcol.addWidget(self._list, 1)
+        sel_hint = QLabel(
+            "Shift/Cmd-click to select several, then right-click for bulk actions."
+        )
+        sel_hint.setStyleSheet("color: gray; font-size: 10px;")
+        sel_hint.setWordWrap(True)
+        lcol.addWidget(sel_hint)
         btn_row = QHBoxLayout()
         add_btn = QPushButton("＋ Add KG")
         add_btn.setAutoDefault(False)
         add_btn.clicked.connect(self._on_add_kg)
+        import_btn = QPushButton("⇪ Bulk import")
+        import_btn.setAutoDefault(False)
+        import_btn.setToolTip("Paste a list of gaps (one per line) to add them all at once.")
+        import_btn.clicked.connect(self._on_bulk_import)
         refresh_btn = QPushButton("⟳")
         refresh_btn.setFixedWidth(28)
         refresh_btn.setAutoDefault(False)
         refresh_btn.clicked.connect(lambda: self.refresh_list())
         btn_row.addWidget(add_btn)
+        btn_row.addWidget(import_btn)
         btn_row.addStretch(1)
         btn_row.addWidget(refresh_btn)
         lcol.addLayout(btn_row)
@@ -1113,8 +1521,7 @@ class KnowledgeGapsPanel(QWidget):
         self._clear_btn.setAutoDefault(False)
         self._clear_btn.setStyleSheet("font-size: 11px;")
         self._clear_btn.setToolTip(
-            "Remove every KG with status Done or Dismissed. "
-            "Other items stay where they are."
+            "Remove every Done KG (including dismissed). Open items stay."
         )
         self._clear_btn.clicked.connect(self._on_clear_completed)
         clear_row.addWidget(self._clear_btn)
@@ -1207,7 +1614,12 @@ class KnowledgeGapsPanel(QWidget):
 
     def refresh_setup_banner(self) -> None:
         try:
-            self._setup_banner.setVisible(not provider_configured())
+            ok = provider_configured()
+            self._setup_banner.setVisible(not ok)
+            analyse_btn = getattr(
+                getattr(self._detail, "_lo_analyser", None), "_analyse_btn", None
+            )
+            set_ai_buttons_enabled([analyse_btn], ok)
         except Exception:
             pass
 
@@ -1228,22 +1640,43 @@ class KnowledgeGapsPanel(QWidget):
 
     def _set_filter(self, key: str) -> None:
         self._filter = key
+        self._refresh_include_dismissed_visibility()
         self.refresh_list()
+
+    def _on_include_dismissed_toggled(self, checked: bool) -> None:
+        self._include_dismissed = bool(checked)
+        self.refresh_list()
+
+    def _refresh_include_dismissed_visibility(self) -> None:
+        # Only meaningful when the Done filter is active.
+        try:
+            self._include_dismissed_cb.setVisible(self._filter == "done")
+        except Exception:
+            pass
 
     def _matches_filter(self, kg: dict) -> bool:
         f = self._filter
         status = kg.get("status", "open")
-        if f in ("open", "done", "dismissed"):
-            return status == f
+        dismissed = bool(kg.get("dismissed", False))
+        if f == "open":
+            return status == "open"
+        if f == "done":
+            # By default hide dismissed items even within the Done filter;
+            # the "Include dismissed" toggle flips this back on.
+            if status != "done":
+                return False
+            if dismissed and not self._include_dismissed:
+                return False
+            return True
         if f.startswith("type:"):
             return kg.get("type", "kg") == f.split(":", 1)[1]
         return True
 
     def refresh_list(self, preserve_selection: str | None = None) -> None:
         items = kg_store.load_all()
-        # Active items above done/dismissed; newest first within each bucket.
+        # Active items above done; newest first within each bucket.
         # Python's sort is stable so we can apply secondary then primary.
-        status_order = {"open": 0, "done": 1, "dismissed": 2}
+        status_order = {"open": 0, "done": 1}
         items.sort(key=lambda k: k.get("created_at", ""), reverse=True)
         items.sort(key=lambda k: status_order.get(k.get("status", "open"), 4))
 
@@ -1251,10 +1684,7 @@ class KnowledgeGapsPanel(QWidget):
         self._count_lbl.setText(
             f"{len(visible)} shown · {len(items)} total"
         )
-        done_count = sum(
-            1 for k in items
-            if k.get("status") in ("done", "dismissed")
-        )
+        done_count = sum(1 for k in items if k.get("status") == "done")
         self._clear_btn.setText(f"Clear completed ({done_count})")
         self._clear_btn.setEnabled(done_count > 0)
 
@@ -1292,6 +1722,113 @@ class KnowledgeGapsPanel(QWidget):
         kg = kg_store.get(li.kg_id)
         self._detail.load(kg)
 
+    # ── bulk actions ───────────────────────────────────────────────────────────
+
+    def _selected_ids(self) -> list[str]:
+        ids: list[str] = []
+        for li in self._list.selectedItems():
+            if isinstance(li, _KGListItem) and li.kg_id:
+                ids.append(li.kg_id)
+        return ids
+
+    def _on_list_context_menu(self, pos) -> None:
+        ids = self._selected_ids()
+        if not ids:
+            return
+        menu = QMenu(self._list)
+        n = len(ids)
+        label = "1 gap" if n == 1 else f"{n} gaps"
+        menu.addAction(f"Send {label} to Create",
+                       lambda: self._bulk_send_to_create(ids))
+        menu.addAction(f"Send {label} to Browse",
+                       lambda: self._bulk_send_to_browse(ids))
+        menu.addSeparator()
+        menu.addAction(f"Mark {label} Done",
+                       lambda: self._bulk_set_status(ids, "done", dismissed=False))
+        menu.addAction(f"Dismiss {label}",
+                       lambda: self._bulk_set_status(ids, "done", dismissed=True))
+        menu.addAction(f"Reopen {label}",
+                       lambda: self._bulk_set_status(ids, "open", dismissed=False))
+        menu.addSeparator()
+        menu.addAction(f"Delete {label}…",
+                       lambda: self._bulk_delete(ids))
+        menu.exec(self._list.mapToGlobal(pos))
+
+    def _bulk_set_status(self, ids: list[str], status: str, dismissed: bool) -> None:
+        for kid in ids:
+            kg_store.update(kid, status=status, dismissed=dismissed)
+        verb = {"done": "Done", "open": "Open"}.get(status, status)
+        if status == "done" and dismissed:
+            verb = "Dismissed"
+        tooltip(f"{len(ids)} gap(s) → {verb}.")
+        self.refresh_list()
+
+    def _bulk_delete(self, ids: list[str]) -> None:
+        if not ids:
+            return
+        if not askUser(
+            f"Delete {len(ids)} knowledge gap(s)?\n\nThis is permanent.",
+            defaultno=True,
+        ):
+            return
+        for kid in ids:
+            kg_store.remove(kid)
+        tooltip(f"Deleted {len(ids)} gap(s).")
+        self.refresh_list()
+
+    def _bulk_send_to_create(self, ids: list[str]) -> None:
+        main = self.window()
+        if not hasattr(main, "gap_queue"):
+            showWarning("Open the KG page from Tools → Ankisstant first.")
+            return
+        queued = 0
+        for kid in ids:
+            kg = kg_store.get(kid)
+            if not kg:
+                continue
+            stem_html = kg_store.field(kg, "stem_html")
+            notes_bits = [kg_store.field(kg, k) for k in ("notes", "concept", "lo")]
+            notes_bits = [b for b in notes_bits if b]
+            images = (kg.get("fields") or {}).get("images") or []
+            main.gap_queue.append({
+                "title":     kg.get("title", ""),
+                "kg_id":     kg.get("id", ""),
+                "stem_html": stem_html or None,
+                "notes":     "\n\n".join(notes_bits) or None,
+                "images":    list(images),
+                "kg_type":   (kg.get("type") or "").lower(),
+            })
+            queued += 1
+        if hasattr(main, "refresh_queue_badge"):
+            main.refresh_queue_badge()
+        if queued and hasattr(main, "show_create_tool"):
+            main.show_create_tool()
+        tooltip(f"Queued {queued} gap(s) for Create.")
+        self.refresh_list()
+
+    def _bulk_send_to_browse(self, ids: list[str]) -> None:
+        main = self.window()
+        if not hasattr(main, "browse_queue"):
+            showWarning("Open the KG page from Tools → Ankisstant first.")
+            return
+        existing = {q.get("id") for q in main.browse_queue if isinstance(q, dict)}
+        queued = 0
+        for kid in ids:
+            if kid in existing:
+                continue
+            kg = kg_store.get(kid)
+            if not kg:
+                continue
+            main.browse_queue.append(kg)
+            existing.add(kid)
+            queued += 1
+        if hasattr(main, "refresh_queue_badge"):
+            main.refresh_queue_badge()
+        if queued and hasattr(main, "show_browse_tool"):
+            main.show_browse_tool()
+        tooltip(f"Queued {queued} KG(s) for Browse.")
+        self.refresh_list()
+
     # ── add / analyse ────────────────────────────────────────────────────────
 
     def _on_add_kg(self) -> None:
@@ -1299,10 +1836,19 @@ class KnowledgeGapsPanel(QWidget):
         if dlg.exec():
             self.refresh_list()
 
+    def _on_bulk_import(self) -> None:
+        dlg = _BulkImportDialog(self)
+        if not dlg.exec():
+            return
+        n = dlg.imported_count
+        if n:
+            tooltip(f"Imported {n} knowledge gap(s).")
+            self.refresh_list()
+
     def _on_clear_completed(self) -> None:
         items = kg_store.load_all()
         done_ids = [k["id"] for k in items
-                    if k.get("status") in ("done", "dismissed") and k.get("id")]
+                    if k.get("status") == "done" and k.get("id")]
         if not done_ids:
             tooltip("Nothing to clear — no completed items.")
             return

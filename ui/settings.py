@@ -11,13 +11,91 @@ from datetime import date
 from aqt.qt import (
     QApplication, QCheckBox, QColor, QColorDialog, QComboBox, QDate,
     QDateEdit, QDialog, QDialogButtonBox, QFormLayout, QGroupBox, QHBoxLayout,
-    QLabel, QLineEdit, QListWidget, QListWidgetItem, QPlainTextEdit,
-    QPushButton, QScrollArea, QSpinBox, Qt, QTabWidget, QVBoxLayout, QWidget,
+    QKeySequence, QKeySequenceEdit, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, Qt,
+    QTabWidget, QVBoxLayout, QWidget,
 )
 from aqt.utils import showInfo, showWarning, tooltip
 
 from ..core import api as core_api
-from ..core.config import DEFAULTS, load_config, save_config
+from ..core.config import (
+    DEFAULTS, PROVIDER_MODELS, active_family, family_for, load_config, save_config,
+)
+
+
+def _model_combo(current: str, fallback: str = "claude-sonnet-4-6",
+                 min_width: int = 320, models: list[str] | None = None) -> QComboBox:
+    """Editable combobox seeded with `models` (defaults to the Anthropic list).
+    currentText() returns the model ID — either a picked one or whatever the
+    user typed."""
+    cb = QComboBox()
+    cb.setEditable(True)
+    cb.addItems(models if models is not None else PROVIDER_MODELS["anthropic"])
+    cur = (current or "").strip() or fallback
+    if cur and cb.findText(cur) < 0:
+        cb.addItem(cur)
+    cb.setCurrentText(cur)
+    cb.setMinimumWidth(min_width)
+    cb.setToolTip("Pick a known model or type a custom model ID.")
+    return cb
+
+
+def _coerce_model_dict(stored, default_dict: dict) -> dict:
+    """Normalise a stored model field (dict or legacy string) into a full
+    {family: id} dict, backfilling missing families from `default_dict`."""
+    if isinstance(stored, dict):
+        return {**default_dict, **{k: v for k, v in stored.items() if v}}
+    if isinstance(stored, str) and stored.strip():
+        return {**default_dict, "anthropic": stored.strip()}
+    return dict(default_dict)
+
+
+class _ModelField(QWidget):
+    """Provider-aware model picker. Holds one model ID per family and shows the
+    one for the active family; switching family preserves each family's pick so
+    a user who jumps between providers keeps their per-provider choices."""
+
+    def __init__(self, stored, default_dict: dict, family: str,
+                 min_width: int = 320, parent=None):
+        super().__init__(parent)
+        self._models = _coerce_model_dict(stored, default_dict)
+        self._family = family
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self._cb = QComboBox()
+        self._cb.setEditable(True)
+        self._cb.setMinimumWidth(min_width)
+        self._cb.setToolTip(
+            "Pick a known model or type a custom model ID. Saved separately per "
+            "provider, so switching providers keeps each one's choice."
+        )
+        lay.addWidget(self._cb)
+        self._populate()
+
+    def _populate(self) -> None:
+        self._cb.blockSignals(True)
+        self._cb.clear()
+        self._cb.addItems(PROVIDER_MODELS.get(self._family, []))
+        cur = (self._models.get(self._family) or "").strip()
+        if not cur:
+            known = PROVIDER_MODELS.get(self._family, [""])
+            cur = known[0] if known else ""
+        if cur and self._cb.findText(cur) < 0:
+            self._cb.addItem(cur)
+        self._cb.setCurrentText(cur)
+        self._cb.blockSignals(False)
+
+    def _capture(self) -> None:
+        self._models[self._family] = self._cb.currentText().strip()
+
+    def set_family(self, family: str) -> None:
+        self._capture()
+        self._family = family
+        self._populate()
+
+    def values(self) -> dict:
+        self._capture()
+        return dict(self._models)
 
 
 # ── small helpers ────────────────────────────────────────────────────────────
@@ -49,6 +127,23 @@ def _expand_form(layout: QFormLayout) -> QFormLayout:
     layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
     layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
     return layout
+
+
+def _set_form_row_visible(form: QFormLayout, field: QWidget, visible: bool) -> None:
+    """Show/hide a whole form row (label + field) by its field widget. Uses
+    Qt 6.4+ setRowVisible when available, else hides both widgets manually."""
+    try:
+        form.setRowVisible(field, visible)
+        return
+    except Exception:
+        pass
+    field.setVisible(visible)
+    try:
+        lbl = form.labelForField(field)
+        if lbl is not None:
+            lbl.setVisible(visible)
+    except Exception:
+        pass
 
 
 def _slug(text: str) -> str:
@@ -246,12 +341,12 @@ class _NotetypeProfileDialog(QDialog):
         skill_hint.setStyleSheet("color: gray;")
         root.addWidget(skill_hint)
 
-        root.addWidget(QLabel("Extra prompt instructions for Claude (optional):"))
+        root.addWidget(QLabel("Extra prompt instructions for AI (optional):"))
         self._instructions = QPlainTextEdit(e.get("extra_instructions", ""))
         self._instructions.setPlaceholderText(
             "e.g. 'Malleus style — front fact only, no clinical context. "
             "Use field <Mnemonic> for memory aids instead of Extra.'\n\n"
-            "Claude will be told which fields this notetype has and will follow "
+            "AI will be told which fields this notetype has and will follow "
             "these instructions when drafting cards."
         )
         self._instructions.setMinimumHeight(120)
@@ -366,50 +461,102 @@ class _ExamDateEditDialog(QDialog):
 
 # ── tab widgets ──────────────────────────────────────────────────────────────
 
-class _GlobalTab(QWidget):
+_PROVIDER_LABELS = [
+    ("auto",      "Auto — Claude CLI, fall back to Anthropic API"),
+    ("cli",       "Claude Code CLI only (subscription)"),
+    ("anthropic", "Anthropic API"),
+    ("gemini",    "Gemini API (free tier)"),
+    ("openai",    "OpenAI API"),
+    ("ollama",    "Ollama (local model, no key)"),
+    ("manual",    "BYO AI — paste from any chatbot"),
+]
+
+# Per-family key metadata for the dynamic key field.
+_KEY_META = {
+    "anthropic": ("Anthropic API key:", "sk-ant-…",
+                  "anthropic_api_key", "console.anthropic.com"),
+    "gemini":    ("Gemini API key:",    "AIza…",
+                  "gemini_api_key",    "aistudio.google.com/apikey"),
+    "openai":    ("OpenAI API key:",    "sk-…",
+                  "openai_api_key",    "platform.openai.com/api-keys"),
+}
+
+
+def _key_family_for(provider: str) -> str | None:
+    """Which API key the dynamic field edits for a given provider. CLI uses no
+    key; auto edits the Anthropic key (its fallback path)."""
+    if provider in ("anthropic", "auto"):
+        return "anthropic"
+    if provider in ("gemini", "openai"):
+        return provider
+    return None  # cli
+
+
+class _AITab(QWidget):
+    """Dedicated AI/provider screen: pick a provider, paste its key, choose a
+    default model. The key field and CLI rows adapt to the selected provider."""
+
     def __init__(self, cfg: dict, parent=None):
         super().__init__(parent)
+        self.on_provider_changed = None  # set by SettingsDialog to fan out
+        self._keys = {
+            "anthropic": cfg.get("anthropic_api_key", "") or "",
+            "gemini":    cfg.get("gemini_api_key", "") or "",
+            "openai":    cfg.get("openai_api_key", "") or "",
+        }
+        self._cur_key_family: str | None = None
+
         layout = _expand_form(QFormLayout(self))
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setVerticalSpacing(10)
 
         intro = QLabel(
-            "Two backends are supported: the local <b>Claude Code CLI</b> "
-            "(uses your subscription quota), or the <b>Anthropic API</b> "
-            "(pay-per-token, requires a key from console.anthropic.com)."
+            "Choose how Ankisstant talks to an AI. Use the local <b>Claude Code "
+            "CLI</b> (your subscription, no key needed), or a paid/free API key "
+            "from <b>Anthropic</b>, <b>Google Gemini</b>, or <b>OpenAI</b>."
         )
         intro.setWordWrap(True)
         intro.setTextFormat(Qt.TextFormat.RichText)
         intro.setStyleSheet("color: gray;")
         layout.addRow(intro)
 
-        self._mode = QComboBox()
-        self._mode.addItem("Auto — prefer CLI, fall back to API", "auto")
-        self._mode.addItem("Claude Code CLI only (subscription)", "cli")
-        self._mode.addItem("Anthropic API only (paid)",           "api")
-        idx = max(0, self._mode.findData((cfg.get("provider_mode") or "auto").lower()))
-        self._mode.setCurrentIndex(idx)
-        layout.addRow("Provider mode:", self._mode)
+        self._provider = QComboBox()
+        for data, label in _PROVIDER_LABELS:
+            self._provider.addItem(label, data)
+        idx = max(0, self._provider.findData((cfg.get("provider") or "auto").lower()))
+        self._provider.setCurrentIndex(idx)
+        layout.addRow("Provider:", self._provider)
 
-        # API key with show/hide toggle.
-        key_row = QHBoxLayout()
-        self._key = QLineEdit(cfg.get("anthropic_api_key", ""))
+        # Dynamic API-key row (label + placeholder change per provider).
+        self._key_label = QLabel("API key:")
+        self._key_container = QWidget()
+        kc = QHBoxLayout(self._key_container)
+        kc.setContentsMargins(0, 0, 0, 0)
+        self._key = QLineEdit()
         self._key.setMinimumWidth(420)
         self._key.setEchoMode(QLineEdit.EchoMode.Password)
-        self._key.setPlaceholderText("sk-ant-…")
-        key_row.addWidget(self._key, 1)
+        kc.addWidget(self._key, 1)
         self._show_key = QPushButton("Show")
         self._show_key.setCheckable(True)
         self._show_key.setFixedWidth(56)
         self._show_key.toggled.connect(self._toggle_key_visibility)
-        key_row.addWidget(self._show_key)
-        layout.addRow("Anthropic API key:", key_row)
+        kc.addWidget(self._show_key)
+        layout.addRow(self._key_label, self._key_container)
 
+        self._key_hint = QLabel("")
+        self._key_hint.setTextFormat(Qt.TextFormat.RichText)
+        self._key_hint.setStyleSheet("color: gray;")
+        self._key_hint.setWordWrap(True)
+        layout.addRow("", self._key_hint)
+
+        # CLI-only rows, grouped so they can be shown/hidden together.
+        self._cli_container = QWidget()
+        cli_form = _expand_form(QFormLayout(self._cli_container))
+        cli_form.setContentsMargins(0, 0, 0, 0)
         self._cli_path = QLineEdit(cfg.get("claude_cli_path", ""))
         self._cli_path.setMinimumWidth(480)
         self._cli_path.setPlaceholderText("Auto-detect (leave blank) — e.g. /usr/local/bin/claude")
-        layout.addRow("Claude CLI path:", self._cli_path)
-
+        cli_form.addRow("Claude CLI path:", self._cli_path)
         cli_hint = QLabel(
             "<small>Leave blank to auto-detect. On macOS, GUI apps don't inherit your "
             "shell PATH, so you may need to set this explicitly. Run "
@@ -418,17 +565,55 @@ class _GlobalTab(QWidget):
         cli_hint.setWordWrap(True)
         cli_hint.setTextFormat(Qt.TextFormat.RichText)
         cli_hint.setStyleSheet("color: gray;")
-        layout.addRow("", cli_hint)
-
+        cli_form.addRow("", cli_hint)
         self._cli_extra = QLineEdit(" ".join(cfg.get("claude_cli_extra_args") or []))
         self._cli_extra.setMinimumWidth(480)
         self._cli_extra.setPlaceholderText("e.g. --permission-mode bypassPermissions")
-        layout.addRow("CLI extra args:", self._cli_extra)
+        cli_form.addRow("CLI extra args:", self._cli_extra)
+        layout.addRow("", self._cli_container)
 
-        self._model_default = QLineEdit(cfg.get("model_default", "claude-sonnet-4-6"))
-        self._model_default.setMinimumWidth(320)
-        self._model_default.setPlaceholderText("claude-sonnet-4-6")
-        layout.addRow("Default model:", self._model_default)
+        # Ollama-only row: the local server URL (no API key needed).
+        self._ollama_container = QWidget()
+        ollama_form = _expand_form(QFormLayout(self._ollama_container))
+        ollama_form.setContentsMargins(0, 0, 0, 0)
+        self._ollama_url = QLineEdit(cfg.get("ollama_url", "") or "http://localhost:11434")
+        self._ollama_url.setMinimumWidth(480)
+        self._ollama_url.setPlaceholderText("http://localhost:11434")
+        ollama_form.addRow("Ollama server URL:", self._ollama_url)
+        ollama_hint = QLabel(
+            "<small>No API key needed. Install Ollama (ollama.com), run "
+            "<code>ollama serve</code>, and <code>ollama pull &lt;model&gt;</code> "
+            "for the model name you set below.</small>"
+        )
+        ollama_hint.setWordWrap(True)
+        ollama_hint.setTextFormat(Qt.TextFormat.RichText)
+        ollama_hint.setStyleSheet("color: gray;")
+        ollama_form.addRow("", ollama_hint)
+        layout.addRow("", self._ollama_container)
+
+        self._default_model = _ModelField(
+            cfg.get("model_defaults"), DEFAULTS["model_defaults"],
+            family_for(cfg.get("provider", "auto")), min_width=360,
+        )
+        layout.addRow("Default model:", self._default_model)
+
+        # Shown only for the 'manual' provider, which has no key/model/CLI.
+        self._manual_note = QLabel(
+            "<b>Bring your own AI — no account needed here.</b><br>"
+            "Every Ankisstant tool still works — when you run one, it hands you "
+            "a ready-made prompt to copy into <b>any</b> chatbot (ChatGPT, Gemini, "
+            "Claude.ai — free versions are fine). Paste the reply back and "
+            "Ankisstant takes it from there. Nothing leaves your machine "
+            "automatically, and no API key is needed."
+        )
+        self._manual_note.setTextFormat(Qt.TextFormat.RichText)
+        self._manual_note.setWordWrap(True)
+        self._manual_note.setStyleSheet(
+            "QLabel { background: rgba(80,160,255,0.12); border: 1px solid "
+            "rgba(80,160,255,0.5); border-radius: 6px; padding: 10px; }"
+        )
+        layout.addRow("", self._manual_note)
+        self._form = layout
 
         test_row = QHBoxLayout()
         self._test_btn = QPushButton("Test connection")
@@ -436,6 +621,49 @@ class _GlobalTab(QWidget):
         test_row.addWidget(self._test_btn)
         test_row.addStretch(1)
         layout.addRow(test_row)
+
+        self._provider.currentIndexChanged.connect(self._refresh)
+        self._refresh()  # initial sync of key field / CLI rows / default model
+
+    # ── dynamic UI ─────────────────────────────────────────────────────────
+    def current_provider(self) -> str:
+        return self._provider.currentData() or "auto"
+
+    def current_family(self) -> str:
+        return family_for(self.current_provider())
+
+    def _capture_key(self) -> None:
+        if self._cur_key_family:
+            self._keys[self._cur_key_family] = self._key.text().strip()
+
+    def _refresh(self, *args) -> None:
+        self._capture_key()
+        provider = self.current_provider()
+        kf = _key_family_for(provider)
+        self._cur_key_family = kf
+        show_key = kf is not None
+        self._key_label.setVisible(show_key)
+        self._key_container.setVisible(show_key)
+        self._key_hint.setVisible(show_key)
+        if show_key:
+            label, placeholder, _cfg_key, where = _KEY_META[kf]
+            if provider == "auto":
+                label = "Anthropic API key (fallback):"
+            self._key_label.setText(label)
+            self._key.setPlaceholderText(placeholder)
+            self._key.setText(self._keys.get(kf, ""))
+            self._key_hint.setText(f"<small>Get a key at {where}.</small>")
+        show_cli = provider in ("auto", "cli")
+        self._cli_container.setVisible(show_cli)
+        self._ollama_container.setVisible(provider == "ollama")
+        manual = provider == "manual"
+        self._manual_note.setVisible(manual)
+        # Manual has no model and nothing to connection-test.
+        _set_form_row_visible(self._form, self._default_model, not manual)
+        self._test_btn.setVisible(not manual)
+        self._default_model.set_family(family_for(provider))
+        if callable(self.on_provider_changed):
+            self.on_provider_changed(self.current_provider())
 
     def _toggle_key_visibility(self, checked: bool):
         self._key.setEchoMode(
@@ -447,34 +675,78 @@ class _GlobalTab(QWidget):
         # Save the form values into a transient config snapshot for the test
         # call, without persisting them (Save isn't clicked yet).
         from ..core.config import load_config as _load
+        from ..core import qt_utils
         snapshot = _load()
         snapshot.update(self.get_values())
         save_config(snapshot)
-        self._test_btn.setEnabled(False)
-        self._test_btn.setText("Testing…")
-        QApplication.processEvents()
-        try:
-            reply = core_api.ask_claude(
-                prompt="Reply with the word ok and nothing else.",
-                system="You are a connection test. Reply with the single word: ok",
-                max_tokens=16,
-                show_errors=False,
-            )
-        finally:
-            self._test_btn.setEnabled(True)
-            self._test_btn.setText("Test connection")
+        # Run on a background thread with a cancellable progress dialog so a
+        # slow or hung network request never freezes Anki's main thread.
+        reply = qt_utils.run_claude_text(
+            self._test_btn,
+            "Testing connection…",
+            prompt="Reply with the word ok and nothing else.",
+            system="You are a connection test. Reply with the single word: ok",
+            max_tokens=16,
+        )
         if reply:
             showInfo(f"Connection OK.\n\nReply: {reply!r}")
         else:
-            showWarning("Test failed — see Anki's console for the error.")
+            showWarning("Test failed or cancelled — see Anki's console for the error.")
+
+    def get_values(self) -> dict:
+        self._capture_key()
+        return {
+            "provider":              self.current_provider(),
+            "anthropic_api_key":     self._keys.get("anthropic", ""),
+            "gemini_api_key":        self._keys.get("gemini", ""),
+            "openai_api_key":        self._keys.get("openai", ""),
+            "claude_cli_path":       self._cli_path.text().strip(),
+            "claude_cli_extra_args": [t for t in self._cli_extra.text().strip().split() if t],
+            "ollama_url":            self._ollama_url.text().strip() or "http://localhost:11434",
+            "model_defaults":        self._default_model.values(),
+        }
+
+
+class _GlobalTab(QWidget):
+    def __init__(self, cfg: dict, parent=None):
+        super().__init__(parent)
+        layout = _expand_form(QFormLayout(self))
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setVerticalSpacing(10)
+
+        intro = QLabel(
+            "General options. AI provider, keys and models now live on the "
+            "<b>AI</b> tab."
+        )
+        intro.setWordWrap(True)
+        intro.setTextFormat(Qt.TextFormat.RichText)
+        intro.setStyleSheet("color: gray;")
+        layout.addRow(intro)
+
+        # ── Month tag — temporality for created / unsuspended cards ──────────
+        self._month_tag = QCheckBox("Add a month tag to created & unsuspended cards")
+        self._month_tag.setChecked(bool(cfg.get("month_tag_enabled", True)))
+        self._month_tag.setToolTip(
+            "When on, every card you create (Create) or unsuspend/tag (Browse) "
+            "also gets a tag <prefix>::<YYYY-MM> for the current month."
+        )
+        layout.addRow("Month tag:", self._month_tag)
+
+        self._month_tag_prefix = QLineEdit(
+            str(cfg.get("month_tag_prefix", "Ankisstant::Month") or "")
+        )
+        self._month_tag_prefix.setMinimumWidth(360)
+        self._month_tag_prefix.setPlaceholderText("e.g. Ankisstant::Month")
+        self._month_tag_prefix.setToolTip(
+            "Root of the month tag. The current month (YYYY-MM) is appended, "
+            "e.g. Ankisstant::Month::2026-05."
+        )
+        layout.addRow("Month tag prefix:", self._month_tag_prefix)
 
     def get_values(self) -> dict:
         return {
-            "provider_mode":       self._mode.currentData() or "auto",
-            "anthropic_api_key":   self._key.text().strip(),
-            "claude_cli_path":     self._cli_path.text().strip(),
-            "claude_cli_extra_args": [t for t in self._cli_extra.text().strip().split() if t],
-            "model_default":       self._model_default.text().strip() or "claude-sonnet-4-6",
+            "month_tag_enabled":   bool(self._month_tag.isChecked()),
+            "month_tag_prefix":    self._month_tag_prefix.text().strip(),
         }
 
 
@@ -489,7 +761,7 @@ class _QBankTab(QWidget):
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(10)
 
-        self._enabled = QCheckBox("Enable QBank with Claude")
+        self._enabled = QCheckBox("Enable AI QBank")
         self._enabled.setChecked(bool(qb_cfg.get("enabled", True)))
         root.addWidget(self._enabled)
 
@@ -547,13 +819,17 @@ class _QBankTab(QWidget):
         cap_box = QGroupBox("Capture & AI card generation")
         cf = _expand_form(QFormLayout(cap_box))
 
-        self._search_model = QLineEdit(qb_cfg.get("search_model", "claude-haiku-4-5-20251001"))
-        self._search_model.setMinimumWidth(360)
+        fam = active_family()
+        self._search_model = _ModelField(
+            qb_cfg.get("search_model"), DEFAULTS["tools"]["qbank"]["search_model"],
+            fam, min_width=360)
         cf.addRow("Search model (fast):", self._search_model)
 
-        self._card_model = QLineEdit(qb_cfg.get("card_gen_model", "claude-sonnet-4-6"))
-        self._card_model.setMinimumWidth(360)
+        self._card_model = _ModelField(
+            qb_cfg.get("card_gen_model"), DEFAULTS["tools"]["qbank"]["card_gen_model"],
+            fam, min_width=360)
         cf.addRow("Card-gen model:", self._card_model)
+        self._model_form = cf
 
         self._notetype = QLineEdit(qb_cfg.get("card_notetype", ""))
         self._notetype.setMinimumWidth(360)
@@ -577,6 +853,39 @@ class _QBankTab(QWidget):
         self._tag_root = QLineEdit(qb_cfg.get("tag_root", "Missed_Questions"))
         self._tag_root.setMinimumWidth(360)
         cf.addRow("Tag root:", self._tag_root)
+
+        # ── Capture popup UX (zoom + image width) ────────────────────────
+        self._image_max_width = QSpinBox()
+        self._image_max_width.setRange(80, 1200)
+        self._image_max_width.setSuffix(" px")
+        self._image_max_width.setValue(int(qb_cfg.get("image_max_width", 300)))
+        self._image_max_width.setToolTip(
+            "Max-width applied to pasted screenshots when saved into a card. "
+            "Smaller values keep cards compact."
+        )
+        cf.addRow("Image max width:", self._image_max_width)
+
+        self._capture_zoom = QSpinBox()
+        self._capture_zoom.setRange(40, 100)
+        self._capture_zoom.setSuffix(" %")
+        self._capture_zoom.setValue(int(round(float(qb_cfg.get("capture_zoom_factor", 0.7)) * 100)))
+        self._capture_zoom.setToolTip(
+            "Zoom level the QBank browser is shrunk to while the capture "
+            "popup is open (so more of the question fits on screen for a "
+            "screenshot). 100% disables the shrink. Anki's reviewer is "
+            "unaffected."
+        )
+        cf.addRow("Capture zoom factor:", self._capture_zoom)
+
+        self._capture_shortcut = QKeySequenceEdit()
+        self._capture_shortcut.setKeySequence(
+            QKeySequence(qb_cfg.get("capture_shortcut", "Ctrl+M"))
+        )
+        self._capture_shortcut.setToolTip(
+            "Application-wide shortcut that opens the capture popup, even while "
+            "reviewing. Clear it to disable."
+        )
+        cf.addRow("Capture shortcut:", self._capture_shortcut)
 
         root.addWidget(cap_box)
         root.addStretch(1)
@@ -708,6 +1017,12 @@ class _QBankTab(QWidget):
         self._exams.pop(idx)
         self._rebuild_exams()
 
+    def set_model_family(self, family: str, manual: bool = False) -> None:
+        self._search_model.set_family(family)
+        self._card_model.set_family(family)
+        _set_form_row_visible(self._model_form, self._search_model, not manual)
+        _set_form_row_visible(self._model_form, self._card_model, not manual)
+
     def get_values(self) -> dict:
         return {
             "enabled":        self._enabled.isChecked(),
@@ -716,13 +1031,16 @@ class _QBankTab(QWidget):
             "default_daily":  int(self._spin.value()),
             "target_periods": sorted(self._periods, key=lambda p: p.get("from", "")),
             "exam_dates":     sorted(self._exams,   key=lambda e: e.get("date", "")),
-            "search_model":   self._search_model.text().strip() or "claude-haiku-4-5-20251001",
-            "card_gen_model": self._card_model.text().strip()    or "claude-sonnet-4-6",
+            "search_model":   self._search_model.values(),
+            "card_gen_model": self._card_model.values(),
             "card_notetype":  self._notetype.text().strip(),
             "card_deck":      self._deck.text().strip(),
             "card_skill_id":  self._skill.text().strip(),
             "missed_q_field": self._field.text().strip()         or "Missed Questions",
             "tag_root":       self._tag_root.text().strip()      or "Missed_Questions",
+            "image_max_width": int(self._image_max_width.value()),
+            "capture_zoom_factor": round(int(self._capture_zoom.value()) / 100.0, 3),
+            "capture_shortcut": self._capture_shortcut.keySequence().toString(),
         }
 
 
@@ -733,13 +1051,15 @@ class _BrowseTab(QWidget):
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setVerticalSpacing(10)
 
-        self._enabled = QCheckBox("Enable Browse with Claude")
+        self._enabled = QCheckBox("Enable AI Browse")
         self._enabled.setChecked(bool(br_cfg.get("enabled", True)))
         layout.addRow(self._enabled)
 
-        self._model = QLineEdit(br_cfg.get("model", "claude-sonnet-4-6"))
-        self._model.setMinimumWidth(420)
+        self._model = _ModelField(
+            br_cfg.get("model"), DEFAULTS["tools"]["browse"]["model"],
+            active_family(), min_width=420)
         layout.addRow("Model:", self._model)
+        self._model_form = layout
 
         self._last_tag = QLineEdit(br_cfg.get("last_used_tag", ""))
         self._last_tag.setMinimumWidth(420)
@@ -765,6 +1085,28 @@ class _BrowseTab(QWidget):
         self._audit_tag.setPlaceholderText("e.g. Ankisstant::AI::Browse")
         layout.addRow("Audit tag:", self._audit_tag)
 
+        # Hierarchical auto-tag: the AI suggests a tag for the searched topic
+        # and pre-fills the "Tag to apply" field. The scheme (base prefix +
+        # type + levels) is the SHARED one configured under Knowledge Gaps —
+        # there's no Browse-specific prefix. A free search is tagged as KG; a
+        # search loaded from a KG uses that KG's type.
+        self._auto_tag = QCheckBox("Auto-suggest a hierarchical tag on topic search")
+        self._auto_tag.setChecked(bool(br_cfg.get("auto_tag", True)))
+        self._auto_tag.setToolTip(
+            "When you search a topic, ask the AI for {system}::{subsystem}::"
+            "{topic} and pre-fill the 'Tag to apply' field using the shared "
+            "auto-tag scheme (set under Knowledge Gaps → Auto-tag). Won't "
+            "overwrite a tag you've already typed or one carried from a KG."
+        )
+        layout.addRow("Auto-tag:", self._auto_tag)
+        at_hint = QLabel(
+            "<small>Tag scheme &amp; base prefix live in "
+            "<b>Knowledge Gaps → Auto-tag</b>.</small>"
+        )
+        at_hint.setStyleSheet("color: gray;")
+        at_hint.setTextFormat(Qt.TextFormat.RichText)
+        layout.addRow("", at_hint)
+
         st_hint = QLabel("<small>Source-deck badges are edited in the addon config JSON.</small>")
         st_hint.setStyleSheet("color: gray;")
         st_hint.setTextFormat(Qt.TextFormat.RichText)
@@ -772,16 +1114,21 @@ class _BrowseTab(QWidget):
 
         self._source_tags = list(br_cfg.get("source_tags") or [])
 
+    def set_model_family(self, family: str, manual: bool = False) -> None:
+        self._model.set_family(family)
+        _set_form_row_visible(self._model_form, self._model, not manual)
+
     def get_values(self) -> dict:
         return {
             "enabled":           self._enabled.isChecked(),
-            "model":             self._model.text().strip() or "claude-sonnet-4-6",
+            "model":             self._model.values(),
             "last_used_tag":     self._last_tag.text().strip(),
             "max_results":       int(self._max.value()),
             "notetype_filter":   self._notetype_filter.text().strip(),
             "front_field":       self._front_field.text().strip() or "Text",
             "audit_tag":         self._audit_tag.text().strip(),
             "source_tags":       self._source_tags,
+            "auto_tag":          self._auto_tag.isChecked(),
         }
 
 
@@ -909,6 +1256,27 @@ class _TypeEditorDialog(QDialog):
         self._description.setMinimumHeight(50)
         self._description.setPlaceholderText("Optional — what is this type for?")
         form.addRow("Description:", self._description)
+
+        # Auto-tag opt-in for this type. When enabled, Create/Browse ask Claude
+        # for {system, subsystem, topic} and build a tag using the SHARED
+        # scheme: <base>::<this type's name>::System::Subsystem::Topic. The base
+        # prefix and template are set once, below the type list.
+        self._auto_tag = QCheckBox("Generate hierarchical tag from concept")
+        self._auto_tag.setChecked(bool((existing or {}).get("auto_tag", False)))
+        self._auto_tag.setToolTip(
+            "When a card is made from a KG of this type, AI extracts "
+            "System / Subsystem / Topic and the addon appends a tag of the form "
+            "<base>::<TypeName>::System::Subsystem::Topic to every card. The "
+            "<base> prefix is shared across all types (set below the type list)."
+        )
+        form.addRow("Auto-tag:", self._auto_tag)
+        type_name_hint = QLabel(
+            "<small>The type's <b>name</b> above becomes the second tag segment "
+            "(e.g. <code>!!Fleg::MQ::…</code>).</small>"
+        )
+        type_name_hint.setStyleSheet("color: gray;")
+        type_name_hint.setTextFormat(Qt.TextFormat.RichText)
+        form.addRow("", type_name_hint)
 
         if existing:
             key_lbl = QLabel(f"<small>key: <code>{existing.get('key', '')}</code></small>")
@@ -1070,11 +1438,12 @@ class _TypeEditorDialog(QDialog):
     def values(self, fallback_key: str = "") -> dict:
         name = self._name.text().strip()
         return {
-            "key":         self._key or _slugify_type_key(name) or fallback_key,
-            "name":        name,
-            "color":       self._color.text().strip() or "#6b7280",
-            "description": self._description.toPlainText().strip(),
-            "fields":      [dict(f) for f in self._fields],
+            "key":              self._key or _slugify_type_key(name) or fallback_key,
+            "name":             name,
+            "color":            self._color.text().strip() or "#6b7280",
+            "description":      self._description.toPlainText().strip(),
+            "auto_tag":         bool(self._auto_tag.isChecked()),
+            "fields":           [dict(f) for f in self._fields],
         }
 
 
@@ -1112,6 +1481,31 @@ class _KnowledgeGapsTab(QWidget):
             str(kg_cfg.get("default_type_on_add") or "kg")
         )
         form.addRow("Default type on Add:", self._default_type_on_add)
+
+        # Shared auto-tag scheme — the single source of truth for BOTH Create
+        # and Browse. Base prefix + per-type name + extracted levels.
+        self._auto_tag_base = QLineEdit(str(kg_cfg.get("auto_tag_base") or ""))
+        self._auto_tag_base.setMinimumWidth(420)
+        self._auto_tag_base.setPlaceholderText("e.g. !!Fleg")
+        self._auto_tag_base.setToolTip(
+            "Shared base prefix for all auto-tags. Cards from Create and Browse "
+            "sit together under <base>::MQ, <base>::KG, etc. (the type name is "
+            "added automatically). Leave blank to disable auto-tagging entirely."
+        )
+        form.addRow("Auto-tag base:", self._auto_tag_base)
+
+        self._tag_scheme = QLineEdit(
+            kg_cfg.get("tag_scheme_template") or "{base}::{type}::{system}::{subsystem}::{topic}"
+        )
+        self._tag_scheme.setMinimumWidth(420)
+        self._tag_scheme.setPlaceholderText("{base}::{type}::{system}::{subsystem}::{topic}")
+        self._tag_scheme.setToolTip(
+            "Template shared by Create and Browse. Available slots: "
+            "{base} (the prefix above), {type} (the KG type's name, e.g. MQ/KG), "
+            "{system}, {subsystem}, {topic}. Empty slots are dropped, so a topic "
+            "with no clear subsystem still produces a usable tag."
+        )
+        form.addRow("Auto-tag template:", self._tag_scheme)
 
         root.addLayout(form)
 
@@ -1160,9 +1554,11 @@ class _KnowledgeGapsTab(QWidget):
         self._ga_enabled.setChecked(bool(ga_cfg.get("enabled", True)))
         ab.addRow(self._ga_enabled)
 
-        self._ga_model = QLineEdit(ga_cfg.get("model", "claude-sonnet-4-6"))
-        self._ga_model.setMinimumWidth(420)
+        self._ga_model = _ModelField(
+            ga_cfg.get("model"), DEFAULTS["tools"]["gap_analyser"]["model"],
+            active_family(), min_width=420)
         ab.addRow("Model:", self._ga_model)
+        self._model_form = ab
 
         self._ga_front_field = QLineEdit(ga_cfg.get("front_field", "Text"))
         ab.addRow("Front field:", self._ga_front_field)
@@ -1178,7 +1574,7 @@ class _KnowledgeGapsTab(QWidget):
         self._ga_max_cards = QSpinBox()
         self._ga_max_cards.setRange(5, 500)
         self._ga_max_cards.setValue(int(ga_cfg.get("max_cards", 80)))
-        ab.addRow("Max cards sent to Claude:", self._ga_max_cards)
+        ab.addRow("Max cards sent to AI:", self._ga_max_cards)
 
         self._ga_max_gaps = QSpinBox()
         self._ga_max_gaps.setRange(1, 30)
@@ -1186,7 +1582,7 @@ class _KnowledgeGapsTab(QWidget):
         ab.addRow("Max gaps to return:", self._ga_max_gaps)
 
         ga_hint = QLabel(
-            "<small>Pulls cards under a tag, asks Claude what's missing, and "
+            "<small>Pulls cards under a tag, asks AI what's missing, and "
             "pushes the approved gaps into the queue above.</small>"
         )
         ga_hint.setTextFormat(Qt.TextFormat.RichText)
@@ -1200,7 +1596,7 @@ class _KnowledgeGapsTab(QWidget):
             "<small>The Knowledge Gaps tab is the unified queue for things you "
             "don't know — from manual notes, the Analyse KG sub-feature, captured "
             "QBank misses, or items saved from Browse. From any KG you can send "
-            "to Browse with Claude, or create a card directly.</small>"
+            "to AI Browse, or create a card directly.</small>"
         )
         outro.setTextFormat(Qt.TextFormat.RichText)
         outro.setStyleSheet("color: gray;")
@@ -1308,13 +1704,22 @@ class _KnowledgeGapsTab(QWidget):
             "confirm_on_delete":     self._confirm_on_delete.isChecked(),
             "default_status_on_add": "open",
             "default_type_on_add":   self._default_type_on_add.currentData() or "kg",
+            "auto_tag_base":         self._auto_tag_base.text().strip(),
+            "tag_scheme_template":   (
+                self._tag_scheme.text().strip()
+                or "{base}::{type}::{system}::{subsystem}::{topic}"
+            ),
             "types":                 [dict(t) for t in self._types],
         }
+
+    def set_model_family(self, family: str, manual: bool = False) -> None:
+        self._ga_model.set_family(family)
+        _set_form_row_visible(self._model_form, self._ga_model, not manual)
 
     def get_gap_analyser_values(self) -> dict:
         return {
             "enabled":         self._ga_enabled.isChecked(),
-            "model":           self._ga_model.text().strip() or "claude-sonnet-4-6",
+            "model":           self._ga_model.values(),
             "front_field":     self._ga_front_field.text().strip() or "Text",
             "notetype_filter": self._ga_notetype_filter.text().strip(),
             "last_used_tag":   self._ga_last_tag.text().strip(),
@@ -1342,13 +1747,15 @@ class _CreatorTab(QWidget):
         top_form = _expand_form(QFormLayout())
         top_form.setVerticalSpacing(10)
 
-        self._enabled = QCheckBox("Enable Create with Claude")
+        self._enabled = QCheckBox("Enable AI Create")
         self._enabled.setChecked(bool(cc_cfg.get("enabled", True)))
         top_form.addRow(self._enabled)
 
-        self._model = QLineEdit(cc_cfg.get("model", "claude-sonnet-4-6"))
-        self._model.setMinimumWidth(420)
+        self._model = _ModelField(
+            cc_cfg.get("model"), DEFAULTS["tools"]["card_creator"]["model"],
+            active_family(), min_width=420)
         top_form.addRow("Model:", self._model)
+        self._model_form = top_form
 
         self._deck = QComboBox()
         self._deck.setEditable(True)
@@ -1396,7 +1803,7 @@ class _CreatorTab(QWidget):
         nt_hint = QLabel(
             "The creator panel's notetype dropdown lists these profiles. "
             "Each profile maps a notetype to its field layout and can carry "
-            "its own prompt addendum so Claude tailors output to that style "
+            "its own prompt addendum so AI tailors output to that style "
             "(e.g. the Malleus deck). Add as many as you like."
         )
         nt_hint.setWordWrap(True)
@@ -1479,6 +1886,10 @@ class _CreatorTab(QWidget):
         self._profiles.pop(idx)
         self._rebuild_profiles()
 
+    def set_model_family(self, family: str, manual: bool = False) -> None:
+        self._model.set_family(family)
+        _set_form_row_visible(self._model_form, self._model, not manual)
+
     def get_values(self) -> dict:
         tags_raw = [t.strip() for t in self._tags.text().split(",") if t.strip()]
         # Keep selected_notetype valid — if the previously selected notetype
@@ -1490,7 +1901,7 @@ class _CreatorTab(QWidget):
         first = self._profiles[0] if self._profiles else {}
         return {
             "enabled":          self._enabled.isChecked(),
-            "model":            self._model.text().strip() or "claude-sonnet-4-6",
+            "model":            self._model.values(),
             "default_deck":     self._deck.currentText().strip(),
             "default_tags":     tags_raw,
             "audit_tag":        self._audit_tag.text().strip(),
@@ -1533,19 +1944,19 @@ class _AboutTab(QWidget):
         body = QTextBrowser()
         body.setOpenExternalLinks(True)
         body.setHtml(
-            "<p>Four Claude-powered tools, bundled together:</p>"
+            "<p>Four AI-powered tools, bundled together:</p>"
             "<ul>"
-            "<li><b>QBank with Claude</b> — log missed QBank questions and "
+            "<li><b>AI QBank</b> — log missed QBank questions and "
             "generate cards from them.</li>"
-            "<li><b>Browse with Claude</b> — natural-language search across "
+            "<li><b>AI Browse</b> — natural-language search across "
             "your collection.</li>"
             "<li><b>Analyse Knowledge Gaps</b> — audit a tag against a learning "
             "objective.</li>"
-            "<li><b>Create with Claude</b> — generate cards from text, URLs, "
+            "<li><b>AI Create</b> — generate cards from text, URLs, "
             "PDFs, or PowerPoints.</li>"
             "</ul>"
             "<p><b>No telemetry.</b> Nothing is sent anywhere except your chosen "
-            "Claude provider (Anthropic API or the local Claude Code CLI).</p>"
+            "AI provider (Anthropic API, Gemini, OpenAI, Ollama, or the local Claude Code CLI).</p>"
             "<p>Anki collection access stays local. Your API key and config live "
             "in this profile's <code>meta.json</code> only.</p>"
         )
@@ -1569,6 +1980,26 @@ class _AboutTab(QWidget):
         notices.setOpenExternalLinks(True)
         notices.setWordWrap(True)
         v.addWidget(notices)
+
+        thanks_patrick = QLabel(
+            "<small>Thanks to "
+            "<a href='https://drpatricklee.substack.com/'>Patrick Lee</a> "
+            "for feedback and inspiration.</small>"
+        )
+        thanks_patrick.setTextFormat(Qt.TextFormat.RichText)
+        thanks_patrick.setOpenExternalLinks(True)
+        thanks_patrick.setWordWrap(True)
+        v.addWidget(thanks_patrick)
+
+        thanks_heatmap = QLabel(
+            "<small>Thanks to "
+            "<a href='https://ankiweb.net/shared/info/1771074083'>"
+            "Review Heatmap</a> by Glutanimate for the original heatmap.</small>"
+        )
+        thanks_heatmap.setTextFormat(Qt.TextFormat.RichText)
+        thanks_heatmap.setOpenExternalLinks(True)
+        thanks_heatmap.setWordWrap(True)
+        v.addWidget(thanks_heatmap)
 
         v.addStretch(1)
 
@@ -1596,6 +2027,7 @@ class SettingsDialog(QDialog):
         root.setSpacing(8)
 
         tabs = QTabWidget()
+        self._ai_tab      = _AITab(self._original_cfg)
         self._global_tab  = _GlobalTab(self._original_cfg)
         self._qbank_tab   = _QBankTab(self._original_cfg.get("tools", {}).get("qbank", {}))
         self._browse_tab  = _BrowseTab(self._original_cfg.get("tools", {}).get("browse", {}))
@@ -1605,13 +2037,18 @@ class SettingsDialog(QDialog):
         )
         self._creator_tab = _CreatorTab(self._original_cfg.get("tools", {}).get("card_creator", {}))
         self._about_tab   = _AboutTab()
+        tabs.addTab(_wrap_scroll(self._ai_tab),      "AI")
         tabs.addTab(_wrap_scroll(self._global_tab),  "Global")
-        tabs.addTab(_wrap_scroll(self._qbank_tab),   "QBank with Claude")
-        tabs.addTab(_wrap_scroll(self._browse_tab),  "Browse with Claude")
+        tabs.addTab(_wrap_scroll(self._qbank_tab),   "AI QBank")
+        tabs.addTab(_wrap_scroll(self._browse_tab),  "AI Browse")
         tabs.addTab(_wrap_scroll(self._kg_tab),      "Knowledge Gaps")
-        tabs.addTab(_wrap_scroll(self._creator_tab), "Create with Claude")
+        tabs.addTab(_wrap_scroll(self._creator_tab), "AI Create")
         tabs.addTab(_wrap_scroll(self._about_tab),   "About")
         root.addWidget(tabs)
+
+        # Keep every tool tab's model pickers in sync with the AI tab's provider.
+        self._ai_tab.on_provider_changed = self._sync_tool_models
+        self._sync_tool_models(self._ai_tab.current_provider())
 
         restart_hint = QLabel(
             "<small>Some changes (enable/disable a tool, change deck-browser hooks) "
@@ -1629,8 +2066,15 @@ class SettingsDialog(QDialog):
         bb.rejected.connect(self.reject)
         root.addWidget(bb)
 
+    def _sync_tool_models(self, provider: str):
+        manual = (provider or "").lower() == "manual"
+        family = family_for(provider)
+        for tab in (self._qbank_tab, self._browse_tab, self._kg_tab, self._creator_tab):
+            tab.set_model_family(family, manual=manual)
+
     def _on_save(self):
         cfg = load_config()
+        cfg.update(self._ai_tab.get_values())
         cfg.update(self._global_tab.get_values())
         cfg.setdefault("tools", {})
         cfg["tools"]["qbank"]        = {**cfg["tools"].get("qbank", {}),        **self._qbank_tab.get_values()}
@@ -1639,6 +2083,13 @@ class SettingsDialog(QDialog):
         cfg["tools"]["gap_analyser"]   = {**cfg["tools"].get("gap_analyser", {}),   **self._kg_tab.get_gap_analyser_values()}
         cfg["tools"]["card_creator"]   = {**cfg["tools"].get("card_creator", {}),   **self._creator_tab.get_values()}
         save_config(cfg)
+        # Re-register the capture shortcut so a changed binding works without
+        # an Anki restart.
+        try:
+            from .. import _setup_capture_shortcut
+            _setup_capture_shortcut()
+        except Exception:
+            pass
         tooltip("Settings saved.")
         self.accept()
 

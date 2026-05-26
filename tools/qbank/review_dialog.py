@@ -13,7 +13,7 @@ from aqt.qt import (
 from aqt.utils import showWarning, tooltip
 
 from ...core import anki_utils, api as core_api
-from ...core.config import tool_config
+from ...core.config import active_family, tool_config, tool_model
 from .anki_helpers import mark_again
 from .missed_queue import load_queue, remove_item
 
@@ -68,7 +68,7 @@ CARD_PROMPT_SKILL = (
 
 def _generate_search_terms(concept: str) -> list[str]:
     cfg = tool_config("qbank")
-    model = cfg.get("search_model") or "claude-haiku-4-5-20251001"
+    model = tool_model(cfg, "search_model", active_family())
     raw = core_api.ask_claude_json(
         prompt=SEARCH_PROMPT.format(concept=concept.strip()),
         system=SEARCH_SYSTEM,
@@ -83,7 +83,7 @@ def _generate_search_terms(concept: str) -> list[str]:
 
 def _generate_card_draft(concept: str, stem: str) -> dict:
     cfg = tool_config("qbank")
-    model     = cfg.get("card_gen_model") or "claude-sonnet-4-6"
+    model     = tool_model(cfg, "card_gen_model", active_family())
     skill_id  = (cfg.get("card_skill_id") or "").strip()
     template  = cfg.get("card_prompt") or (CARD_PROMPT_SKILL if skill_id else CARD_PROMPT_DEFAULT)
     prompt    = template.replace("{concept}", concept).replace("{stem}", stem)
@@ -295,7 +295,7 @@ class ReviewDialog(QDialog):
         if not self._current_item:
             return
         concept = self._current_item.get("concept", "")
-        self._status_lbl.setText("Searching with Claude…")
+        self._status_lbl.setText("Searching with AI…")
         self._search_btn.setEnabled(False)
 
         def _bg():
@@ -432,7 +432,7 @@ class ReviewDialog(QDialog):
         tag       = anki_utils.build_tag(tag_root, system, subsystem, topic)
         item_id   = self._current_item["id"]
 
-        self._status_lbl.setText("Drafting card with Claude…")
+        self._status_lbl.setText("Drafting card with AI…")
 
         def _bg():
             return _generate_card_draft(concept, stem)

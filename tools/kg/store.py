@@ -50,7 +50,21 @@ def load_all() -> list[dict]:
     try:
         with open(path, "r") as f:
             data = json.load(f)
-        return data if isinstance(data, list) else []
+        if not isinstance(data, list):
+            return []
+        # One-shot in-memory migration: legacy status="dismissed" gets
+        # folded into status="done" + dismissed=True. We don't write back
+        # on every read — the next update() on each record persists it.
+        out: list[dict] = []
+        for it in data:
+            if not isinstance(it, dict):
+                continue
+            if it.get("status") == "dismissed":
+                it = dict(it)
+                it["status"] = "done"
+                it["dismissed"] = True
+            out.append(it)
+        return out
     except (json.JSONDecodeError, OSError) as e:
         print(f"[ankisstant] kg_queue load failed: {e}")
         return []
@@ -67,8 +81,10 @@ def save_all(items: list[dict]) -> None:
 # ── normalisation ────────────────────────────────────────────────────────────
 
 VALID_SOURCES = {"manual", "analyse", "qbank", "browse"}
-VALID_STATUSES = {"open", "done", "dismissed"}
+VALID_STATUSES = {"open", "done"}
 # Statuses that no longer exist but may still be in old saved data.
+# "dismissed" used to be a separate top-level status; it now folds into
+# status="done" plus the boolean `dismissed` flag (see _normalise).
 LEGACY_STATUS_ALIASES = {"in_progress": "open"}
 
 
@@ -99,7 +115,15 @@ def _normalise(item: dict) -> dict:
     out["source"] = src if src in VALID_SOURCES else "manual"
     st = out.get("status", "open")
     st = LEGACY_STATUS_ALIASES.get(st, st)
+    # Migration: legacy "dismissed" status collapses into status=done with
+    # the boolean dismissed flag set. Anything coming in already-flagged
+    # keeps its flag.
+    dismissed_flag = bool(out.get("dismissed", False))
+    if st == "dismissed":
+        st = "done"
+        dismissed_flag = True
     out["status"] = st if st in VALID_STATUSES else "open"
+    out["dismissed"] = dismissed_flag if out["status"] == "done" else False
     # Type is a free-form slug (configurable in settings). Default keyed off
     # source so legacy entries get a sensible label.
     tp = str(out.get("type") or "").strip().lower()

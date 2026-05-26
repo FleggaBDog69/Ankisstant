@@ -13,11 +13,11 @@ from aqt.qt import (
 )
 from aqt.utils import askUser, showWarning, tooltip
 
-from ..core import anki_utils, api as core_api
-from ..core.config import tool_config, save_tool_config
+from ..core import anki_utils
+from ..core.config import active_family, tool_config, tool_model, save_tool_config
 from ..core.qt_utils import (
-    attach_tag_completer, loading, make_help_button, make_setup_banner,
-    provider_configured,
+    attach_tag_completer, make_help_button, make_setup_banner,
+    provider_configured, run_claude_json, set_ai_buttons_enabled,
 )
 from .kg import store as kg_store
 
@@ -101,7 +101,7 @@ class GapAnalyserPanel(QWidget):
 
         intro = QLabel(
             "Paste a learning objective, pick the Anki tag holding cards for that LO, "
-            "and Claude will flag specific gaps. Approved gaps land in the "
+            "and AI will flag specific gaps. Approved gaps land in the "
             "<b>Knowledge Gaps</b> queue — send each to Browse or Create from there."
         )
         intro.setTextFormat(Qt.TextFormat.RichText)
@@ -144,7 +144,7 @@ class GapAnalyserPanel(QWidget):
         # Analyse button
         btn_row = QHBoxLayout()
         btn_row.addStretch(1)
-        self.analyse_btn = QPushButton("🔍 Analyse Gaps with Claude")
+        self.analyse_btn = QPushButton("🔍 Analyse Gaps with AI")
         self.analyse_btn.setEnabled(False)
         self.analyse_btn.clicked.connect(self._on_analyse)
         btn_row.addWidget(self.analyse_btn)
@@ -191,7 +191,9 @@ class GapAnalyserPanel(QWidget):
 
     def refresh_setup_banner(self) -> None:
         try:
-            self._setup_banner.setVisible(not provider_configured())
+            ok = provider_configured()
+            self._setup_banner.setVisible(not ok)
+            set_ai_buttons_enabled([getattr(self, "analyse_btn", None)], ok)
         except Exception:
             pass
 
@@ -279,13 +281,13 @@ class GapAnalyserPanel(QWidget):
         )
 
         self.status.setText(
-            f"Asking Claude what's missing from {len(card_fronts)} card(s) under '{tag}'…"
+            f"Asking AI what's missing from {len(card_fronts)} card(s) under '{tag}'…"
         )
-        model = self.cfg.get("model") or None
-        with loading(self.analyse_btn, "Analysing…"):
-            gaps = core_api.ask_claude_json(
-                prompt=user_msg, system=system, max_tokens=1024, model=model,
-            )
+        model = tool_model(self.cfg, "model", active_family())
+        gaps = run_claude_json(
+            self.analyse_btn, "Analysing…",
+            prompt=user_msg, system=system, max_tokens=1024, model=model,
+        )
         self._update_button_state()
 
         if not isinstance(gaps, list):
@@ -306,7 +308,7 @@ class GapAnalyserPanel(QWidget):
 
         self._render_gaps(gaps)
         self.status.setText(
-            f"Claude found {len(gaps)} gap(s) across {len(card_fronts)} card(s) under '{tag}'."
+            f"AI found {len(gaps)} gap(s) across {len(card_fronts)} card(s) under '{tag}'."
         )
 
     # ── render / select / queue ──────────────────────────────────────────────
