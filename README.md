@@ -19,6 +19,10 @@ Before anything else, pick how Ankisstant connects to AI. You need one of these:
 > **ChatGPT Plus ≠ API access.** ChatGPT Plus is a subscription to chatgpt.com — it does not include API credits. If you have ChatGPT, use the [paste import path](docs/setup-paste.md).
 >
 > **Gemini free tier\*:** Free tier prompts may be used by Google to improve its models. See the [Gemini guide](docs/setup-gemini.md) for details and the paid-tier option.
+>
+> **Confirmed-working providers:** **Gemini**, the **Claude API** (Anthropic), the **Claude CLI**, and **no-AI paste import** are the tested, supported paths. **OpenAI** and **Ollama** are implemented but not yet confirmed end-to-end — use them at your own risk and please report back.
+>
+> **Gemini model note:** on the free tier only **Gemini 2.5 Flash** has quota — *Gemini 2.0 Flash* and *Gemini 2.5 Pro* return `429 limit: 0` for free-tier keys. Ankisstant defaults to 2.5 Flash and will auto-correct an old saved default on upgrade.
 
 Not sure where to start? [Gemini free tier](docs/setup-gemini.md) — five minutes, no payment.
 

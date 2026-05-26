@@ -8,7 +8,7 @@ import json
 
 from aqt import mw
 from aqt.qt import (
-    QButtonGroup, QComboBox, QDialog, QFrame, QGroupBox, QHBoxLayout,
+    QButtonGroup, QCheckBox, QComboBox, QDialog, QFrame, QGroupBox, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QRadioButton, QStackedWidget, Qt,
     QTextEdit, QVBoxLayout, QWidget,
 )
@@ -73,6 +73,9 @@ _PROVIDERS = [
      "You need an API key from OpenAI's platform with a small prepaid credit balance. "
      "A ChatGPT Plus subscription does not include API access. "
      "Data is sent to OpenAI's servers.<br><br>"
+     "<b style='color:#b85c00;'>Experimental:</b> the OpenAI path is implemented but "
+     "not yet confirmed end-to-end. Gemini, Claude (API or CLI) and the no-AI "
+     "copy/paste mode are the tested, supported options.<br><br>"
      "<b style='color:#b85c00;'>Note:</b> New keys can take up to 15 minutes to activate."),
 
     ("ollama",
@@ -85,7 +88,10 @@ _PROVIDERS = [
      "llama3.1, mistral, or phi3 (several GB each).<br><br>"
      "<b>Hardware:</b> 16 GB RAM is the practical minimum; 32 GB recommended for "
      "larger models. Apple Silicon Macs and recent NVIDIA GPUs work well. "
-     "Older or low-RAM machines may be too slow to be usable."),
+     "Older or low-RAM machines may be too slow to be usable.<br><br>"
+     "<b style='color:#b85c00;'>Experimental:</b> the Ollama path is implemented but "
+     "not yet confirmed end-to-end. Gemini, Claude (API or CLI) and the no-AI "
+     "copy/paste mode are the tested, supported options."),
 ]
 
 # Per-family model metadata: id → (friendly name, tier description)
@@ -93,16 +99,18 @@ _MODEL_META: dict[str, tuple[str, str]] = {
     "claude-opus-4-7":           ("Opus 4.7",         "Most capable — complex multi-step reasoning"),
     "claude-sonnet-4-6":         ("Sonnet 4.6",        "Recommended — excellent quality, reasonable speed"),
     "claude-haiku-4-5-20251001": ("Haiku 4.5",         "Fast & cheap — great for searches and quick tasks"),
-    "gemini-2.5-pro":            ("Gemini 2.5 Pro",    "Highest quality — slower, uses more quota"),
-    "gemini-2.5-flash":          ("Gemini 2.5 Flash",  "Recommended — fast and capable"),
-    "gemini-2.0-flash":          ("Gemini 2.0 Flash",  "Free-tier workhorse, very fast"),
+    "gemini-2.5-pro":            ("Gemini 2.5 Pro",    "Highest quality — PAID plan only (no free quota)"),
+    "gemini-2.5-flash":          ("Gemini 2.5 Flash",  "Recommended — the only free-tier Gemini model"),
+    "gemini-2.0-flash":          ("Gemini 2.0 Flash",  "Legacy — no longer free; prefer 2.5 Flash"),
     "gpt-4o":                    ("GPT-4o",            "Most capable OpenAI model"),
     "gpt-4o-mini":               ("GPT-4o mini",       "Recommended — cheap and capable"),
     "gpt-4.1-mini":              ("GPT-4.1 mini",      "Fast and economical"),
 }
 
 # Default model index (into PROVIDER_MODELS list) per family
-_DEFAULT_IDX = {"anthropic": 1, "gemini": 2, "openai": 1, "ollama": 0}
+# Gemini → index 1 = gemini-2.5-flash. (2.0-flash, index 2, no longer has a
+# free tier — defaulting to it 429'd new free-tier users on first run.)
+_DEFAULT_IDX = {"anthropic": 1, "gemini": 1, "openai": 1, "ollama": 0}
 
 # Page indices
 _P_INTRO    = 0
@@ -110,6 +118,22 @@ _P_CREDS    = 1
 _P_MODEL    = 2
 _P_DEFAULTS = 3
 _P_TEST     = 4
+_P_QBANKS   = 5
+
+# Curated list of popular question banks, surfaced as checkboxes in the wizard
+# so a new user can seed their QBank list in one click instead of typing URLs.
+# (key, display name, url). The user picks 0–3; more can be added in Settings.
+_POPULAR_QBANKS: list[tuple[str, str, str]] = [
+    ("uworld",      "UWorld",              "https://www.uworld.com/"),
+    ("amboss",      "AMBOSS",              "https://www.amboss.com/"),
+    ("osmosis",     "Osmosis",             "https://www.osmosis.org/"),
+    ("emedici",     "eMedici",             "https://app.emedici.com"),
+    ("clinicalkey", "ClinicalKey Student", "https://www.clinicalkey.com/student/questionbanks"),
+    ("passmedicine","Passmedicine",        "https://www.passmedicine.com/"),
+    ("quesmed",     "Quesmed",             "https://quesmed.com/"),
+    ("lecturio",    "Lecturio",            "https://www.lecturio.com/"),
+    ("geekymedics", "Geeky Medics (OSCE)", "https://geekymedics.com/"),
+]
 
 # Pre-built AI agents for the manual copy-paste workflow.
 # Fill in real URLs once the GPTs are published; None = show as "coming soon".
@@ -446,6 +470,65 @@ class _PageCredentials(QWidget):
             key_row.addWidget(show_btn)
             lay.addLayout(key_row)
 
+            # Inline connection test, right next to the key — fix it and retry
+            # here without paging forward. Runs async (no nested modal loop).
+            test_row = QHBoxLayout()
+            self._key_test_btn = QPushButton("Test key")
+            self._key_test_btn.setAutoDefault(False)
+            self._key_test_btn.clicked.connect(self._run_inline_test)
+            test_row.addWidget(self._key_test_btn)
+            self._key_test_lbl = QLabel("")
+            self._key_test_lbl.setStyleSheet("font-size: 12px;")
+            test_row.addWidget(self._key_test_lbl, 1)
+            lay.addLayout(test_row)
+            lay.addWidget(_muted(
+                "<small>Optional — confirm the key works now, or just click Next.</small>"
+            ))
+
+    def _run_inline_test(self) -> None:
+        key = self.get_api_key()
+        if not key:
+            self._key_test_lbl.setText("Paste a key first.")
+            self._key_test_lbl.setStyleSheet("color: #b85c00; font-size: 12px;")
+            return
+        # Persist the typed key/provider so ask_claude (which reads config) uses it.
+        self._wizard._apply_config()
+        self._key_test_btn.setEnabled(False)
+        self._key_test_lbl.setStyleSheet("color: gray; font-size: 12px;")
+        self._key_test_lbl.setText("Testing…")
+
+        def work():
+            return core_api.ask_claude(
+                prompt="Reply with the word ok and nothing else.",
+                system="You are a connection test. Reply with the single word: ok",
+                max_tokens=16,
+                show_errors=False,
+            )
+
+        def done(fut):
+            try:
+                reply = fut.result()
+            except Exception as e:
+                log.error(f"wizard inline key test failed: {e}")
+                reply = None
+            try:
+                self._key_test_btn.setEnabled(True)
+            except RuntimeError:
+                return  # wizard closed / page rebuilt mid-test
+            if reply and reply.strip().lower().startswith("ok"):
+                self._key_test_lbl.setText("✓ Key works")
+                self._key_test_lbl.setStyleSheet("color: #1c8000; font-size: 12px;")
+            elif reply:
+                self._key_test_lbl.setText("✓ Connected — key is valid")
+                self._key_test_lbl.setStyleSheet("color: #1c8000; font-size: 12px;")
+            else:
+                self._key_test_lbl.setText(
+                    "✗ Failed — check the key and that it has quota (details in console)"
+                )
+                self._key_test_lbl.setStyleSheet("color: #c0392b; font-size: 12px;")
+
+        mw.taskman.run_in_background(work, done)
+
     def _detect_cli(self, *_args, silent: bool = False) -> None:
         path = core_api.detect_cli_path(
             self._wizard.cfg.get("claude_cli_path", "") or ""
@@ -733,6 +816,87 @@ class _PageDefaults(QWidget):
         return True
 
 
+class _PageQbanks(QWidget):
+    """Pick up to 3 favourite question banks. Seeds qbank.platforms so the
+    QBank tool's launcher buttons are ready on first use. Optional — 0 is fine."""
+
+    _MAX = 3
+
+    def __init__(self, wizard: SetupWizard, parent=None):
+        super().__init__(parent)
+        self._wizard = wizard
+        root = QVBoxLayout(self)
+        root.setContentsMargins(24, 20, 24, 16)
+        root.setSpacing(10)
+
+        root.addWidget(_h2("Your favourite question banks"))
+        root.addWidget(_muted(
+            "Pick up to <b>3</b> question banks you use most — QBank adds a quick-"
+            "launch button for each. This is optional; you can skip it and add, "
+            "remove, or rename banks (and their URLs) any time in "
+            "<b>Settings → QBank</b>."
+        ))
+        root.addWidget(_hsep())
+
+        # Which banks are already configured? Pre-check them so re-running the
+        # wizard doesn't silently drop a user's existing choices.
+        existing = (self._wizard.cfg.get("tools", {})
+                    .get("qbank", {}).get("platforms", []) or [])
+        existing_keys = {(p.get("key") or "").lower() for p in existing}
+        existing_urls = {(p.get("url") or "").rstrip("/") for p in existing}
+
+        self._boxes: list[tuple[QCheckBox, tuple[str, str, str]]] = []
+        for key, name, url in _POPULAR_QBANKS:
+            cb = QCheckBox(f"{name}")
+            cb.setToolTip(url)
+            if key in existing_keys or url.rstrip("/") in existing_urls:
+                cb.setChecked(True)
+            cb.toggled.connect(self._enforce_limit)
+            root.addWidget(cb)
+            self._boxes.append((cb, (key, name, url)))
+
+        self._count_lbl = QLabel("")
+        self._count_lbl.setStyleSheet("color: gray; font-size: 12px;")
+        root.addWidget(self._count_lbl)
+
+        root.addStretch(1)
+        self._refresh_count()
+
+    def _checked(self) -> list[tuple[str, str, str]]:
+        return [meta for cb, meta in self._boxes if cb.isChecked()]
+
+    def _enforce_limit(self, _checked: bool):
+        chosen = [cb for cb, _ in self._boxes if cb.isChecked()]
+        if len(chosen) > self._MAX:
+            # Uncheck the most recently toggled-on box (the sender) to hold the cap.
+            sender = self.sender()
+            if isinstance(sender, QCheckBox):
+                sender.blockSignals(True)
+                sender.setChecked(False)
+                sender.blockSignals(False)
+            self._count_lbl.setText(f"You can pick at most {self._MAX}.")
+            self._count_lbl.setStyleSheet("color: #b85c00; font-size: 12px;")
+            return
+        self._refresh_count()
+
+    def _refresh_count(self):
+        n = len(self._checked())
+        self._count_lbl.setStyleSheet("color: gray; font-size: 12px;")
+        self._count_lbl.setText(
+            "None selected — that's fine, add some later in Settings." if n == 0
+            else f"{n} selected (max {self._MAX})."
+        )
+
+    def selected_platforms(self) -> list[dict]:
+        return [{"key": k, "name": n, "url": u} for (k, n, u) in self._checked()]
+
+    def refresh(self):
+        self._refresh_count()
+
+    def validate(self) -> bool:
+        return True  # optional page — any number 0..MAX is valid
+
+
 class _PageTest(QWidget):
     """Page 4: test connection + generate one sample card."""
 
@@ -826,61 +990,95 @@ class _PageTest(QWidget):
         self._card_data = None
 
     def _run_test(self):
-        from ..core import qt_utils
-        reply = qt_utils.run_claude_text(
-            self._test_btn,
-            "Testing connection…",
-            prompt="Reply with the word ok and nothing else.",
-            system="You are a connection test. Reply with the single word: ok",
-            max_tokens=16,
-        )
-        if reply and reply.strip().lower().startswith("ok"):
-            self._test_lbl.setText("✓ Connection OK")
-            self._test_lbl.setStyleSheet("color: #1c8000; font-size: 12px;")
-            self._gen_btn.setEnabled(True)
-            self._connection_ok = True
-        elif reply:
-            self._test_lbl.setText(f"Unexpected reply: {reply.strip()[:60]}")
-            self._test_lbl.setStyleSheet("color: #b85c00; font-size: 12px;")
-        else:
-            self._test_lbl.setText("✗ No reply — check your settings")
-            self._test_lbl.setStyleSheet("color: #c0392b; font-size: 12px;")
+        # Run async via taskman — NOT qt_utils.run_claude_text, which spins a
+        # nested modal QProgressDialog/QEventLoop. Doing that inside this already
+        # modal wizard deadlocks Qt on macOS (froze Anki on a failed API call).
+        self._test_btn.setEnabled(False)
+        self._test_lbl.setStyleSheet("color: gray; font-size: 12px;")
+        self._test_lbl.setText("Testing connection…")
+
+        def work():
+            return core_api.ask_claude(
+                prompt="Reply with the word ok and nothing else.",
+                system="You are a connection test. Reply with the single word: ok",
+                max_tokens=16,
+                show_errors=False,
+            )
+
+        def done(fut):
+            try:
+                reply = fut.result()
+            except Exception as e:
+                log.error(f"wizard connection test failed: {e}")
+                reply = None
+            try:
+                self._test_btn.setEnabled(True)
+            except RuntimeError:
+                return  # wizard closed mid-test
+            if reply and reply.strip().lower().startswith("ok"):
+                self._test_lbl.setText("✓ Connection OK")
+                self._test_lbl.setStyleSheet("color: #1c8000; font-size: 12px;")
+                self._gen_btn.setEnabled(True)
+                self._connection_ok = True
+            elif reply:
+                self._test_lbl.setText(f"Unexpected reply: {reply.strip()[:60]}")
+                self._test_lbl.setStyleSheet("color: #b85c00; font-size: 12px;")
+            else:
+                self._test_lbl.setText(
+                    "✗ Failed — check the API key and that it has quota (details in console)"
+                )
+                self._test_lbl.setStyleSheet("color: #c0392b; font-size: 12px;")
+
+        mw.taskman.run_in_background(work, done)
 
     def _run_gen(self):
-        from ..core import qt_utils
+        # Async, for the same reason as _run_test — no nested modal loop.
+        self._gen_btn.setEnabled(False)
+        self._gen_lbl.setStyleSheet("color: gray;")
         self._gen_lbl.setText("Generating…")
         self._preview_box.setVisible(False)
         self._add_btn.setEnabled(False)
         self._added_lbl.setText("")
 
-        raw = qt_utils.run_claude_text(
-            self._gen_btn,
-            "Generating test card…",
-            prompt=_TEST_CARD_PROMPT,
-            system="You generate Anki cards. Follow the output format exactly.",
-            max_tokens=400,
-        )
-        if not raw:
-            self._gen_lbl.setText("Generation failed — check settings or try again.")
-            self._gen_lbl.setStyleSheet("color: #c0392b;")
-            return
-
-        card = self._parse_card(raw)
-        if not card:
-            self._gen_lbl.setText(
-                "Couldn't parse the response — model may have returned "
-                "unexpected text. Try again."
+        def work():
+            return core_api.ask_claude(
+                prompt=_TEST_CARD_PROMPT,
+                system="You generate Anki cards. Follow the output format exactly.",
+                max_tokens=400,
+                show_errors=False,
             )
-            self._gen_lbl.setStyleSheet("color: #b85c00;")
-            return
 
-        self._card_data = card
-        self._front_view.setPlainText(card.get("front", ""))
-        self._extra_view.setPlainText(card.get("extra", ""))
-        self._preview_box.setVisible(True)
-        self._add_btn.setEnabled(True)
-        self._gen_lbl.setText("✓ Card generated")
-        self._gen_lbl.setStyleSheet("color: #1c8000;")
+        def done(fut):
+            try:
+                raw = fut.result()
+            except Exception as e:
+                log.error(f"wizard test card generation failed: {e}")
+                raw = None
+            try:
+                self._gen_btn.setEnabled(True)
+            except RuntimeError:
+                return  # wizard closed mid-generate
+            if not raw:
+                self._gen_lbl.setText("Generation failed — check the key/quota (details in console).")
+                self._gen_lbl.setStyleSheet("color: #c0392b;")
+                return
+            card = self._parse_card(raw)
+            if not card:
+                self._gen_lbl.setText(
+                    "Couldn't parse the response — model may have returned "
+                    "unexpected text. Try again."
+                )
+                self._gen_lbl.setStyleSheet("color: #b85c00;")
+                return
+            self._card_data = card
+            self._front_view.setPlainText(card.get("front", ""))
+            self._extra_view.setPlainText(card.get("extra", ""))
+            self._preview_box.setVisible(True)
+            self._add_btn.setEnabled(True)
+            self._gen_lbl.setText("✓ Card generated")
+            self._gen_lbl.setStyleSheet("color: #1c8000;")
+
+        mw.taskman.run_in_background(work, done)
 
     @staticmethod
     def _parse_card(raw: str) -> dict | None:
@@ -998,11 +1196,13 @@ class SetupWizard(QDialog):
         self.page_model    = _PageModel(self)
         self.page_defaults = _PageDefaults(self)
         self.page_test     = _PageTest(self)
+        self.page_qbanks   = _PageQbanks(self)
         self._stack.addWidget(self.page_intro)    # _P_INTRO = 0
         self._stack.addWidget(self.page_creds)    # _P_CREDS = 1
         self._stack.addWidget(self.page_model)    # _P_MODEL = 2
         self._stack.addWidget(self.page_defaults) # _P_DEFAULTS = 3
         self._stack.addWidget(self.page_test)     # _P_TEST = 4
+        self._stack.addWidget(self.page_qbanks)   # _P_QBANKS = 5
         root.addWidget(self._stack, 1)
 
         root.addWidget(_hsep())
@@ -1038,8 +1238,12 @@ class SetupWizard(QDialog):
 
     def _page_flow_for(self, provider: str) -> list[int]:
         if provider == "manual":
-            return [_P_INTRO, _P_CREDS, _P_DEFAULTS, _P_TEST]
-        return [_P_INTRO, _P_CREDS, _P_MODEL, _P_DEFAULTS, _P_TEST]
+            # Copy-paste workflow has no programmatic AI to test, so the
+            # "Test connection" / generate-a-card page is meaningless here —
+            # end on QBanks instead. (Showing the test page just fired a doomed
+            # CLI call.)
+            return [_P_INTRO, _P_CREDS, _P_DEFAULTS, _P_QBANKS]
+        return [_P_INTRO, _P_CREDS, _P_MODEL, _P_DEFAULTS, _P_QBANKS, _P_TEST]
 
     def _enter_page(self, page_idx: int):
         self._stack.setCurrentIndex(page_idx)
@@ -1049,6 +1253,8 @@ class SetupWizard(QDialog):
             self.page_model.refresh()
         elif page_idx == _P_TEST:
             self.page_test.refresh()
+        elif page_idx == _P_QBANKS:
+            self.page_qbanks.refresh()
 
         pos = self._flow_pos + 1 if self._flow else 1
         total = len(self._flow) if self._flow else 5
@@ -1056,12 +1262,9 @@ class SetupWizard(QDialog):
 
         self._back_btn.setVisible(page_idx != _P_INTRO)
 
-        if page_idx == _P_TEST:
-            self._next_btn.setText("Finish")
-        elif page_idx == _P_DEFAULTS and _P_TEST not in self._flow:
-            self._next_btn.setText("Finish")
-        else:
-            self._next_btn.setText("Next →")
+        # "Finish" on the last page of whatever flow this provider has.
+        is_last = bool(self._flow) and self._flow_pos == len(self._flow) - 1
+        self._next_btn.setText("Finish" if is_last else "Next →")
 
         self._skip_btn.setVisible(page_idx == _P_INTRO)
 
@@ -1138,6 +1341,12 @@ class SetupWizard(QDialog):
             qb["card_deck"] = deck
         if notetype and not qb.get("card_notetype"):
             qb["card_notetype"] = notetype
+
+        # Favourite question banks picked on the QBanks page (0–3). Only write
+        # when that page is in the flow, so skipping the wizard or a flow that
+        # omits it never clobbers the user's existing platform list.
+        if _P_QBANKS in self._flow:
+            qb["platforms"] = self.page_qbanks.selected_platforms()
 
         save_config(self.cfg)
 

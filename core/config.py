@@ -5,7 +5,11 @@ from __future__ import annotations
 
 from aqt import mw
 
-ADDON = "ankisstant"
+# The add-on's package/folder name. When installed from AnkiWeb this is the
+# numeric ID (e.g. "351752439"); in dev it's "ankisstant". Derive it from the
+# module path so getConfig/writeConfig always target the real folder — never
+# hardcode it, or meta.json writes hit a folder that doesn't exist.
+ADDON = __name__.split(".")[0]
 
 # ── provider catalogue ─────────────────────────────────────────────────────────
 # Known models per provider family, surfaced in the model pickers. The combos
@@ -37,12 +41,20 @@ PROVIDER_OF: dict[str, str] = {
 }
 
 # Per-family defaults for "fast" (search/cheap) and "smart" (generation) roles.
-_FAST_MODELS:  dict[str, str] = {"anthropic": "claude-haiku-4-5-20251001", "gemini": "gemini-2.0-flash", "openai": "gpt-4o-mini", "ollama": "llama3.1"}
-_SMART_MODELS: dict[str, str] = {"anthropic": "claude-sonnet-4-6",          "gemini": "gemini-2.5-pro",   "openai": "gpt-4o",      "ollama": "llama3.1"}
+# gemini defaults to 2.5-flash for BOTH roles: on the free tier neither
+# gemini-2.0-flash nor gemini-2.5-pro has any quota (both return 429 limit:0),
+# so neither can be a safe default. 2.5-flash is the only free-tier-capable
+# Gemini model. Pro stays selectable in the picker for users on a paid plan.
+_FAST_MODELS:  dict[str, str] = {"anthropic": "claude-haiku-4-5-20251001", "gemini": "gemini-2.5-flash", "openai": "gpt-4o-mini", "ollama": "llama3.1"}
+_SMART_MODELS: dict[str, str] = {"anthropic": "claude-sonnet-4-6",          "gemini": "gemini-2.5-flash", "openai": "gpt-4o",      "ollama": "llama3.1"}
 
 DEFAULTS: dict = {
     "schema_version": 1,
     "migrated_v1": False,
+    # One-time heal of Gemini model IDs that have no free-tier quota (see
+    # _migrate_dead_gemini_models). Flips to True after the first rewrite so a
+    # paying user can re-select Pro afterwards and have it stick.
+    "gemini_freetier_migrated": False,
     "first_run_seen": False,
     "debug_logging": False,
     "anthropic_api_key": "",
@@ -248,6 +260,7 @@ def ensure_config() -> None:
     raw = mw.addonManager.getConfig(ADDON) or {}
     merged = _deep_merge(DEFAULTS, raw)
     _migrate_auto_tag_scheme(merged)
+    _migrate_dead_gemini_models(merged)
     if merged != raw:
         mw.addonManager.writeConfig(ADDON, merged)
 
@@ -258,6 +271,7 @@ def load_config() -> dict:
     _migrate_provider_schema(cfg)
     _migrate_creator_notetypes(cfg)
     _migrate_auto_tag_scheme(cfg)
+    _migrate_dead_gemini_models(cfg)
     return cfg
 
 
@@ -301,6 +315,56 @@ def _migrate_provider_schema(cfg: dict) -> None:
         t = tools.get(tool_key)
         if isinstance(t, dict):
             t["model"] = _as_model_dict(t.get("model"), _SMART_MODELS)
+
+
+def _migrate_dead_gemini_models(cfg: dict) -> bool:
+    """Rewrite stored Gemini model IDs that don't work on the free tier.
+
+    Updating the add-on can't fix this on its own: Anki keeps the model IDs a
+    profile already saved, so a profile first set up under old defaults still
+    has gemini-2.0-flash / gemini-2.5-pro stored and keeps hitting 429 limit:0.
+
+      • gemini-2.0-flash  → always rewritten (it lost its free tier entirely and
+        2.5-flash supersedes it; no reason to keep it as a stored default).
+      • gemini-2.5-pro    → rewritten ONCE, guarded by gemini_freetier_migrated,
+        so free-tier users stop crashing on quota while paid users can pick Pro
+        again later and keep it.
+
+    Returns True if anything (including the guard flag) changed."""
+    pro_done = bool(cfg.get("gemini_freetier_migrated"))
+    dead = {"gemini-2.0-flash": "gemini-2.5-flash"}
+    if not pro_done:
+        dead["gemini-2.5-pro"] = "gemini-2.5-flash"
+
+    changed = False
+
+    def fix(holder: dict, key: str) -> None:
+        nonlocal changed
+        val = holder.get(key)
+        if isinstance(val, dict):
+            for fam, mid in list(val.items()):
+                if mid in dead:
+                    val[fam] = dead[mid]
+                    changed = True
+        elif isinstance(val, str) and val in dead:
+            holder[key] = dead[val]
+            changed = True
+
+    fix(cfg, "model_defaults")
+    tools = cfg.get("tools", {})
+    qb = tools.get("qbank")
+    if isinstance(qb, dict):
+        fix(qb, "search_model")
+        fix(qb, "card_gen_model")
+    for tool_key in ("browse", "gap_analyser", "knowledge_gaps", "card_creator"):
+        t = tools.get(tool_key)
+        if isinstance(t, dict):
+            fix(t, "model")
+
+    if not pro_done:
+        cfg["gemini_freetier_migrated"] = True
+        changed = True
+    return changed
 
 
 def _migrate_creator_notetypes(cfg: dict) -> None:

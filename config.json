@@ -9,7 +9,7 @@
   "claude_cli_path": "",
   "claude_cli_extra_args": [],
   "provider": "auto",
-  "model_defaults": {"anthropic": "claude-haiku-4-5-20251001", "gemini": "gemini-2.0-flash", "openai": "gpt-4o-mini"},
+  "model_defaults": {"anthropic": "claude-haiku-4-5-20251001", "gemini": "gemini-2.5-flash", "openai": "gpt-4o-mini"},
   "window": {"width": 900, "height": 600, "x": null, "y": null},
   "tools": {
     "qbank": {
@@ -23,8 +23,8 @@
       "default_daily": 0,
       "target_periods": [],
       "exam_dates": [],
-      "search_model": {"anthropic": "claude-haiku-4-5-20251001", "gemini": "gemini-2.0-flash", "openai": "gpt-4o-mini"},
-      "card_gen_model": {"anthropic": "claude-sonnet-4-6", "gemini": "gemini-2.5-pro", "openai": "gpt-4o"},
+      "search_model": {"anthropic": "claude-haiku-4-5-20251001", "gemini": "gemini-2.5-flash", "openai": "gpt-4o-mini"},
+      "card_gen_model": {"anthropic": "claude-sonnet-4-6", "gemini": "gemini-2.5-flash", "openai": "gpt-4o"},
       "card_skill_id": "",
       "card_prompt": "",
       "card_notetype": "",
@@ -39,7 +39,7 @@
     },
     "browse": {
       "enabled": true,
-      "model": {"anthropic": "claude-sonnet-4-6", "gemini": "gemini-2.5-pro", "openai": "gpt-4o"},
+      "model": {"anthropic": "claude-sonnet-4-6", "gemini": "gemini-2.5-flash", "openai": "gpt-4o"},
       "last_used_tag": "",
       "max_results": 50,
       "notetype_filter": "",
@@ -50,7 +50,7 @@
     },
     "gap_analyser": {
       "enabled": true,
-      "model": {"anthropic": "claude-sonnet-4-6", "gemini": "gemini-2.5-pro", "openai": "gpt-4o"},
+      "model": {"anthropic": "claude-sonnet-4-6", "gemini": "gemini-2.5-flash", "openai": "gpt-4o"},
       "front_field": "Text",
       "notetype_filter": "",
       "last_used_tag": "",
@@ -59,7 +59,7 @@
     },
     "card_creator": {
       "enabled": true,
-      "model": {"anthropic": "claude-sonnet-4-6", "gemini": "gemini-2.5-pro", "openai": "gpt-4o"},
+      "model": {"anthropic": "claude-sonnet-4-6", "gemini": "gemini-2.5-flash", "openai": "gpt-4o"},
       "default_deck": "",
       "default_notetype": "",
       "default_tags": [],

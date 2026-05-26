@@ -464,6 +464,23 @@ def _http_post_json(url: str, headers: dict, body: dict, timeout: int,
             detail = e.read().decode("utf-8", errors="replace")
         except Exception:
             detail = ""
+        # A 429 with "limit: 0" / free-tier-token wording means the chosen model
+        # has *no* free-tier quota at all (e.g. Gemini 2.0 Flash, 2.5 Pro) — a
+        # raw dump of Google's JSON is useless to the user, so translate it into
+        # the one action that fixes it.
+        low = detail.lower()
+        if e.code == 429 and ("limit: 0" in low or "free_tier" in low or "free tier" in low):
+            raise ClaudeError(
+                f"{provider_label} rejected this model: your key's free tier has "
+                "no quota for it. Open Ankisstant Settings → AI and switch the "
+                "model to Gemini 2.5 Flash (the only free-tier Gemini model), or "
+                "add billing to your Google AI Studio account for Pro/2.0."
+            )
+        if e.code == 429:
+            raise ClaudeError(
+                f"{provider_label} rate limit hit (429). Wait a minute and retry, "
+                "or switch to a lighter model in Settings → AI. [{}]".format(detail[:200])
+            )
         raise ClaudeError(f"{provider_label} API {e.code}: {detail[:500]}")
     except urllib.error.URLError as e:
         raise ClaudeError(f"Network error: {e.reason}")
@@ -726,6 +743,23 @@ def ask_claude(
         _log.error(f"ask_claude failed: {e}")
         if show_errors:
             _surface_claude_error(str(e), use_cli=use_cli, use_api=any_provider_configured)
+        return None
+    except Exception as e:
+        # Catch-all safety net. ask_claude runs on a background thread; an
+        # exception type we didn't anticipate (JSON decode, attribute error,
+        # an SDK quirk on any provider) would otherwise surface uncaught in the
+        # taskman done-callback on the main thread and can hard-crash Anki on
+        # macOS. Degrade to a logged error + tooltip instead — same as a
+        # ClaudeError. This is provider-agnostic by design: it protects the
+        # Gemini path and every other path equally.
+        from . import log as _log
+        _log.error(f"ask_claude crashed unexpectedly: {e!r}")
+        if show_errors:
+            _surface_claude_error(
+                f"Unexpected error talking to the AI provider: {e}. "
+                "See the console for the full traceback.",
+                use_cli=use_cli, use_api=any_provider_configured,
+            )
         return None
     except Exception as e:
         from . import log as _log

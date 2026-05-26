@@ -675,23 +675,50 @@ class _AITab(QWidget):
         # Save the form values into a transient config snapshot for the test
         # call, without persisting them (Save isn't clicked yet).
         from ..core.config import load_config as _load
-        from ..core import qt_utils
+        from ..core import log
+        from aqt import mw
         snapshot = _load()
         snapshot.update(self.get_values())
         save_config(snapshot)
-        # Run on a background thread with a cancellable progress dialog so a
-        # slow or hung network request never freezes Anki's main thread.
-        reply = qt_utils.run_claude_text(
-            self._test_btn,
-            "Testing connection…",
-            prompt="Reply with the word ok and nothing else.",
-            system="You are a connection test. Reply with the single word: ok",
-            max_tokens=16,
-        )
-        if reply:
-            showInfo(f"Connection OK.\n\nReply: {reply!r}")
-        else:
-            showWarning("Test failed or cancelled — see Anki's console for the error.")
+
+        # IMPORTANT: this dialog is modal (open_settings uses dlg.exec()). A
+        # nested QProgressDialog + QEventLoop.exec() — what run_claude_text does
+        # — runs an event loop *inside* the modal loop, which deadlocks / hard-
+        # crashes Anki on macOS. So drive the test with taskman directly: the
+        # work() runs off-thread and done() runs back on the main thread, with
+        # no nested loop. Same pattern as the setup wizard's connection test.
+        self._test_btn.setEnabled(False)
+        self._test_btn.setText("Testing…")
+
+        def work():
+            return core_api.ask_claude(
+                prompt="Reply with the word ok and nothing else.",
+                system="You are a connection test. Reply with the single word: ok",
+                max_tokens=16,
+                show_errors=False,
+            )
+
+        def done(fut):
+            try:
+                reply = fut.result()
+            except Exception as e:
+                log.error(f"settings connection test crashed: {e!r}")
+                reply = None
+            try:
+                self._test_btn.setEnabled(True)
+                self._test_btn.setText("Test connection")
+            except RuntimeError:
+                return  # dialog closed mid-test
+            if reply:
+                showInfo(f"Connection OK.\n\nReply: {reply!r}")
+            else:
+                showWarning(
+                    "Test failed — see Anki's console for the error. If you're on "
+                    "Gemini's free tier, make sure the model is Gemini 2.5 Flash "
+                    "(2.0 Flash and 2.5 Pro have no free quota)."
+                )
+
+        mw.taskman.run_in_background(work, done)
 
     def get_values(self) -> dict:
         self._capture_key()

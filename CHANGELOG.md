@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.6.4
+
+### Fixed
+- **Gemini free-tier defaults, for real this time.** Both the "fast" and "smart"
+  Gemini defaults are now `gemini-2.5-flash` — the only model with free-tier
+  quota. (Card generation previously defaulted to `gemini-2.5-pro`, which
+  returns `429 limit: 0` on a free key — the "create over quota" crash.)
+- **One-time migration heals already-saved configs.** Updating the add-on can't
+  overwrite model IDs a profile already stored, so profiles set up under older
+  defaults kept hitting 429. On load, stored `gemini-2.0-flash` / `gemini-2.5-pro`
+  defaults are rewritten to `gemini-2.5-flash` (Pro once, guarded — paid users
+  can re-select it and keep it).
+- **Settings → Test connection no longer freezes/crashes Anki.** The Settings
+  dialog is modal; its test ran a nested event loop inside it, which deadlocks on
+  macOS. Now driven by `taskman` like the wizard test. This was provider-agnostic
+  — it could crash on any provider, not just Gemini.
+- Any unexpected error from an AI provider now degrades to a logged error +
+  tooltip instead of potentially hard-crashing Anki from a background thread.
+- Free-tier `429 limit: 0` errors now show an actionable message ("switch to
+  Gemini 2.5 Flash") instead of a raw JSON dump.
+
+### Added
+- **Favourite question banks** step in the setup wizard: pick up to 3 from a
+  curated list (UWorld, AMBOSS, Osmosis, eMedici, ClinicalKey, Passmedicine,
+  Quesmed, Lecturio, Geeky Medics) to seed QBank's quick-launch buttons. More
+  can be added/edited any time in Settings → QBank.
+
+### Changed
+- Model picker labels now state the free-tier reality (2.5 Flash = only free
+  Gemini; 2.5 Pro = paid only; 2.0 Flash = legacy/no longer free).
+- Docs note the confirmed-working providers: Gemini, Claude API, Claude CLI, and
+  no-AI paste import. OpenAI and Ollama are implemented but not yet confirmed.
+
 ## 1.6
 
 Documentation overhaul: all five providers now fully documented with per-path setup guides.
