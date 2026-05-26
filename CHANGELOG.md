@@ -56,7 +56,7 @@ UI polish and usability improvements.
 Housekeeping: author/repo identity updated.
 
 ### Changed
-- Author renamed from "Fletcher Bucat" to "Flegga" in `manifest.json`.
+- Author name updated to "Flegga" in `manifest.json`.
 - Homepage URL updated to `https://github.com/FleggaBDog69/Ankisstant`.
 - Stray name references in README and earlier changelog entries updated to "Flegga".
 
