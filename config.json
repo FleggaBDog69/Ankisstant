@@ -30,6 +30,7 @@
       "card_notetype": "",
       "card_deck": "",
       "missed_q_field": "Missed Questions",
+      "mq_explain": true,
       "tag_root": "Missed_Questions",
       "last_system": "",
       "last_subsystem": "",

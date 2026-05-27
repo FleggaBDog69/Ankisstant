@@ -509,6 +509,16 @@ def auto_tag_base() -> str:
         return ""
 
 
+def mq_explain_enabled() -> bool:
+    """Whether missed-question cards carry an AI-written knowledge-gap
+    explanation (leading the Missed Questions field, above the screenshot).
+    Lives under qbank config; defaults on. Shared by Create and Browse."""
+    try:
+        return bool(tool_config("qbank").get("mq_explain", True))
+    except Exception:
+        return True
+
+
 def kg_type_info(type_key: str) -> tuple[str, bool]:
     """Return (display_name, auto_tag_enabled) for a KG type key.
     Falls back to ('', False) when the type is unknown."""

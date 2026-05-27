@@ -27,7 +27,7 @@ from aqt.utils import askUser, showWarning, tooltip
 from ..core import anki_utils, api as core_api, log
 from ..core.config import (
     active_family, auto_tag_base, format_hierarchical_tag, load_config, month_tag,
-    tool_config, tool_model, save_tool_config,
+    mq_explain_enabled, tool_config, tool_model, save_tool_config,
 )
 from ..core.qt_utils import (
     attach_tag_completer, is_manual_provider, loading, make_help_button,
@@ -54,7 +54,10 @@ CARD RULES (derived from Wozniak's 20 Rules / Med School Insiders best practices
 - Use standard Anki cloze syntax: {{c1::answer}}, {{c2::answer}}.
   - Prefer SHORT cloze answers (1–4 words). Long clozed phrases are hard to grade honestly.
   - Multiple clozes per card are fine ONLY if they test tightly-coupled facts (e.g. drug + class + mechanism). Otherwise split into separate cards.
-  - Use {{c1::}}, {{c2::}}, … to make sibling cards; use the SAME number (e.g. {{c1::A}} … {{c1::B}}) only when you want them revealed together as one card.
+- CLOZE NUMBERING — read carefully, this is commonly done wrong:
+  - When ONE card front has several deletions that should be tested SEPARATELY (each hidden on its own sibling card), you MUST number them sequentially: {{c1::…}}, {{c2::…}}, {{c3::…}}. Do NOT label them all {{c1::…}}.
+  - Give two deletions the SAME number (e.g. {{c1::A}} … {{c1::B}}) ONLY when they are meant to be revealed together as a single card.
+  - Reusing {{c1::…}} for every deletion on a card — when they're actually separate facts — is WRONG: it collapses everything into one card. If in doubt, number them c1, c2, c3, ….
 - AVOID ENUMERATIONS / SETS: never make a single card with "list the 5 causes of X". Either pick the 1–2 highest-yield items per card, or use overlapping/sequential clozes.
 - LEVEL: Year 3 Australian medical student. Australian drug names and guidelines (e.g. eTG, RACGP) preferred when relevant.
 - FORMATTING: <b> for high-yield terms, <u> for underline. No other HTML.
@@ -215,26 +218,9 @@ def _apply_tag_levels(gap: dict, type_meta: dict, levels: dict) -> str:
     return tag
 
 
-# Appended to the card-gen system prompt to fold tag classification into the
-# SAME request (one round-trip — important in manual mode, where each call is a
-# copy/paste dialog). The reply becomes an object instead of a bare array.
-MERGED_TAG_INSTRUCTIONS = (
-    "\n\nTAG CLASSIFICATION (REQUIRED)\n"
-    "In addition to the cards, classify this material into a hierarchical tag. "
-    "Return your ENTIRE answer as a JSON OBJECT (not a bare array):\n"
-    '  {"tags": {"system": "...", "subsystem": "...", "topic": "..."}, '
-    '"cards": [ ...the card objects exactly as specified above... ]}\n'
-    "Tag rules:\n"
-    "- system: top-level body system/domain — Cardio, Neuro, Endo, GI, Resp, "
-    "Renal, Heme, MSK, Derm, Repro, Psych, ID, Onc, Pharm, Stats, Genetics, "
-    "Biochem, Immuno. Single best fit.\n"
-    "- subsystem: more specific category within the system (e.g. Arrhythmias, "
-    "Stroke, Diabetes).\n"
-    "- topic: most specific entity/drug/sign/mechanism (e.g. AFib, Digoxin).\n"
-    "- PascalCase or snake_case; no spaces, '::', or slashes. Use an empty "
-    "string for any level that's genuinely unclear.\n"
-    'The "cards" array uses EXACTLY the card object shape described above.'
-)
+# Tag classification and the MQ explanation are folded into the card-gen request
+# via _merged_gen_instructions() (built below), so they come back in the same
+# round-trip — important in manual/BYO mode where each call is a copy/paste.
 
 
 def _generate_auto_tag_for_gap(gap: dict, type_meta: dict, model: str | None = None) -> str:
@@ -276,6 +262,133 @@ def _generate_auto_tag_for_gap(gap: dict, type_meta: dict, model: str | None = N
     if not isinstance(resp, dict):
         return ""
     return _apply_tag_levels(gap, type_meta, resp)
+
+
+# ── MQ knowledge-gap explanation ───────────────────────────────────────────────
+#
+# Missed-question (MQ) cards lead their Missed Questions field with the specific
+# concept missed ("Knowledge gap: …") and a brief AI-written explanation of it,
+# above the captured screenshot. The explanation is requested in the SAME AI
+# round-trip as the cards (folded into an object reply — see
+# _merged_gen_instructions), so connected-AI and BYO/manual users both get it
+# without an extra call. It's then cached on the gap + persisted to the KG store
+# so it's never regenerated. Gated by the qbank `mq_explain` setting.
+
+def _wants_mq_explanation(gap: dict | None) -> bool:
+    """True when this gap is an MQ gap with a concept to explain and no
+    explanation cached yet, and the feature is enabled."""
+    if not mq_explain_enabled() or not isinstance(gap, dict):
+        return False
+    if (gap.get("kg_type") or "").lower() != "mq":
+        return False
+    if (gap.get("explanation") or "").strip():
+        return False
+    return bool((gap.get("concept") or gap.get("title") or "").strip())
+
+
+# Shared wording for what the explanation should be — reused by the merged
+# instructions and the separate-call fallback so both ask for the same thing.
+_MQ_EXPLANATION_GUIDANCE = (
+    "a brief teaching explanation (1-3 plain sentences) of the specific concept "
+    "the student missed — explain the underlying mechanism or principle (the "
+    "WHY/HOW), not just a restatement; be factually careful and don't invent "
+    "specifics; pitch it at a Year 3 Australian medical student; plain prose, no "
+    "markdown"
+)
+
+
+def _merged_gen_instructions(*, want_tag: bool, want_explanation: bool) -> str:
+    """Build the 'return an OBJECT' instruction block folded into the card-gen
+    request, so tag classification and/or the MQ explanation come back in the
+    SAME round-trip (critical in manual/BYO mode). Returns '' when neither extra
+    is wanted — the reply then stays a bare card array as before."""
+    if not want_tag and not want_explanation:
+        return ""
+    keys: list[str] = []
+    if want_tag:
+        keys.append('"tags": {"system": "...", "subsystem": "...", "topic": "..."}')
+    if want_explanation:
+        keys.append('"mq_explanation": "..."')
+    keys.append('"cards": [ ...the card objects exactly as specified above... ]')
+    out = [
+        "\n\nIN ADDITION to the cards, return your ENTIRE answer as a single JSON "
+        "OBJECT (not a bare array) with these keys:",
+        "  {" + ", ".join(keys) + "}",
+    ]
+    if want_tag:
+        out.append(
+            "Tag rules:\n"
+            "- system: top-level body system/domain — Cardio, Neuro, Endo, GI, "
+            "Resp, Renal, Heme, MSK, Derm, Repro, Psych, ID, Onc, Pharm, Stats, "
+            "Genetics, Biochem, Immuno. Single best fit.\n"
+            "- subsystem: more specific category within the system (e.g. "
+            "Arrhythmias, Stroke, Diabetes).\n"
+            "- topic: most specific entity/drug/sign/mechanism (e.g. AFib, Digoxin).\n"
+            "- PascalCase or snake_case; no spaces, '::', or slashes. Use an empty "
+            "string for any level that's genuinely unclear."
+        )
+    if want_explanation:
+        out.append('The "mq_explanation" value is ' + _MQ_EXPLANATION_GUIDANCE + ".")
+    out.append('The "cards" array uses EXACTLY the card object shape described above.')
+    return "\n".join(out)
+
+
+def _persist_mq_explanation(gap: dict, text: str) -> str:
+    """Cache an MQ explanation on the gap dict and write it back to the KG
+    store so it survives and is reused. Returns the stored text."""
+    text = (text or "").strip()
+    if not isinstance(gap, dict) or not text:
+        return ""
+    gap["explanation"] = text
+    kg_id = gap.get("kg_id")
+    if kg_id:
+        try:
+            from .kg import store as kg_store
+            existing = kg_store.get(kg_id)
+            if existing:
+                fields = dict(existing.get("fields") or {})
+                fields["explanation"] = text
+                kg_store.update(kg_id, fields=fields)
+        except Exception as e:
+            print(f"[ankisstant] mq explanation persist failed: {e}")
+    return text
+
+
+MQ_EXPLANATION_SYSTEM = (
+    "You write " + _MQ_EXPLANATION_GUIDANCE + ".\n\n"
+    "Given the concept the student missed (and optional context from the question "
+    "they got wrong), return ONLY the explanation text — no preamble, headings, or "
+    "markdown."
+)
+
+
+def _generate_mq_explanation_for_gap(gap: dict, model: str | None = None) -> str:
+    """Separate-call fallback for the MQ explanation — used only when it can't
+    be folded into the card-gen request (skill flows produce a bare array, so
+    the object trick doesn't apply). Returns '' on failure; result is cached +
+    persisted via _persist_mq_explanation."""
+    if not _wants_mq_explanation(gap):
+        return (gap.get("explanation") or "").strip() if isinstance(gap, dict) else ""
+    concept = (gap.get("concept") or gap.get("title") or "").strip()
+    context_bits = [f"Concept missed: {concept}"]
+    stem = (gap.get("stem_html") or "").strip()
+    if stem:
+        plain = re.sub(r"<[^>]+>", " ", stem)
+        plain = re.sub(r"\s+", " ", plain).strip()
+        if plain:
+            context_bits.append(f"Question they got wrong: {plain[:600]}")
+    notes = (gap.get("notes") or "").strip()
+    if notes:
+        context_bits.append(f"Their notes: {notes[:300]}")
+    try:
+        text = core_api.ask_claude(
+            prompt="\n".join(context_bits), system=MQ_EXPLANATION_SYSTEM,
+            max_tokens=400, model=model, show_errors=False,
+        )
+    except Exception as e:
+        print(f"[ankisstant] mq explanation call failed: {e}")
+        return ""
+    return _persist_mq_explanation(gap, text or "")
 
 
 # ── small helpers ────────────────────────────────────────────────────────────
@@ -369,8 +482,37 @@ def _img_tags_for(paths: list[str]) -> str:
     return "<br>".join(bits)
 
 
+def _focus_directive(focus: str) -> str:
+    """Wrap the user's free-text Focus into a hard, high-priority instruction.
+
+    A bare "Focus: …" line gets treated as a soft hint and is easily ignored
+    (e.g. the model won't cloze the *name of a test* when asked). Phrasing it
+    as an overriding requirement makes the model actually follow it."""
+    return (
+        "FOCUS — these instructions are MANDATORY and override the default card "
+        "selection. Follow them exactly, even if it means clozing things you "
+        "would normally leave unclozed (e.g. the name of a test/sign/criterion):\n"
+        f"{focus}"
+    )
+
+
 def _fetch_url(url: str) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 Ankisstant"})
+    # Many sites (e.g. austroads.gov.au) reject requests whose User-Agent
+    # doesn't look like a real browser, returning HTTP 403. Send a full
+    # browser-like header set so we read like Safari/Chrome rather than a bot.
+    req = urllib.request.Request(url, headers={
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+            "Version/17.0 Safari/605.1.15"
+        ),
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/avif,image/webp,*/*;q=0.8"
+        ),
+        "Accept-Language": "en-AU,en;q=0.9",
+        "Accept-Encoding": "identity",
+    })
     with urllib.request.urlopen(req, timeout=30) as resp:
         raw = resp.read().decode("utf-8", errors="replace")
     text = re.sub(r"<script[\s\S]*?</script>", " ", raw, flags=re.I)
@@ -1036,6 +1178,17 @@ class CreatorPanel(QWidget):
                 if notes:
                     focus_bits.append("Notes: " + notes[:300])
             self.focus.setText(" — ".join(focus_bits))
+            # Carry the KG's own tags into the tag field (on top of the user's
+            # standing default tags) so curated tags aren't lost. The auto-tag,
+            # if any, is appended later at create time — it doesn't replace these.
+            default_tags = list(self.cfg.get("default_tags", []))
+            gap_tags = list(gap.get("tags") or []) if isinstance(gap, dict) else []
+            merged_tags: list[str] = []
+            for t in default_tags + gap_tags:
+                t = (t or "").strip()
+                if t and t not in merged_tags:
+                    merged_tags.append(t)
+            self.tags.setText(", ".join(merged_tags))
             self.n_cards.setValue(int(self.cfg.get("gap_n_cards", 3)))
             self._update_autotag_hint(gap)
         except Exception as e:
@@ -1170,6 +1323,10 @@ class CreatorPanel(QWidget):
             return
         skipped = queue.pop(0)
         self._current_gap = None
+        # Skipping is an explicit "advance to the next gap" — clear the form so
+        # the new top gap pre-fills cleanly (and its Focus replaces the old one).
+        self.topic.setText("")
+        self.focus.setText("")
         if hasattr(self._main_window, "refresh_queue_badge"):
             self._main_window.refresh_queue_badge()
         self.refresh_queue_state(self._main_window)
@@ -1284,7 +1441,17 @@ class CreatorPanel(QWidget):
                     except (urllib.error.URLError, urllib.error.HTTPError) as e:
                         fetch_err = e
                 if fetch_err is not None:
-                    showWarning(f"Could not fetch URL: {fetch_err}")
+                    code = getattr(fetch_err, "code", None)
+                    if code in (401, 403):
+                        showWarning(
+                            f"That site blocked the request (HTTP {code}).\n\n"
+                            "Some sites (paywalled or bot-protected, e.g. parts of "
+                            "austroads.gov.au) won't let the add-on fetch the page "
+                            "directly. Open the page in your browser, copy the "
+                            "relevant text, and paste it into the box below instead."
+                        )
+                    else:
+                        showWarning(f"Could not fetch URL: {fetch_err}")
                     return
                 text_body = (text_body + "\n\n" + fetched).strip() if text_body else fetched
 
@@ -1336,7 +1503,7 @@ class CreatorPanel(QWidget):
 
             parts = [f"Generate {n} high-yield cloze cards from the SOURCE below."]
             if focus:
-                parts.append(f"Focus: {focus}")
+                parts.append(_focus_directive(focus))
             if attachments_for_api:
                 parts.append(
                     "PDF attachment(s) provided — use them as the primary source."
@@ -1353,7 +1520,7 @@ class CreatorPanel(QWidget):
             source_label = None
             user_msg = (
                 f"Generate {n} high-yield cloze cards on the TOPIC: {topic_label}\n"
-                + (f"Focus: {focus}\n" if focus else "")
+                + (_focus_directive(focus) + "\n" if focus else "")
             )
 
         model = tool_model(self.cfg, "model", active_family())
@@ -1370,14 +1537,26 @@ class CreatorPanel(QWidget):
         # the SAME request (one object reply) — critical in manual mode, where
         # each call is its own copy/paste dialog. Skill flows keep the separate
         # call so the skill's tuned array output isn't disturbed.
+        # Auto-tag and the MQ knowledge-gap explanation are both normally a
+        # separate AI call, but with no skill in play we fold them into the SAME
+        # request (one object reply) — critical in manual/BYO mode, where each
+        # call is its own copy/paste dialog. Skill flows keep the separate call
+        # so the skill's tuned array output isn't disturbed.
         gap = self._current_gap if isinstance(self._current_gap, dict) else None
         type_meta = _kg_type_meta((gap.get("kg_type") or "").lower()) if gap else None
         cached_tag = (gap.get("auto_tag") or "").strip() if gap else ""
         want_tag = bool(gap and type_meta and type_meta.get("auto_tag")
                         and auto_tag_base())
-        merge_tag = want_tag and not cached_tag and not skill_id and not skill_invocation
+        no_skill = not skill_id and not skill_invocation
+        merge_tag = want_tag and not cached_tag and no_skill
+        want_explanation = _wants_mq_explanation(gap)
+        merge_explanation = want_explanation and no_skill
+        merged = _merged_gen_instructions(
+            want_tag=merge_tag, want_explanation=merge_explanation,
+        )
+        if merged:
+            system_prompt += merged
         if merge_tag:
-            system_prompt += MERGED_TAG_INSTRUCTIONS
             ctx = []
             if (gap.get("title") or "").strip():
                 ctx.append(f"Title: {gap['title'].strip()}")
@@ -1389,6 +1568,13 @@ class CreatorPanel(QWidget):
                 ctx.append(f"Notes: {gap['notes'].strip()[:300]}")
             if ctx:
                 user_msg += "\n\nCLASSIFY THIS MATERIAL for the tag:\n" + "\n".join(ctx)
+        if merge_explanation:
+            concept = (gap.get("concept") or gap.get("title") or "").strip()
+            if concept:
+                user_msg += (
+                    "\n\nThe student's specific knowledge gap (explain this in "
+                    f'"mq_explanation"): {concept}'
+                )
 
         reply = run_claude_json(
             self.go_btn, loading_label,
@@ -1397,16 +1583,30 @@ class CreatorPanel(QWidget):
             attachments=attachments_for_api or None,
         )
 
-        # Merged replies are {"tags": {...}, "cards": [...]}; otherwise a bare
-        # array. Pull the tag levels out before validating the card list.
+        # Merged replies are an object {"tags": …, "mq_explanation": …,
+        # "cards": […]}; otherwise a bare array. Pull the extras out before
+        # validating the card list.
         merged_tag_levels = None
         cards = reply
-        if merge_tag and isinstance(reply, dict):
-            merged_tag_levels = reply.get("tags")
+        if (merge_tag or merge_explanation) and isinstance(reply, dict):
             cards = reply.get("cards")
+            if merge_tag:
+                merged_tag_levels = reply.get("tags")
+            if merge_explanation:
+                _persist_mq_explanation(gap, str(reply.get("mq_explanation") or ""))
 
         if reply is None:
             return  # cancelled, or a parse failure already surfaced
+
+        # Skill flows can't fold the explanation in (array output), so fall back
+        # to a separate call there. Only the AI Generate flow does this — the
+        # BYO Paste flow never calls out.
+        if want_explanation and not merge_explanation and not (gap and gap.get("explanation")):
+            try:
+                with loading(self.go_btn, "Explaining the knowledge gap…"):
+                    _generate_mq_explanation_for_gap(gap, model=model)
+            except Exception as e:
+                print(f"[ankisstant] mq explanation fallback skipped: {e}")
 
         self.cfg["default_n_cards"] = n
         self._finalize_review(
@@ -1449,12 +1649,15 @@ class CreatorPanel(QWidget):
             return  # cancelled or unparseable (a message was already shown)
 
         # Accept a bare [...] array, a {"cards": [...]} / {"tags":…, "cards":…}
-        # object, or even a single {"front","extra"} object.
+        # object, or even a single {"front","extra"} object. An "mq_explanation"
+        # key (present when the user ran our merged prompt) is honoured too.
         merged_tag_levels = None
+        mq_explanation = ""
         cards = parsed
         if isinstance(parsed, dict):
             if isinstance(parsed.get("tags"), dict):
                 merged_tag_levels = parsed["tags"]
+            mq_explanation = str(parsed.get("mq_explanation") or "").strip()
             cards = parsed.get("cards")
             if cards is None and "front" in parsed:
                 cards = [parsed]
@@ -1462,6 +1665,10 @@ class CreatorPanel(QWidget):
         gap = self._current_gap if isinstance(self._current_gap, dict) else None
         type_meta = _kg_type_meta((gap.get("kg_type") or "").lower()) if gap else None
         cached_tag = (gap.get("auto_tag") or "").strip() if gap else ""
+        # Persist any pasted explanation onto the gap. No model is ever called
+        # here — BYO users supply it via the prompt they ran externally.
+        if mq_explanation and _wants_mq_explanation(gap):
+            _persist_mq_explanation(gap, mq_explanation)
 
         # want_tag=False: in paste mode we never fall back to an AI auto-tag
         # call (that would defeat the point). Pasted tag levels still apply.
@@ -1498,6 +1705,8 @@ class CreatorPanel(QWidget):
         kg_type_for_image = ""
         kg_stem_html = ""
         kg_notes = ""
+        kg_concept = ""
+        kg_explanation = ""
         if gap is not None:
             kg_image_filenames = list(gap.get("images") or [])
             kg_type_for_image = (gap.get("kg_type") or "").lower()
@@ -1506,6 +1715,14 @@ class CreatorPanel(QWidget):
             # source of confusion, not just the image.
             kg_stem_html = str(gap.get("stem_html") or "")
             kg_notes = str(gap.get("notes") or "")
+            # MQ-type gaps lead the Missed Questions field with the specific
+            # concept missed (the knowledge gap) plus an AI-written explanation,
+            # above the screenshot. Both were resolved by the caller (folded
+            # into the generation request, or pulled from a pasted reply) and
+            # cached on the gap / persisted to the KG store.
+            if kg_type_for_image == "mq":
+                kg_concept = str(gap.get("concept") or "").strip()
+                kg_explanation = str(gap.get("explanation") or "").strip()
             # Resolve the auto-tag: cached → merged-from-this-reply → separate
             # call (skill flows). Append it to every card from this gap.
             auto_tag = cached_tag
@@ -1544,6 +1761,8 @@ class CreatorPanel(QWidget):
             kg_type_for_image=kg_type_for_image,
             kg_stem_html=kg_stem_html,
             kg_notes=kg_notes,
+            kg_concept=kg_concept,
+            kg_explanation=kg_explanation,
             parent=self,
         )
         result = dlg.exec()
@@ -1575,6 +1794,12 @@ class CreatorPanel(QWidget):
             except Exception as e:
                 print(f"[ankisstant] mark KG done failed: {e}")
             self._current_gap = None
+            # Clear the form so the next queued gap pre-fills cleanly. Without
+            # this, the just-finished gap's topic/focus linger and the dirty-form
+            # guard in refresh_queue_state blocks the next gap from auto-loading
+            # (leaving a stale Focus from the previous KG).
+            self.topic.setText("")
+            self.focus.setText("")
             if hasattr(self._main_window, "refresh_queue_badge"):
                 self._main_window.refresh_queue_badge()
             self.refresh_queue_state(self._main_window)
@@ -1745,6 +1970,7 @@ class ReviewDialog(QDialog):
                  deck_name, tags, profile=None, panel_image_paths=None,
                  kg_image_filenames=None, kg_type_for_image="",
                  kg_stem_html="", kg_notes="",
+                 kg_concept="", kg_explanation="",
                  parent=None):
         super().__init__(parent)
         self.cfg = tool_config("card_creator")
@@ -1774,6 +2000,11 @@ class ReviewDialog(QDialog):
         # carries the original missed question for reference.
         self.kg_stem_html: str = str(kg_stem_html or "")
         self.kg_notes: str = str(kg_notes or "")
+        # MQ-type KGs: the specific concept missed (the knowledge gap) and an
+        # optional AI-written explanation of it. Both are rendered above the
+        # screenshot in the Missed Questions field (see _kg_content_html).
+        self.kg_concept: str = str(kg_concept or "").strip()
+        self.kg_explanation: str = str(kg_explanation or "").strip()
         self.rows: list[_CardRow] = []
         self.setWindowTitle("Review proposed cards")
         self.setMinimumSize(800, 700)
@@ -1998,13 +2229,23 @@ class ReviewDialog(QDialog):
         return "<br>".join(bits)
 
     def _kg_content_html(self) -> str:
-        """Full HTML to append to the KG target field — for MQ-type KGs
-        this includes the captured question stem and any freeform notes
-        above the screenshot(s). For non-MQ KGs it's just the images.
+        """Full HTML to append to the KG target field — for MQ-type KGs this
+        leads with the specific knowledge gap (concept) and an AI-written
+        explanation of it, then the captured question stem and any freeform
+        notes above the screenshot(s). For non-MQ KGs it's just the images.
 
         Returns "" if there's nothing to append."""
         parts: list[str] = []
         if self.kg_type_for_image == "mq":
+            if self.kg_concept:
+                parts.append(
+                    f"<b>Knowledge gap:</b> {html.escape(self.kg_concept)}"
+                )
+            if self.kg_explanation:
+                parts.append(
+                    "<i>" + html.escape(self.kg_explanation).replace("\n", "<br>")
+                    + "</i>"
+                )
             if self.kg_stem_html.strip():
                 parts.append(self.kg_stem_html.strip())
             if self.kg_notes.strip():

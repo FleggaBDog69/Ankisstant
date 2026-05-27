@@ -1,5 +1,66 @@
 # Changelog
 
+## 1.7.0
+
+### Added
+- **Favourite tags for tag-search (Browse → Tags mode).** Tag searches could
+  surface a flood of matching tags. A new **★ Favourite tags…** button opens a
+  picker over your whole tag tree — tick the resource/branch tags you study from
+  at any hierarchy level (e.g. `Anking_S1_V12::Boards_&_Beyond`, or a parent/
+  child), **type one in by name** (for top-level tags that don't surface in the
+  list), and **order them by priority** with Move up/down / Remove. Results are
+  grouped by that order (e.g. Pathoma → B&B → First Aid), each matching tag is
+  labelled with the favourite it sits under, and **★ only** hides everything
+  that isn't on one of your favourites. Favourites + their order are saved.
+  - **Result rows** lead with the favourite chip (`★ #Pathoma`), then — when the
+    tag is step-tagged — a **Step 1/2/3** chip derived from the tag itself, then
+    the tag path and note count. The path starts at the matched segment and shows
+    only what sits **at or below** it; everything above (version tag, resource,
+    intermediate categories) is dropped. The meaningless per-row AI
+    study-reference label is gone. A keyword matches any hierarchy *segment*, and
+    tags below the matched level are shown as their own rows (so sub-tags are
+    visible).
+  - **Favourite matching is by hierarchy, not shared cards.** A tag is only
+    labelled `★ #Pathoma` if `#Pathoma` actually appears in its tag path — fixes
+    Boards & Beyond (and other) tags being wrongly flagged as Pathoma just
+    because their cards overlapped. Favourites can be a full path or a single
+    level.
+  - The tag-search AI prompt is **tighter**: it now sticks to the topic and its
+    closely-related disease entities (e.g. MS → multiple sclerosis, optic
+    neuritis) instead of branching into every associated sign/finding
+    (oligoclonal bands, Uhthoff, MRI…).
+- **Missed-question cards now lead with the knowledge gap + an explanation.**
+  When you make a card from a captured missed question — via **Create** *or*
+  **Browse** — the Missed Questions field now opens with the specific concept
+  missed (`Knowledge gap: …`) followed by a brief AI-written explanation of it,
+  above the question screenshot.
+  - The explanation is requested **in the same AI round-trip** as the cards /
+    search terms (folded into the reply object), so it costs no extra call.
+    Bring-your-own-AI users get it too: the manual "copy prompt" dialog includes
+    it, and the standalone prompt now documents an `mq_explanation` key the
+    Paste-cards flow reads.
+  - Generated once, then cached on the gap and persisted to the KG store, so
+    re-running or reusing the gap never re-calls the model.
+  - Toggle under **Settings → AI QBank** ("Add an AI-written explanation…");
+    on by default.
+
+### Fixed
+- **URL fetch failed with HTTP 403 on some sites** (e.g. austroads.gov.au).
+  Create now sends full browser-like request headers, and when a site still
+  blocks it (401/403), the warning tells you to paste the page text instead.
+- **The "Focus" instruction was treated as a soft hint and often ignored**
+  (e.g. asking it to *cloze the name of a test* did nothing). Focus is now sent
+  as a mandatory, overriding instruction.
+- **Gemini collapsed every cloze on a card to `c1`.** The cloze-numbering rules
+  now spell out that separate sibling deletions must be numbered `c1, c2, c3…`
+  and that reusing `c1` is only for facts revealed together.
+- **KG tags didn't carry into Create.** Tags on a knowledge gap now pre-fill the
+  Create tag field (alongside your default tags); the auto-tag is appended, not
+  used as a replacement, so curated tags are no longer lost.
+- **The Focus field kept stale text when moving to the next queued gap.**
+  Finishing or skipping a gap now clears the form so the next gap loads cleanly
+  and Focus is wiped when the new gap has nothing to seed it.
+
 ## 1.6.5
 
 ### Fixed

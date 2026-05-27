@@ -877,6 +877,18 @@ class _QBankTab(QWidget):
         self._field.setMinimumWidth(360)
         cf.addRow("Append-to field:", self._field)
 
+        self._mq_explain = QCheckBox(
+            "Add an AI-written explanation of the knowledge gap above the question"
+        )
+        self._mq_explain.setChecked(bool(qb_cfg.get("mq_explain", True)))
+        self._mq_explain.setToolTip(
+            "When making a card (or tagging via Browse) from a captured missed "
+            "question, lead the append-to field with the specific concept missed "
+            "and a short explanation of it. Generated in the same AI request, so "
+            "it costs no extra round-trip."
+        )
+        cf.addRow("", self._mq_explain)
+
         self._tag_root = QLineEdit(qb_cfg.get("tag_root", "Missed_Questions"))
         self._tag_root.setMinimumWidth(360)
         cf.addRow("Tag root:", self._tag_root)
@@ -1064,6 +1076,7 @@ class _QBankTab(QWidget):
             "card_deck":      self._deck.text().strip(),
             "card_skill_id":  self._skill.text().strip(),
             "missed_q_field": self._field.text().strip()         or "Missed Questions",
+            "mq_explain":     self._mq_explain.isChecked(),
             "tag_root":       self._tag_root.text().strip()      or "Missed_Questions",
             "image_max_width": int(self._image_max_width.value()),
             "capture_zoom_factor": round(int(self._capture_zoom.value()) / 100.0, 3),

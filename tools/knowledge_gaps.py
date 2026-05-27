@@ -1132,20 +1132,27 @@ class KGDetailPane(QWidget):
             showWarning("Open the KG page from Tools → Ankisstant first.")
             return
         # Pull supplemental context out of the type-specific fields blob.
+        # `concept` is carried separately (it leads the Missed Questions field
+        # as the knowledge-gap line) so it isn't duplicated inside `notes`.
         stem_html = kg_store.field(kg, "stem_html")
         notes_bits = []
-        for k in ("notes", "concept", "lo"):
+        for k in ("notes", "lo"):
             v = kg_store.field(kg, k)
             if v:
                 notes_bits.append(v)
         images = (kg.get("fields") or {}).get("images") or []
         item = {
-            "title":     kg.get("title", ""),
-            "kg_id":     kg.get("id", ""),
-            "stem_html": stem_html or None,
-            "notes":     "\n\n".join(notes_bits) or None,
-            "images":    list(images),
-            "kg_type":   (kg.get("type") or "").lower(),
+            "title":       kg.get("title", ""),
+            "kg_id":       kg.get("id", ""),
+            "stem_html":   stem_html or None,
+            "notes":       "\n\n".join(notes_bits) or None,
+            "concept":     kg_store.field(kg, "concept") or "",
+            "explanation": kg_store.field(kg, "explanation") or "",
+            "images":      list(images),
+            "kg_type":     (kg.get("type") or "").lower(),
+            # User-curated tags on the KG flow through to the Create form's tag
+            # field (in addition to any auto-tag), instead of being dropped.
+            "tags":        [t for t in (kg.get("tags") or []) if t],
         }
         main.gap_queue.append(item)
         if hasattr(main, "refresh_queue_badge"):
@@ -1787,16 +1794,21 @@ class KnowledgeGapsPanel(QWidget):
             if not kg:
                 continue
             stem_html = kg_store.field(kg, "stem_html")
-            notes_bits = [kg_store.field(kg, k) for k in ("notes", "concept", "lo")]
+            # concept rides separately (leads the Missed Questions field), so
+            # keep it out of notes to avoid duplicating it on the card.
+            notes_bits = [kg_store.field(kg, k) for k in ("notes", "lo")]
             notes_bits = [b for b in notes_bits if b]
             images = (kg.get("fields") or {}).get("images") or []
             main.gap_queue.append({
-                "title":     kg.get("title", ""),
-                "kg_id":     kg.get("id", ""),
-                "stem_html": stem_html or None,
-                "notes":     "\n\n".join(notes_bits) or None,
-                "images":    list(images),
-                "kg_type":   (kg.get("type") or "").lower(),
+                "title":       kg.get("title", ""),
+                "kg_id":       kg.get("id", ""),
+                "stem_html":   stem_html or None,
+                "notes":       "\n\n".join(notes_bits) or None,
+                "concept":     kg_store.field(kg, "concept") or "",
+                "explanation": kg_store.field(kg, "explanation") or "",
+                "images":      list(images),
+                "kg_type":     (kg.get("type") or "").lower(),
+                "tags":        [t for t in (kg.get("tags") or []) if t],
             })
             queued += 1
         if hasattr(main, "refresh_queue_badge"):

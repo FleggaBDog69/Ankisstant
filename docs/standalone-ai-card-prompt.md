@@ -36,6 +36,10 @@ The **whole reply** must be a single JSON object, no markdown fences, no prose:
   carries the tags.
 - `tags` → folded into a hierarchical Anki tag (`base::type::system::subsystem::topic`)
   on every card from that gap. Leave any level `""` if genuinely unclear.
+- `mq_explanation` *(optional)* → for a **missed question**, a 1–3 sentence
+  explanation of the concept you got wrong. Ankisstant puts it (with the gap
+  itself) at the top of the Missed Questions field, above the screenshot. Omit
+  it for ordinary gaps.
 
 ---
 
@@ -58,7 +62,14 @@ Return ONE JSON object and NOTHING else. No markdown code fences, no ```json,
 no preamble, no "Here are your cards", no trailing notes. The first character
 of your reply is { and the last is }. Shape exactly:
   {"tags": {"system": "...", "subsystem": "...", "topic": "..."},
+   "mq_explanation": "...",
    "cards": [{"front": "...", "extra": "..."}, ...]}
+
+MQ_EXPLANATION (only when the gap is a question you got wrong)
+- "mq_explanation": 1–3 plain sentences explaining the underlying concept the
+  student missed — the mechanism or principle (the WHY/HOW), not a restatement.
+  Plain prose, no markdown. Use "" (or omit the key) for an ordinary gap that
+  isn't a missed question.
 
 CARD RULES (Wozniak's 20 Rules / Med School Insiders best practice)
 - MINIMUM INFORMATION: one atomic fact per card. If a card tests two things,

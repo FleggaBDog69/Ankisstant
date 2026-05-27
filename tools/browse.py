@@ -6,19 +6,20 @@
 from __future__ import annotations
 
 import html as _html
+import re
 
 from aqt import mw
 from aqt.qt import (
-    QApplication, QButtonGroup, QCheckBox, QDialogButtonBox, QFrame, QHBoxLayout,
-    QLabel, QLineEdit, QListWidget, QListWidgetItem, QPlainTextEdit,
-    QPushButton, QRadioButton, Qt, QVBoxLayout, QWidget,
+    QApplication, QButtonGroup, QCheckBox, QDialog, QDialogButtonBox,
+    QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QPlainTextEdit, QPushButton, QRadioButton, Qt, QVBoxLayout, QWidget,
 )
 from aqt.utils import askUser, showWarning, tooltip
 
 from ..core import anki_utils, api as core_api, log
 from ..core.config import (
     active_family, auto_tag_base, format_hierarchical_tag, kg_type_info, month_tag,
-    tool_config, tool_model, save_tool_config,
+    mq_explain_enabled, tool_config, tool_model, save_tool_config,
 )
 from ..core.qt_utils import (
     attach_tag_completer, loading, make_help_button, make_setup_banner,
@@ -75,31 +76,63 @@ RESCOPE_SYSTEM = (
     "Same JSON-array-of-strings format as before. 3–6 items. No prose."
 )
 
-# Appended to the search-terms prompt to fold a hierarchical tag suggestion
-# into the SAME request (one round-trip — important in manual mode). The reply
-# becomes an object instead of a bare array.
-MERGED_TAG_INSTRUCTIONS = (
-    "\n\nALSO: classify this topic into a hierarchical tag. Return your ENTIRE "
-    "answer as a JSON OBJECT (not a bare array):\n"
-    '  {"tags": {"system": "...", "subsystem": "...", "topic": "..."}, '
-    '"terms": [ ...the search-term strings as specified above... ]}\n'
-    "Tag rules:\n"
-    "- system: top-level body system/domain — Cardio, Neuro, Endo, GI, Resp, "
-    "Renal, Heme, MSK, Derm, Repro, Psych, ID, Onc, Pharm, Stats, Genetics, "
-    "Biochem, Immuno. Single best fit.\n"
-    "- subsystem: more specific category within the system (e.g. Arrhythmias).\n"
-    "- topic: most specific entity/drug/sign/mechanism (e.g. AFib).\n"
-    "- PascalCase or snake_case; no spaces, '::', or slashes. Empty string for "
-    "any level that's genuinely unclear.\n"
-    'The "terms" array uses EXACTLY the string format described above.'
-)
+# Folded into the search-terms prompt so a hierarchical tag suggestion and/or an
+# MQ knowledge-gap explanation come back in the SAME round-trip (important in
+# manual/BYO mode). When either is requested the reply becomes an object instead
+# of a bare array. See _merged_terms_instructions().
+def _merged_terms_instructions(*, want_tag: bool, want_explanation: bool) -> str:
+    """Return the 'reply as an OBJECT' instruction block, or '' when neither
+    extra is wanted (the reply then stays a bare terms array)."""
+    if not want_tag and not want_explanation:
+        return ""
+    keys: list[str] = []
+    if want_tag:
+        keys.append('"tags": {"system": "...", "subsystem": "...", "topic": "..."}')
+    if want_explanation:
+        keys.append('"mq_explanation": "..."')
+    keys.append('"terms": [ ...the search-term strings as specified above... ]')
+    out = [
+        "\n\nALSO return your ENTIRE answer as a single JSON OBJECT (not a bare "
+        "array) with these keys:",
+        "  {" + ", ".join(keys) + "}",
+    ]
+    if want_tag:
+        out.append(
+            "Tag rules:\n"
+            "- system: top-level body system/domain — Cardio, Neuro, Endo, GI, "
+            "Resp, Renal, Heme, MSK, Derm, Repro, Psych, ID, Onc, Pharm, Stats, "
+            "Genetics, Biochem, Immuno. Single best fit.\n"
+            "- subsystem: more specific category within the system (e.g. "
+            "Arrhythmias).\n"
+            "- topic: most specific entity/drug/sign/mechanism (e.g. AFib).\n"
+            "- PascalCase or snake_case; no spaces, '::', or slashes. Empty "
+            "string for any level that's genuinely unclear."
+        )
+    if want_explanation:
+        out.append(
+            'The "mq_explanation" value is a brief teaching explanation (1-3 '
+            "plain sentences) of the specific concept the student missed — "
+            "explain the underlying mechanism or principle (the WHY/HOW), not "
+            "just a restatement; be factually careful; pitch it at a Year 3 "
+            "Australian medical student; plain prose, no markdown."
+        )
+    out.append('The "terms" array uses EXACTLY the string format described above.')
+    return "\n".join(out)
 
 TAG_SEARCH_SYSTEM = (
     "You generate Anki tag-name keywords for a medical student. Given a topic, "
-    "return a JSON array of 3 to 6 short, specific keyword strings that are "
-    "likely to appear inside that student's Anki tag tree for that topic. "
-    "For each keyword, also suggest a favourite study resource and the USMLE "
-    "step level it's most relevant to.\n\n"
+    "return a JSON array of keyword strings that match tag names for THAT topic "
+    "and its tightly-coupled disease entities only.\n\n"
+    "STAY TIGHT — this is the most important rule:\n"
+    "- Return the topic itself, plus AT MOST a couple of closely-related disease "
+    "entities or direct differentials (e.g. for 'multiple sclerosis': "
+    "multiple_sclerosis, optic_neuritis).\n"
+    "- DO NOT branch out to the individual signs, symptoms, lab findings, "
+    "investigations, or buzzwords associated with the topic. For 'multiple "
+    "sclerosis' that means NO oligoclonal_bands, NO Uhthoff, NO MRI — those flood "
+    "the results with tangents. Only widen to a separate condition, never to a "
+    "feature of the topic.\n"
+    "- 2 to 4 items, fewer is better. Quality over coverage.\n\n"
     "Format — JSON array of objects exactly like:\n"
     '[{"keyword": "multiple_sclerosis", "resource": "Boards & Beyond — Neuro: MS", "step": "Step 1"}, ...]\n\n'
     "RULES:\n"
@@ -110,12 +143,24 @@ TAG_SEARCH_SYSTEM = (
     "- resource is a concise study reference (Boards & Beyond chapter, Pathoma section, "
     "First Aid page-range, etc.).\n"
     "- step is one of 'Step 1', 'Step 2 CK', 'Step 3', or 'Step 1+2' if it spans both. "
-    "Use 'AMC' for Australian-context entries when clearly post-graduation.\n"
-    "- 3–6 items, quality over quantity.\n\n"
+    "Use 'AMC' for Australian-context entries when clearly post-graduation.\n\n"
     "Return ONLY the JSON array. No prose."
 )
 
 # ── helpers ──────────────────────────────────────────────────────────────────
+
+_STEP_RE = re.compile(r"step[ _]?([123])", re.IGNORECASE)
+
+
+def _step_label(segs: list[str]) -> str:
+    """Pull a USMLE step from a tag's segments (e.g. '#AK_Step1_v12' → 'Step 1').
+    Returns '' when the tag isn't step-tagged (e.g. '#Malleus_CM')."""
+    for s in segs:
+        m = _STEP_RE.search(s)
+        if m:
+            return f"Step {m.group(1)}"
+    return ""
+
 
 def _front_preview(note, front_field: str, limit: int = 140) -> str:
     fld = note[front_field] if front_field in note else note.fields[0]
@@ -166,6 +211,11 @@ class BrowsePanel(QWidget):
         self._linked_kg_images: list[str] = []
         self._linked_kg_stem_html: str = ""
         self._linked_kg_type: str = ""
+        # MQ KGs lead the appended content with the specific concept missed and
+        # an AI-written explanation of it (above the stem/screenshot), matching
+        # the Create flow. The explanation is folded into the search request.
+        self._linked_kg_concept: str = ""
+        self._linked_kg_explanation: str = ""
         self._build()
 
     def preload_for_kg(self, kg: dict) -> None:
@@ -181,6 +231,8 @@ class BrowsePanel(QWidget):
             fields_blob.get("stem_html") or kg.get("stem_html") or ""
         )
         self._linked_kg_type = (kg.get("type") or "").lower()
+        self._linked_kg_concept = str(fields_blob.get("concept") or "").strip()
+        self._linked_kg_explanation = str(fields_blob.get("explanation") or "").strip()
         # Carry the KG's tag over so "Tag & Unsuspend" reuses it. We're
         # explicitly loading this KG, so override whatever's there (it was
         # only the last-used tag). Prefer a tag the user assigned in the KG
@@ -194,6 +246,25 @@ class BrowsePanel(QWidget):
         self._update_autotag_hint(kg)
         self._last_topic = title
         self._last_terms = []
+
+    def _store_linked_kg_explanation(self, text: str) -> None:
+        """Cache an MQ explanation on the panel and persist it to the linked
+        KG's store record so Create reuses it and it isn't regenerated."""
+        text = (text or "").strip()
+        if not text:
+            return
+        self._linked_kg_explanation = text
+        if not self._linked_kg_id:
+            return
+        try:
+            from .kg import store as kg_store
+            existing = kg_store.get(self._linked_kg_id)
+            if existing:
+                fields = dict(existing.get("fields") or {})
+                fields["explanation"] = text
+                kg_store.update(self._linked_kg_id, fields=fields)
+        except Exception as e:
+            print(f"[ankisstant] browse mq explanation persist failed: {e}")
 
     def _update_autotag_hint(self, kg: dict | None) -> None:
         """Surface a notice when the loaded KG already carries a tag, so the
@@ -446,6 +517,32 @@ class BrowsePanel(QWidget):
         self.status.setWordWrap(True)
         root.addWidget(self.status)
 
+        # Tag-mode-only: favourites + filter/sort. A topic search can surface a
+        # flood of matching tags; the user curates a set of favourite resource/
+        # branch tags (any hierarchy level) and then filters/sorts the results
+        # by which ones their favourites actually live on.
+        self._fav_row = QWidget()
+        fav_layout = QHBoxLayout(self._fav_row)
+        fav_layout.setContentsMargins(0, 0, 0, 0)
+        self.fav_btn = QPushButton("★ Favourite tags…")
+        self.fav_btn.setAutoDefault(False)
+        self.fav_btn.setToolTip(
+            "Pick the resource/branch tags you study from. Results can then be "
+            "filtered or sorted by which of your favourites they sit under."
+        )
+        self.fav_btn.clicked.connect(self._open_favourites_dialog)
+        fav_layout.addWidget(self.fav_btn)
+        self.fav_only_cb = QCheckBox("★ only")
+        self.fav_only_cb.setToolTip("Show only tags that sit on cards from your favourite tags.")
+        self.fav_only_cb.toggled.connect(lambda *_: self._render_tag_rows())
+        fav_layout.addWidget(self.fav_only_cb)
+        fav_hint = QLabel("Results group by your favourite order (Pathoma → B&B → …).")
+        fav_hint.setStyleSheet("color: gray; font-size: 11px;")
+        fav_layout.addWidget(fav_hint)
+        fav_layout.addStretch(1)
+        self._fav_row.setVisible(False)
+        root.addWidget(self._fav_row)
+
         self.results_list = QListWidget()
         self.results_list.setAlternatingRowColors(True)
         self.results_list.itemDoubleClicked.connect(self._on_item_double_clicked)
@@ -573,7 +670,9 @@ class BrowsePanel(QWidget):
             if not rows:
                 tooltip("Tick at least one tag first.")
                 return
-            query = " OR ".join(f'tag:"{r["tag"]}"' for r in rows)
+            query = " OR ".join(
+                r["query"] if r.get("query") else f'tag:"{r["tag"]}"' for r in rows
+            )
         else:
             nids = self._selected_nids()
             if not nids:
@@ -618,6 +717,7 @@ class BrowsePanel(QWidget):
         self.broader_btn.setEnabled(False)
         self.narrower_btn.setEnabled(False)
         self.confirm_btn.setEnabled(False)
+        self._fav_row.setVisible(self._mode == "tags")
         if self._mode == "tags":
             self.status.setText("Tags mode — find tag groups for study planning.")
         else:
@@ -676,8 +776,27 @@ class BrowsePanel(QWidget):
         merge_tag = (want_tag and bool(self.cfg.get("auto_tag", True))
                      and bool(base) and type_enabled
                      and not self._tag_from_kg and not self._tag_user_set)
-        if merge_tag:
-            system_prompt = system_prompt + MERGED_TAG_INSTRUCTIONS
+        # MQ explanation: fold it into this same search request when a missed-
+        # question KG is loaded, the feature's on, and we don't already have one.
+        merge_explanation = (
+            want_tag and mq_explain_enabled()
+            and bool(getattr(self, "_linked_kg_id", None))
+            and self._linked_kg_type == "mq"
+            and not self._linked_kg_explanation.strip()
+            and bool((self._linked_kg_concept
+                      or self.topic.text()).strip())
+        )
+        merged = _merged_terms_instructions(
+            want_tag=merge_tag, want_explanation=merge_explanation,
+        )
+        if merged:
+            system_prompt = system_prompt + merged
+        if merge_explanation:
+            concept = (self._linked_kg_concept or self.topic.text()).strip()
+            user_prompt += (
+                "\n\nThe student's specific knowledge gap (explain this in "
+                f'"mq_explanation"): {concept}'
+            )
 
         model = tool_model(self.cfg, "model", active_family())
         reply = run_claude_json(
@@ -688,16 +807,21 @@ class BrowsePanel(QWidget):
             model=model,
         )
 
-        # Merged replies are {"tags": {...}, "terms": [...]}; otherwise a bare
-        # array. Pull the tag out and pre-fill the "Tag to apply" field.
+        # Merged replies are an object {"tags": …, "mq_explanation": …,
+        # "terms": […]}; otherwise a bare array. Pull the extras out.
         terms = reply
-        if merge_tag and isinstance(reply, dict):
+        if (merge_tag or merge_explanation) and isinstance(reply, dict):
             terms = reply.get("terms")
-            levels = reply.get("tags")
-            if isinstance(levels, dict):
-                tag = format_hierarchical_tag(base, levels, type_seg=type_name)
-                if tag and tag != base:
-                    self.tag_input.setText(tag)
+            if merge_tag:
+                levels = reply.get("tags")
+                if isinstance(levels, dict):
+                    tag = format_hierarchical_tag(base, levels, type_seg=type_name)
+                    if tag and tag != base:
+                        self.tag_input.setText(tag)
+            if merge_explanation:
+                self._store_linked_kg_explanation(
+                    str(reply.get("mq_explanation") or "")
+                )
 
         if not isinstance(terms, list) or not all(isinstance(t, str) for t in terms):
             self._refresh_rescope_enabled()
@@ -774,39 +898,131 @@ class BrowsePanel(QWidget):
             tag_rows = self._resolve_tags(cleaned)
         self._populate_tag_results(tag_rows, cleaned)
 
+    def _favourite_tags(self) -> list[str]:
+        """Favourites in the user's priority order (top = preferred)."""
+        return [t for t in (self.cfg.get("favourite_tags") or []) if t]
+
+    @staticmethod
+    def _segs_contains(hay: list[str], needle: list[str]) -> bool:
+        """True if `needle` appears as a contiguous run of segments within
+        `hay` (case-insensitive). Lets a favourite match whether it's a full
+        path (A::B is a prefix of A::B::C) or a single segment (#Pathoma is one
+        of the tag's levels)."""
+        if not needle or len(needle) > len(hay):
+            return False
+        hay_l = [s.lower() for s in hay]
+        needle_l = [s.lower() for s in needle]
+        for i in range(len(hay_l) - len(needle_l) + 1):
+            if hay_l[i:i + len(needle_l)] == needle_l:
+                return True
+        return False
+
+    def _annotate_fav(self, rows: list[dict]) -> None:
+        """Attach favourite-ranking by HIERARCHY, not by shared notes. A tag is
+        "under" a favourite only if the favourite's path actually appears in the
+        tag's own segments — so a Boards & Beyond tag is never mislabelled as
+        Pathoma just because their cards overlap. fav_rank is the index of the
+        highest-priority matching favourite (lower = preferred), None if none."""
+        favs = [(f, f.split("::")) for f in self._favourite_tags()]
+        for r in rows:
+            segs = r.get("segs") or r["tag"].split("::")
+            rank, label = None, ""
+            for i, (fav, fav_segs) in enumerate(favs):
+                if self._segs_contains(segs, fav_segs):
+                    rank, label = i, fav_segs[-1]
+                    break
+            r["fav_rank"] = rank
+            r["fav_label"] = label
+
+    def _reannotate_favourites(self) -> None:
+        self._annotate_fav(self._results)
+
     def _resolve_tags(self, entries: list[dict]) -> list[dict]:
-        """For each keyword, find matching tag names in the collection and
-        produce one row per unique tag (preferring the first keyword that
-        matched, so display order is stable)."""
+        """For each keyword, return every collection tag that has the keyword in
+        one of its hierarchy segments — including the tags *below* the matched
+        level, each as its own row. Note count / nids span the tag's subtree."""
         all_tags = list(mw.col.tags.all())
         seen: dict[str, dict] = {}
         for entry in entries:
             needle = entry["keyword"].lower()
             for t in all_tags:
-                if needle in t.lower() and t not in seen:
-                    nids = list(mw.col.find_notes(f'tag:"{t}"'))
-                    seen[t] = {
-                        "tag":      t,
-                        "keyword":  entry["keyword"],
-                        "resource": entry["resource"],
-                        "step":     entry["step"],
-                        "nids":     nids,
-                        "n_notes":  len(nids),
-                    }
-        # Sort by note-count desc — most populated tags first.
-        return sorted(seen.values(), key=lambda r: -r["n_notes"])
+                segs = t.split("::")
+                if t in seen:
+                    continue
+                # shallowest segment containing the keyword — display starts here
+                idx = next((i for i, s in enumerate(segs) if needle in s.lower()), None)
+                if idx is None:
+                    continue
+                query = f'tag:"{t}" OR tag:"{t}::*"'
+                try:
+                    nids = list(mw.col.find_notes(query))
+                except Exception as e:
+                    print(f"[ankisstant] tag note query failed for {t!r}: {e}")
+                    nids = []
+                seen[t] = {
+                    "tag":       t,
+                    "segs":      segs,
+                    "match_idx": idx,
+                    "keyword":   entry["keyword"],
+                    "query":     query,
+                    "nids":      nids,
+                    "n_notes":   len(nids),
+                    "step":      _step_label(segs),
+                }
+        rows = list(seen.values())
+        self._annotate_fav(rows)
+        return rows
 
     def _populate_tag_results(self, tag_rows: list[dict], entries: list[dict]) -> None:
+        # Keep the full resolved set; the visible list is a filtered/sorted view.
+        self._results = tag_rows
+        self._tag_entries = entries
+        self._render_tag_rows()
+
+    @staticmethod
+    def _format_tag_head(row: dict) -> str:
+        """The tag path from the matched segment downward only — levels *above*
+        the search term (version tag, resource, intermediate categories) are
+        dropped, since the resource is shown via the favourite chip and the step
+        via its own chip. Sub-tags below the match are kept and visible."""
+        segs = row.get("segs") or row["tag"].split("::")
+        idx = row.get("match_idx", 0)
+        body = segs[idx:] or segs
+        return "  ›  ".join(body)
+
+    def _render_tag_rows(self) -> None:
+        """Rebuild the visible tag list from self._results, applying the current
+        favourites filter and sort order. Re-runs no queries."""
+        if self._mode != "tags":
+            return
+        has_favs = bool(self._favourite_tags())
+        rows = list(self._results)
+        filtered_no_favs = False
+        if self.fav_only_cb.isChecked():
+            if has_favs:
+                rows = [r for r in rows if r.get("fav_rank") is not None]
+            else:
+                filtered_no_favs = True
+        # Group by favourite priority (rank 0 first), non-favourites last; within
+        # a group, most-populated tags first.
+        BIG = 10**9
+        rows.sort(key=lambda r: (
+            r["fav_rank"] if r.get("fav_rank") is not None else BIG,
+            -r["n_notes"],
+        ))
+
         self.results_list.blockSignals(True)
         self.results_list.clear()
-        self._results = tag_rows
-        for row in tag_rows:
-            meta_bits = [f"{row['n_notes']} note{'s' if row['n_notes'] != 1 else ''}"]
-            if row["resource"]:
-                meta_bits.append(row["resource"])
-            if row["step"]:
-                meta_bits.append(row["step"])
-            label = f"{row['tag']}   ·   {'  ·  '.join(meta_bits)}"
+        for row in rows:
+            # Order: resource (favourite) chip · step · tag path · note count.
+            bits = []
+            if row.get("fav_label"):
+                bits.append(f"★ {row['fav_label']}")
+            if row.get("step"):
+                bits.append(row["step"])
+            bits.append(self._format_tag_head(row))
+            bits.append(f"{row['n_notes']} note{'s' if row['n_notes'] != 1 else ''}")
+            label = "   ·   ".join(bits)
             item = QListWidgetItem(label)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Unchecked)
@@ -814,13 +1030,168 @@ class BrowsePanel(QWidget):
             self.results_list.addItem(item)
         self.results_list.blockSignals(False)
 
+        entries = getattr(self, "_tag_entries", []) or []
         breakdown = ", ".join(e["keyword"] for e in entries)
-        self.status.setText(
-            f"Found {len(tag_rows)} matching tag(s) for: {breakdown}. "
-            "Double-click to open a tag in the browser."
-        )
+        if filtered_no_favs:
+            self.status.setText(
+                "No favourite tags set yet — click ★ Favourite tags… to pick some. "
+                f"Showing all {len(rows)} matching tag(s)."
+            )
+        else:
+            shown = f"Showing {len(rows)} of {len(self._results)}" \
+                if len(rows) != len(self._results) else f"Found {len(rows)}"
+            self.status.setText(
+                f"{shown} matching tag(s) for: {breakdown}. "
+                "Double-click to open a tag in the browser."
+            )
         self._update_count()
-        self.confirm_btn.setEnabled(len(tag_rows) > 0)
+        self.confirm_btn.setEnabled(self.results_list.count() > 0)
+
+    def _open_favourites_dialog(self) -> None:
+        """Pick favourite tags AND order them by priority. Top pane: searchable,
+        checkable list of the whole tag tree to add/remove favourites. Bottom
+        pane: the chosen favourites in priority order, with Move up/down — that
+        order is exactly how tag-search results are grouped (top = preferred)."""
+        if not anki_utils.require_col():
+            return
+        all_tags = sorted(mw.col.tags.all(), key=str.lower)
+        if not all_tags:
+            tooltip("No tags in your collection yet.")
+            return
+        # Ordered list of favourites; membership tracked via this list's order.
+        order: list[str] = list(self._favourite_tags())
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Favourite tags")
+        dlg.resize(560, 640)
+        v = QVBoxLayout(dlg)
+        v.addWidget(QLabel(
+            "Tick the resource/branch tags you study from — any hierarchy level "
+            "works (e.g. <code>Anking_S1_V12::Boards_&amp;_Beyond</code> or a "
+            "parent/child). Results are grouped by the priority order below."
+        ))
+        search = QLineEdit()
+        search.setPlaceholderText("Filter tags…")
+        v.addWidget(search)
+        lst = QListWidget()
+        v.addWidget(lst, 1)
+
+        v.addWidget(QLabel("Priority order — top is preferred:"))
+        order_row = QHBoxLayout()
+        order_list = QListWidget()
+        order_row.addWidget(order_list, 1)
+        order_btns = QVBoxLayout()
+        up_btn = QPushButton("▲ Up")
+        up_btn.setAutoDefault(False)
+        down_btn = QPushButton("▼ Down")
+        down_btn.setAutoDefault(False)
+        remove_btn = QPushButton("✕ Remove")
+        remove_btn.setAutoDefault(False)
+        order_btns.addWidget(up_btn)
+        order_btns.addWidget(down_btn)
+        order_btns.addWidget(remove_btn)
+        order_btns.addStretch(1)
+        order_row.addLayout(order_btns)
+        v.addLayout(order_row, 1)
+
+        # Add a tag by name — for top-level tags that don't surface in the list,
+        # or any tag you'd rather type than scroll to. Autocompletes existing tags
+        # but accepts anything you type.
+        add_row = QHBoxLayout()
+        add_input = QLineEdit()
+        add_input.setPlaceholderText("Type a tag name to add as a favourite…")
+        attach_tag_completer(add_input, multi=False)
+        add_btn = QPushButton("Add")
+        add_btn.setAutoDefault(False)
+        add_row.addWidget(add_input, 1)
+        add_row.addWidget(add_btn)
+        v.addLayout(add_row)
+
+        def refresh_order_list():
+            order_list.blockSignals(True)
+            keep = order_list.currentRow()
+            order_list.clear()
+            for t in order:
+                order_list.addItem(QListWidgetItem(t))
+            if 0 <= keep < order_list.count():
+                order_list.setCurrentRow(keep)
+            order_list.blockSignals(False)
+
+        def rebuild(needle: str = ""):
+            needle = needle.lower().strip()
+            lst.blockSignals(True)
+            lst.clear()
+            for t in all_tags:
+                if needle and needle not in t.lower():
+                    continue
+                it = QListWidgetItem(t)
+                it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                it.setCheckState(
+                    Qt.CheckState.Checked if t in order else Qt.CheckState.Unchecked
+                )
+                lst.addItem(it)
+            lst.blockSignals(False)
+
+        def on_item_changed(item):
+            t = item.text()
+            if item.checkState() == Qt.CheckState.Checked:
+                if t not in order:
+                    order.append(t)
+            elif t in order:
+                order.remove(t)
+            refresh_order_list()
+
+        def move(delta: int):
+            i = order_list.currentRow()
+            j = i + delta
+            if i < 0 or not (0 <= j < len(order)):
+                return
+            order[i], order[j] = order[j], order[i]
+            order_list.setCurrentRow(j)
+            refresh_order_list()
+
+        def remove_selected():
+            i = order_list.currentRow()
+            if 0 <= i < len(order):
+                del order[i]
+                refresh_order_list()
+                rebuild(search.text())  # re-untick in the main list if shown
+
+        def add_typed():
+            t = add_input.text().strip().strip(":")
+            if not t:
+                return
+            if t not in order:
+                order.append(t)
+            add_input.clear()
+            refresh_order_list()
+            rebuild(search.text())  # re-tick in the main list if shown
+
+        lst.itemChanged.connect(on_item_changed)
+        search.textChanged.connect(rebuild)
+        up_btn.clicked.connect(lambda: move(-1))
+        down_btn.clicked.connect(lambda: move(1))
+        remove_btn.clicked.connect(remove_selected)
+        add_btn.clicked.connect(add_typed)
+        add_input.returnPressed.connect(add_typed)
+        rebuild()
+        refresh_order_list()
+
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        v.addWidget(bb)
+
+        if dlg.exec():
+            self.cfg["favourite_tags"] = list(order)  # preserve priority order
+            try:
+                save_tool_config("browse", self.cfg)
+            except Exception as e:
+                print(f"[ankisstant] saving favourite tags failed: {e}")
+            self._reannotate_favourites()
+            self._render_tag_rows()
 
     def _run_searches(self, terms, notetype_filter, max_results):
         seen: set[int] = set()
@@ -920,7 +1291,8 @@ class BrowsePanel(QWidget):
             tag = str(item.data(Qt.ItemDataRole.UserRole) or "")
             if not tag:
                 return
-            query = f'tag:"{tag}"'
+            row = next((r for r in self._results if r["tag"] == tag), None)
+            query = row["query"] if row and row.get("query") else f'tag:"{tag}"'
         else:
             nid = int(item.data(Qt.ItemDataRole.UserRole))
             query = f"nid:{nid}"
@@ -1071,6 +1443,18 @@ class BrowsePanel(QWidget):
                     qb_cfg = tool_config("qbank")
                     target_field = qb_cfg.get("missed_q_field") or "Missed Questions"
                     parts = []
+                    # Lead with the specific knowledge gap + its explanation,
+                    # then the captured stem/screenshot — matching Create.
+                    if self._linked_kg_concept:
+                        parts.append(
+                            f"<b>Knowledge gap:</b> {_html.escape(self._linked_kg_concept)}"
+                        )
+                    if self._linked_kg_explanation:
+                        parts.append(
+                            "<i>"
+                            + _html.escape(self._linked_kg_explanation).replace("\n", "<br>")
+                            + "</i>"
+                        )
                     if self._linked_kg_stem_html:
                         parts.append(self._linked_kg_stem_html)
                     if img_html:
