@@ -2,7 +2,7 @@
   "name": "Ankisstant",
   "package": "ankisstant",
   "author": "Flegga",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "description": "QBank, Browse, Knowledge Gaps, and Create — four AI-powered tools for Anki. Works with Gemini free tier, Ollama, Claude CLI, Anthropic/OpenAI API, or any chatbot via paste import.",
   "conflicts": ["679076377", "browse_with_claude", "create_cards_with_claude"],
   "mod": 0,

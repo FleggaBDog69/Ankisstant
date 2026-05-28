@@ -8,9 +8,9 @@ import os
 
 from aqt import mw
 from aqt.qt import (
-    QComboBox, QDialog, QDialogButtonBox, QHBoxLayout, QLabel,
-    QKeySequence, QPushButton, QShortcut, QSpinBox, QSplitter, Qt, QTimer,
-    QUrl, QVBoxLayout,
+    QComboBox, QDesktopServices, QDialog, QDialogButtonBox, QHBoxLayout, QLabel,
+    QKeySequence, QLineEdit, QPushButton, QShortcut, QSpinBox, QSplitter, Qt,
+    QTimer, QUrl, QVBoxLayout,
 )
 
 try:
@@ -54,6 +54,57 @@ def _get_profile(platform_key: str) -> "QWebEngineProfile":
     )
     _profiles[platform_key] = profile
     return profile
+
+
+_popups: list = []   # keep popup windows alive (WA_DeleteOnClose frees them on close)
+
+
+class _NewTabPage(QWebEnginePage):
+    """Page that routes target=_blank / window.open() links to a new Anki window.
+
+    Anki's embedded webview silently blocks new-tab navigation. Some QBank
+    features (e.g. Apex Anesthesia mock exams) rely on opening a new tab, so we
+    catch those requests in createWindow and host them in a fresh in-Anki
+    BrowserWindow — same login/cookies and the same capture toolbar as the
+    original. If no owner window is known we fall back to the system browser.
+    """
+
+    def __init__(self, profile, parent, owner=None):
+        super().__init__(profile, parent)
+        self._owner = owner
+
+    def createWindow(self, _type):
+        owner = self._owner
+        if owner is None:
+            # No QBank window to attach to — hand off to the default browser.
+            stub = QWebEnginePage(self.profile(), self)
+
+            def _open_external(url: QUrl):
+                if url.isValid() and not url.isEmpty():
+                    QDesktopServices.openUrl(url)
+                    stub.deleteLater()
+
+            stub.urlChanged.connect(_open_external)
+            return stub
+
+        # Build a new in-Anki QBank window and let Qt drive its page to the
+        # new-tab URL. Returning the page is what tells Qt where to load it.
+        new_page = _NewTabPage(self.profile(), None)
+        win = BrowserWindow(
+            owner._platform_key, owner._platform_name, None, mw,
+            initial_page=new_page, is_popup=True,
+        )
+        new_page._owner = win  # further new-tabs from this window stay in Anki
+        _popups.append(win)
+        win.show()
+        win.raise_()
+        win.activateWindow()
+        return new_page
+
+
+def _make_page(profile, parent, owner=None):
+    """Build a page that opens new-tab links in a fresh Anki QBank window."""
+    return _NewTabPage(profile, parent, owner=owner)
 
 
 class _QuestionCountDialog(QDialog):
@@ -109,10 +160,15 @@ AI_OPTIONS = [
 
 
 class BrowserWindow(QDialog):
-    def __init__(self, platform_key: str, platform_name: str, url: str, parent=None):
+    def __init__(self, platform_key: str, platform_name: str, url, parent=None,
+                 initial_page=None, is_popup: bool = False,
+                 track_session: bool = True, show_nav: bool = False):
         super().__init__(parent)
         self._platform_key = platform_key
         self._platform_name = platform_name
+        self._is_popup = is_popup
+        self._track_session = track_session
+        self._address = None
         self.setWindowTitle(platform_name)
         self.resize(1400, 850)
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.Window)
@@ -134,15 +190,47 @@ class BrowserWindow(QDialog):
         capture_btn = QPushButton("📌 Capture missed Q")
         capture_btn.setStyleSheet("font-size: 12px; padding: 4px 10px;")
         capture_btn.setToolTip("Save the current question to review later (⌘⇧K)")
+        capture_btn.setAutoDefault(False)
         capture_btn.clicked.connect(self._open_capture)
         toolbar.addWidget(capture_btn)
 
         review_btn = QPushButton("Review queue")
         review_btn.setStyleSheet("font-size: 12px; padding: 4px 10px;")
+        review_btn.setAutoDefault(False)
         review_btn.clicked.connect(self._open_review)
         toolbar.addWidget(review_btn)
 
-        toolbar.addStretch()
+        # ── Navigation (general browser only): back / forward / reload / URL ──
+        if show_nav:
+            back_btn = QPushButton("◀")
+            back_btn.setStyleSheet("font-size: 12px; padding: 4px 8px;")
+            back_btn.setToolTip("Back")
+            back_btn.setAutoDefault(False)
+            back_btn.clicked.connect(lambda: self.view.back())
+            toolbar.addWidget(back_btn)
+
+            fwd_btn = QPushButton("▶")
+            fwd_btn.setStyleSheet("font-size: 12px; padding: 4px 8px;")
+            fwd_btn.setToolTip("Forward")
+            fwd_btn.setAutoDefault(False)
+            fwd_btn.clicked.connect(lambda: self.view.forward())
+            toolbar.addWidget(fwd_btn)
+
+            reload_btn = QPushButton("⟳")
+            reload_btn.setStyleSheet("font-size: 12px; padding: 4px 8px;")
+            reload_btn.setToolTip("Reload")
+            reload_btn.setAutoDefault(False)
+            reload_btn.clicked.connect(lambda: self.view.reload())
+            toolbar.addWidget(reload_btn)
+
+            self._address = QLineEdit()
+            self._address.setStyleSheet("font-size: 12px; padding: 4px 8px;")
+            self._address.setPlaceholderText("Type a URL and press Enter…")
+            self._address.setClearButtonEnabled(True)
+            self._address.returnPressed.connect(self._navigate_to_address)
+            toolbar.addWidget(self._address, stretch=1)
+        else:
+            toolbar.addStretch()
 
         self._ai_combo = QComboBox()
         self._ai_combo.setStyleSheet("font-size: 12px;")
@@ -159,6 +247,7 @@ class BrowserWindow(QDialog):
         self._ai_toggle.setCheckable(True)
         self._ai_toggle.setStyleSheet("font-size: 12px; padding: 4px 10px;")
         self._ai_toggle.setToolTip("Show/hide AI sidebar (⌘⇧A)")
+        self._ai_toggle.setAutoDefault(False)
         self._ai_toggle.clicked.connect(self._toggle_ai)
         toolbar.addWidget(self._ai_toggle)
 
@@ -168,9 +257,18 @@ class BrowserWindow(QDialog):
         self._splitter = QSplitter(Qt.Orientation.Horizontal, self)
 
         self.view = QWebEngineView(self)
-        page = QWebEnginePage(_get_profile(platform_key), self.view)
-        self.view.setPage(page)
-        self.view.setUrl(QUrl(url))
+        if initial_page is not None:
+            # A new-tab popup: adopt the page Qt handed us and let it load the URL.
+            page = initial_page
+            page.setParent(self.view)
+            self.view.setPage(page)
+        else:
+            page = _make_page(_get_profile(platform_key), self.view, owner=self)
+            self.view.setPage(page)
+            if url:
+                self.view.setUrl(QUrl(url))
+        if self._address is not None:
+            self.view.urlChanged.connect(self._on_url_changed)
         self._splitter.addWidget(self.view)
 
         self._ai_view = None
@@ -198,7 +296,7 @@ class BrowserWindow(QDialog):
             return
         name, url = self._current_ai()
         self._ai_view = QWebEngineView(self)
-        page = QWebEnginePage(_get_profile(f"ai_{name.lower()}"), self._ai_view)
+        page = _make_page(_get_profile(f"ai_{name.lower()}"), self._ai_view)
         self._ai_view.setPage(page)
         self._ai_view.setUrl(QUrl(url))
         self._splitter.addWidget(self._ai_view)
@@ -220,7 +318,7 @@ class BrowserWindow(QDialog):
     def _on_ai_changed(self, _idx):
         name, url = self._current_ai()
         if self._ai_view is not None:
-            page = QWebEnginePage(_get_profile(f"ai_{name.lower()}"), self._ai_view)
+            page = _make_page(_get_profile(f"ai_{name.lower()}"), self._ai_view)
             self._ai_view.setPage(page)
             self._ai_view.setUrl(QUrl(url))
         self._persist_ai_state()
@@ -234,6 +332,21 @@ class BrowserWindow(QDialog):
         except Exception as e:
             print(f"[ankisstant] persist ai state failed: {e}")
 
+    def _on_url_changed(self, url: QUrl):
+        # Keep the address bar in sync, unless the user is mid-edit.
+        if not self._address.hasFocus():
+            self._address.setText(url.toString())
+
+    def _navigate_to_address(self):
+        text = self._address.text().strip()
+        if not text:
+            return
+        # Treat input with no scheme as a bare domain (e.g. "uworld.com").
+        if "://" not in text:
+            text = "https://" + text
+        self.view.setUrl(QUrl(text))
+        self.view.setFocus()
+
     def _open_capture(self):
         from .capture_dialog import open_capture
         open_capture(self._platform_key, self._platform_name)
@@ -243,6 +356,19 @@ class BrowserWindow(QDialog):
         _open_kg_page_for_qbank()
 
     def closeEvent(self, event):
+        if self._is_popup:
+            # New-tab popups aren't a graded study session; just clean up.
+            try:
+                _popups.remove(self)
+            except ValueError:
+                pass
+            event.accept()
+            return
+        if not self._track_session:
+            # General browser — not a graded QBank session.
+            _windows.pop(self._platform_key, None)
+            event.accept()
+            return
         if not self._prompted:
             self._prompted = True
             dialog = _QuestionCountDialog(self._platform_name, self)
@@ -265,4 +391,22 @@ def open_platform(platform_key: str, platform_name: str, url: str) -> None:
         return
     win = BrowserWindow(platform_key, platform_name, url, mw)
     _windows[platform_key] = win
+    win.show()
+
+
+def open_browser() -> None:
+    """Open a general-purpose web browser window with the capture toolbar.
+
+    Unlike a configured QBank, this starts blank so the user can navigate
+    anywhere via the address bar. Its own profile keeps logins separate, and it
+    doesn't prompt for a question count on close (it isn't a graded session).
+    """
+    key = "open_browser"
+    win = _windows.get(key)
+    if win is not None and win.isVisible():
+        win.raise_()
+        win.activateWindow()
+        return
+    win = BrowserWindow(key, "Browser", "", mw, track_session=False, show_nav=True)
+    _windows[key] = win
     win.show()

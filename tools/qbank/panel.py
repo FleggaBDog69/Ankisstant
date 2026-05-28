@@ -15,7 +15,7 @@ from aqt.qt import (
 from ...core.config import tool_config
 from ...core.qt_utils import make_help_button
 from ..kg import store as kg_store
-from .browser import open_platform
+from .browser import open_platform, open_browser
 from .capture_dialog import open_capture
 from .session_dialog import open_session_dialog
 from .stats import load_combined_stats, get_streak
@@ -170,29 +170,37 @@ class QBankPanel(QWidget):
 
         # ── Platform launchers ───────────────────────────────────────────────
         root.addWidget(QLabel("<b>Open QBank</b>"))
-        if platforms or pq_present:
-            grid = QGridLayout()
-            grid.setSpacing(8)
-            slot = 0
-            for p in platforms:
-                btn = QPushButton(p["name"])
-                btn.setMinimumHeight(36)
-                btn.clicked.connect(
-                    lambda _checked=False, _p=p: open_platform(_p["key"], _p["name"], _p["url"])
-                )
-                grid.addWidget(btn, slot // 3, slot % 3)
-                slot += 1
-            if pq_present:
-                pq_btn = QPushButton("Practice Qs")
-                pq_btn.setMinimumHeight(36)
-                pq_btn.setToolTip("Practice Questions addon — local screenshot library")
-                pq_btn.clicked.connect(lambda _checked=False: _open_practice_questions())
-                grid.addWidget(pq_btn, slot // 3, slot % 3)
-            wrapper = QWidget()
-            wrapper.setLayout(grid)
-            root.addWidget(wrapper)
-        else:
-            root.addWidget(QLabel("<i>No QBanks configured. Add some in Settings.</i>"))
+        grid = QGridLayout()
+        grid.setSpacing(8)
+        slot = 0
+        for p in platforms:
+            btn = QPushButton(p["name"])
+            btn.setMinimumHeight(36)
+            btn.clicked.connect(
+                lambda _checked=False, _p=p: open_platform(_p["key"], _p["name"], _p["url"])
+            )
+            grid.addWidget(btn, slot // 3, slot % 3)
+            slot += 1
+        if pq_present:
+            pq_btn = QPushButton("Practice Qs")
+            pq_btn.setMinimumHeight(36)
+            pq_btn.setToolTip("Practice Questions addon — local screenshot library")
+            pq_btn.clicked.connect(lambda _checked=False: _open_practice_questions())
+            grid.addWidget(pq_btn, slot // 3, slot % 3)
+            slot += 1
+        # Always offer a general browser — use any site without configuring it.
+        browser_btn = QPushButton("🌐 Open Browser")
+        browser_btn.setMinimumHeight(36)
+        browser_btn.setToolTip("Open a blank web browser with the capture toolbar — "
+                               "navigate to any site via the address bar")
+        browser_btn.clicked.connect(lambda _checked=False: open_browser())
+        grid.addWidget(browser_btn, slot // 3, slot % 3)
+        wrapper = QWidget()
+        wrapper.setLayout(grid)
+        root.addWidget(wrapper)
+        if not platforms:
+            root.addWidget(QLabel("<i>No QBanks configured yet — add some in "
+                                  "Settings, or just use Open Browser.</i>"))
 
         # ── Actions ──────────────────────────────────────────────────────────
         root.addWidget(QLabel("<b>Actions</b>"))

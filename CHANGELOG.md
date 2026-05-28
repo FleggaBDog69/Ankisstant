@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.7.1
+
+### Added
+- **🌐 Open Browser** in the QBank launcher. Opens a blank in-Anki browser with
+  an address bar (type a URL + Enter; bare domains get `https://`) and
+  back/forward/reload, plus the usual capture toolbar (Capture missed Q, Review
+  queue, AI sidebar) — so you can use any site without configuring it as a
+  QBank. It keeps its own login profile and isn't treated as a graded session
+  (no question-count prompt on close).
+- **New-tab links open inside Anki.** QBank features that open a new tab (e.g.
+  Apex Anesthesia mock exams) were silently blocked by Anki's webview. They now
+  open in a fresh Anki browser window that shares the same login and capture
+  toolbar, instead of vanishing.
+
+### Fixed
+- Pressing Enter in the Open Browser address bar no longer triggers the
+  "Capture missed Q" dialog (button `autoDefault` is now off).
+
 ## 1.7.0
 
 ### Added
