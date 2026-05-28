@@ -407,6 +407,6 @@ def open_browser() -> None:
         win.raise_()
         win.activateWindow()
         return
-    win = BrowserWindow(key, "Browser", "", mw, track_session=False, show_nav=True)
+    win = BrowserWindow(key, "Browser", "", mw, show_nav=True)
     _windows[key] = win
     win.show()

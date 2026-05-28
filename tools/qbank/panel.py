@@ -15,10 +15,10 @@ from aqt.qt import (
 from ...core.config import tool_config
 from ...core.qt_utils import make_help_button
 from ..kg import store as kg_store
-from .browser import open_platform, open_browser
+from .browser import open_platform, open_browser, _QuestionCountDialog
 from .capture_dialog import open_capture
 from .session_dialog import open_session_dialog
-from .stats import load_combined_stats, get_streak
+from .stats import load_combined_stats, get_streak, add_session
 from .targets import get_target
 
 
@@ -30,7 +30,44 @@ def _practice_questions_available() -> bool:
         return False
 
 
+_pq_windows: list = []   # keep PQ library dialogs alive while open
+
+
+def _on_practice_questions_closed() -> None:
+    """Prompt for a question count when the Practice Qs window closes, mirroring
+    the QBank browser windows, and log it under the practice_questions platform."""
+    from aqt import mw
+    dialog = _QuestionCountDialog("Practice Qs")
+    if dialog.exec():
+        correct, incorrect = dialog.values()
+        add_session(correct, incorrect, "practice_questions")
+        try:
+            mw.deckBrowser.refresh()
+        except Exception:
+            pass
+
+
 def _open_practice_questions() -> None:
+    # Build the Practice Questions library window ourselves (soft import — the
+    # addon is optional) so we can hook its close to the session-count prompt.
+    try:
+        from practice_questions.library import LibraryDialog  # type: ignore
+        dlg = LibraryDialog()
+        _pq_windows.append(dlg)
+
+        def _finished(_result, _d=dlg):
+            try:
+                _pq_windows.remove(_d)
+            except ValueError:
+                pass
+            _on_practice_questions_closed()
+
+        dlg.finished.connect(_finished)
+        dlg.show()
+        return
+    except Exception as e:
+        print(f"[ankisstant] practice_questions LibraryDialog hook failed: {e}")
+    # Fallback: launch via the addon's own entry point (no session prompt).
     try:
         from practice_questions.library import show_library  # type: ignore
         show_library()

@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.7.2
+
+### Changed
+- **Open Browser** now prompts for a question count on close and logs the
+  session, just like the configured QBanks.
+- **Practice Questions** launched from the QBank panel now also prompts for a
+  question count on close and logs it under the Practice Qs platform. (The
+  Practice Questions addon is still optional — this is a soft hook that no-ops
+  if it isn't installed.)
+
 ## 1.7.1
 
 ### Added
