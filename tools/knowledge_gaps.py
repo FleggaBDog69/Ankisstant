@@ -27,7 +27,7 @@ from aqt.qt import (
 from aqt.utils import askUser, showWarning, tooltip
 
 from ..core import anki_utils
-from ..core.config import active_family, tool_config, tool_model
+from ..core.config import active_family, tool_config, tool_model_for
 from ..core.qt_utils import (
     attach_tag_completer, make_help_button, make_setup_banner,
     provider_configured, run_claude_json, set_ai_buttons_enabled,
@@ -73,14 +73,16 @@ def _load_types() -> list[dict]:
             "description": str(t.get("description", "") or ""),
         })
     if not cleaned:
-        cleaned = [
-            {"key": "mq", "name": "MQ", "color": "#b45309",
-             "description": "Missed question."},
-            {"key": "kg", "name": "KG", "color": "#6b7280",
-             "description": "Knowledge gap."},
-            {"key": "lo", "name": "LO", "color": "#9333ea",
-             "description": "Learning objective."},
-        ]
+        # Single source of truth: fall back to the config DEFAULTS type list
+        # (with its full field schema) rather than a second hardcoded copy.
+        from ..core.config import DEFAULTS
+        for t in DEFAULTS["tools"]["knowledge_gaps"]["types"]:
+            cleaned.append({
+                "key":         str(t.get("key", "")),
+                "name":        str(t.get("name", "")),
+                "color":       str(t.get("color", "") or "#6b7280"),
+                "description": str(t.get("description", "") or ""),
+            })
     return cleaned
 
 
@@ -477,7 +479,7 @@ class _LOAnalyserSection(QGroupBox):
         self._status.setText(
             f"Asking AI what's missing from {len(fronts)} card(s) under '{tag}'…"
         )
-        model = tool_model(cfg, "model", active_family())
+        model = tool_model_for("gap_analysis")
         gaps = run_claude_json(
             self._analyse_btn, "Analysing…",
             prompt=user_msg, system=system, max_tokens=1024, model=model,

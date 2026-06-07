@@ -125,6 +125,81 @@ skill's rules from `~/.claude/skills/<name>/SKILL.md` beneath the block above.
 
 ---
 
+## Installing a card-creation *skill* (Claude Code CLI / Anthropic API)
+
+If you use the **Claude Code CLI** (or the Anthropic API) rather than paste, you
+can put the card rules in a **skill** instead of sending them inline with every
+request. The skill's instructions live on disk (CLI) or server-side (API), so
+each card request is shorter and **cheaper per token** — you send the gap, not
+the rulebook. In Ankisstant a notetype profile then chooses **"Use a skill"**
+(Settings → AI Create → edit a notetype → *Card creation uses: Use a skill*),
+and the tool's default skill is set in **Settings → AI → Card creation skill**.
+
+### CLI path (subscription, no API key)
+
+1. Create the folder `~/.claude/skills/anki-cards/`.
+2. Save the block below as `~/.claude/skills/anki-cards/SKILL.md`.
+3. In the notetype profile, set **Card creation uses → Use a skill**, and the
+   **Card creation skill (CLI)** field to either `/anki-cards` or
+   `Use the anki-cards skill` (the plain-English form is the most reliable).
+   Or set it once for the whole tool in **Settings → AI → Card creation skill**.
+
+```markdown
+---
+name: anki-cards
+description: Use when turning a clinical knowledge gap, missed question, or topic into high-yield Anki cloze cards for a Year 3 Australian medical student. Triggers on "make cards", "anki cards", "cloze", or a pasted knowledge gap.
+---
+
+# Anki cloze cards — Year 3 AU med
+
+You turn ONE clinical knowledge gap into high-yield Anki cloze cards plus a
+classification tag. Do not ask follow-up questions — the reply is consumed by an
+Anki addon, not a person.
+
+## Output
+Return ONE JSON object and NOTHING else — no markdown fences, no preamble. The
+first character is `{`, the last is `}`. Shape:
+
+    {"tags": {"system": "...", "subsystem": "...", "topic": "..."},
+     "mq_explanation": "...",
+     "cards": [{"front": "...", "extra": "..."}, ...]}
+
+- `mq_explanation`: only for a missed question — 1–3 plain sentences on the
+  mechanism/principle missed (the WHY/HOW), not a restatement. Use "" otherwise.
+
+## Card rules
+- MINIMUM INFORMATION: one atomic fact per card; split anything testing two things.
+- CONCISION: cut every word that doesn't change meaning.
+- CLOZE: standard `{{c1::answer}}` syntax, answers 1–4 words. Multiple clozes only
+  when facts are tightly coupled; otherwise split into sibling cards.
+- RETRIEVAL FORCE: the visible cue must make the student RECALL via a mechanism,
+  presentation, contrast, cause, or consequence — never restate the answer's label,
+  and the cloze answer must not appear as a substring of the visible cue.
+- NO ENUMERATIONS on one card; pick the 1–2 highest-yield items or split.
+- FORMATTING: only `<b>` and `<u>` in fields. No other HTML.
+- EXTRA: clinical "so what" / mnemonic; never repeat the front; "" if nothing to add.
+- LEVEL: Year 3 Australian med student; Australian drugs/guidelines (eTG, RACGP).
+
+## Tags
+- system: Cardio, Neuro, Endo, GI, Resp, Renal, Heme, MSK, Derm, Repro, Psych, ID,
+  Onc, Pharm, Stats, Genetics, Biochem, Immuno. Single best fit.
+- subsystem: more specific category (Arrhythmias, Stroke, Diabetes, …).
+- topic: most specific entity/drug/sign (AFib, Digoxin, McDonald_criteria, …).
+- PascalCase or snake_case only; no spaces/`::`/slashes. Use "" if genuinely unclear.
+```
+
+### API path (Anthropic key)
+
+Upload the same skill to Anthropic (skills beta), copy its `skill_…` ID, and paste
+it into **Settings → AI → Card creation skill** (the field shows the Anthropic
+channel when the provider is Anthropic) or the notetype's **Card creation skill
+(API)** field. The addon forces the API path automatically when a skill ID is set.
+
+> Skills are Anthropic-only. On Gemini/OpenAI/Ollama the skill cell is greyed out
+> and the inline prompt is used instead — nothing breaks, it just isn't cheaper.
+
+---
+
 ## The pure-gaps importer (no cards, no AI)
 
 Separate from the above: to log gaps without making cards, use Knowledge Gaps →

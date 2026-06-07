@@ -48,6 +48,20 @@ PROVIDER_OF: dict[str, str] = {
 _FAST_MODELS:  dict[str, str] = {"anthropic": "claude-haiku-4-5-20251001", "gemini": "gemini-2.5-flash", "openai": "gpt-4o-mini", "ollama": "llama3.1"}
 _SMART_MODELS: dict[str, str] = {"anthropic": "claude-sonnet-4-6",          "gemini": "gemini-2.5-flash", "openai": "gpt-4o",      "ollama": "llama3.1"}
 
+# ── AI tool matrix ──────────────────────────────────────────────────────────────
+# The canonical list of AI "tools" surfaced in the consolidated per-AI matrix on
+# the Settings → AI page. Each tool has one model (and, for skill-capable tools, a
+# skill) per provider family. This is the SINGLE place model choices live; the old
+# scattered per-tool model keys (qbank.search_model, browse.model, …) survive only
+# as optional per-tool OVERRIDES, read when their `<field>_override` flag is set.
+# `tier` is the default suggestion ("fast" = cheap/search, "smart" = generation).
+_AI_TOOLS: list[dict] = [
+    {"key": "card_creation", "label": "Card creation",  "skills": True,  "tier": "smart"},
+    {"key": "search",        "label": "Search / Browse", "skills": False, "tier": "smart"},
+    {"key": "gap_analysis",  "label": "Gap analysis",    "skills": False, "tier": "smart"},
+    {"key": "quality_pass",  "label": "Quality pass",    "skills": True,  "tier": "fast"},
+]
+
 DEFAULTS: dict = {
     "schema_version": 1,
     "migrated_v1": False,
@@ -70,6 +84,33 @@ DEFAULTS: dict = {
     "provider": "auto",
     # Default model per provider family, used when a tool passes no explicit model.
     "model_defaults": dict(_FAST_MODELS),
+    # Consolidated AI tool matrix (Settings → AI). The single source of truth for
+    # which model (and skill) each AI tool uses, per provider family. Seeded from
+    # the legacy per-tool model keys by _migrate_ai_matrix; thereafter the tool tabs
+    # only override via their `<field>_override` flags. `skill` holds the family-
+    # specific channel: `anthropic` = an Anthropic skill_id, `cli` = a CLI skill
+    # invocation (e.g. "/malleus-anki"); other families ignore skills.
+    "ai_matrix": {
+        "card_creation": {"model": dict(_SMART_MODELS), "skill": {"anthropic": "", "cli": ""}},
+        "search":        {"model": dict(_SMART_MODELS)},
+        "gap_analysis":  {"model": dict(_SMART_MODELS)},
+        "quality_pass":  {"model": dict(_FAST_MODELS),  "skill": {"anthropic": "", "cli": ""}},
+    },
+    # One-time seed of ai_matrix from the legacy scattered model keys. Flips True
+    # after the first run so later AI-tab edits aren't clobbered by re-seeding.
+    "ai_matrix_migrated": False,
+    # Per-skill settings keyed by skill name (the bundled catalog skills:
+    # anki-cards, anki-card-scorer, anki-browse). Currently just an optional
+    # Anthropic custom skill_id for users who upload the skill to the Anthropic
+    # API and want native by-id invocation. e.g. {"anki-cards": {"anthropic_skill_id": "skill_…"}}
+    "skills": {},
+    # Manual / paste provider: prebuilt "Ankisstant" assistants that bundle the
+    # create/grade/browse instructions, so paste users send only the variable
+    # content, never the full instructions. Shipped public links → every user gets
+    # the "Open assistant" buttons. (Claude.ai has no shareable assistant link, so
+    # web-Claude users copy the bundled Project instructions instead.)
+    "manual_gpt_url": "https://chatgpt.com/g/g-6a258981479481918a8685bac4bae37c-ankisstant-custom-gpt",
+    "manual_gem_url": "https://gemini.google.com/gem/1KPTwuU2mgZWmD7dDL5OiRN94CMTlGkkr?usp=sharing",
     # When on, every card created (Create) or unsuspended/tagged (Browse) also
     # gets a month tag "<prefix>::<YYYY-MM>" so cards carry a sense of when
     # they entered your rotation. The prefix is user-configurable.
@@ -80,6 +121,12 @@ DEFAULTS: dict = {
         "qbank": {
             "enabled": True,
             "show_heatmap": True,
+            # Weakness dashboard — aggregates captured missed questions (the MQ
+            # KGs in kg_queue.json) by System/Subsystem/Topic inside the QBank
+            # panel. weakness_window_days: 0 = all time.
+            "show_weakness": True,
+            "weakness_window_days": 30,
+            "weakness_top_n": 8,
             "platforms": [
                 {"key": "osmosis",     "name": "Osmosis",     "url": "https://www.osmosis.org/"},
                 {"key": "emedici",     "name": "eMedici",     "url": "https://app.emedici.com"},
@@ -179,9 +226,27 @@ DEFAULTS: dict = {
                     "auto_tag": True,
                     "fields": [
                         {"key": "concept",   "label": "Concept missed",  "kind": "text",
-                         "placeholder": "e.g. digoxin toxicity worsened by hypokalaemia"},
+                         "placeholder": "e.g. digoxin toxicity worsened by hypokalaemia",
+                         "source": "capture", "surfaces": ["mq_capture", "home", "add_kg"],
+                         "flows": ["create", "browse"],
+                         "anki_target": {"kind": "role", "role": "missed_q", "position": 0, "mode": "append"}},
+                        # AI-written teaching explanation of the missed concept,
+                        # produced in the SAME generation call (see tools/kg/engine.py)
+                        # and composed into the Missed Questions field above the stem.
+                        {"key": "explanation", "label": "Explanation (AI)", "kind": "longtext",
+                         "placeholder": "Filled by the AI — the mechanism behind the missed concept",
+                         "source": "ai", "flows": ["create", "browse"], "cardinality": "note",
+                         "ai_refs": ["concept", "stem_html"],
+                         "ai_prompt": ("a brief teaching explanation (1-3 plain sentences) of the "
+                                       "specific concept the student missed — explain the underlying "
+                                       "mechanism or principle (the WHY/HOW), not just a restatement; "
+                                       "be factually careful and don't invent specifics; pitch it at a "
+                                       "Year 3 Australian medical student; plain prose, no markdown"),
+                         "anki_target": {"kind": "role", "role": "missed_q", "position": 1, "mode": "append"}},
                         {"key": "stem_html", "label": "Question stem",   "kind": "html",
-                         "placeholder": "Paste text or a screenshot (Cmd/Ctrl+V)"},
+                         "placeholder": "Paste text or a screenshot (Cmd/Ctrl+V)",
+                         "source": "capture", "surfaces": ["mq_capture"],
+                         "anki_target": {"kind": "role", "role": "missed_q", "position": 2, "mode": "append"}},
                         {"key": "system",    "label": "System",          "kind": "text",
                          "placeholder": "e.g. Cardio"},
                         {"key": "subsystem", "label": "Subsystem",       "kind": "text",
@@ -189,9 +254,13 @@ DEFAULTS: dict = {
                         {"key": "topic",     "label": "Topic",           "kind": "text",
                          "placeholder": "e.g. Digoxin"},
                         {"key": "platform",  "label": "QBank source",    "kind": "text",
-                         "placeholder": "e.g. AMBOSS, eMedici"},
+                         "placeholder": "e.g. AMBOSS, eMedici",
+                         # Auto-filled from the QBank source on capture, so it's not
+                         # an input on the capture popup — only on Home / Add-KG.
+                         "source": "capture", "surfaces": ["home", "add_kg"]},
                         {"key": "notes",     "label": "Notes",           "kind": "longtext",
-                         "placeholder": "Optional context, mnemonic, why you got it wrong"},
+                         "placeholder": "Optional context, mnemonic, why you got it wrong",
+                         "source": "capture", "surfaces": ["home", "add_kg"]},
                     ],
                 },
                 {
@@ -224,6 +293,7 @@ DEFAULTS: dict = {
             "default_deck": "",
             "default_notetype": "",
             "default_tags": [],
+            "auto_tag": True,
             "audit_tag": "Ankisstant::AI::Creator",
             "default_n_cards": 10,
             "gap_n_cards": 3,
@@ -238,6 +308,39 @@ DEFAULTS: dict = {
             # profile on migration; new installs start with an empty list.
             "notetypes": [],
             "selected_notetype": "",
+            # Background generation: when on, Generate enqueues a background job
+            # (the user keeps using Anki) and finished cards land in a persistent
+            # "ready to review" queue. Off restores the old modal generate→review.
+            "background_generation": True,
+            "max_parallel_jobs": 2,
+            # Card Quality Pass: score generated cards against a rubric before
+            # the review screen and act on the verdict (pass / flag / regenerate).
+            # See tools/quality_pass.py. Off by default — opt-in.
+            "quality_pass": {
+                "enabled": False,                   # global master toggle
+                # "separate_call" = one batch grade call after generation (can use
+                #   a different/cheaper grader model); "same_call" = fold the grade
+                #   into the generation call itself (self-grade, no extra round-trip).
+                "grading_mode": "separate_call",
+                # "flag_only" = chip + pre-fill the regen hint; "auto_regenerate" =
+                #   silently regenerate failures (re-grading each attempt) up to
+                #   auto_regen_max_retries before surfacing the best attempt flagged.
+                "verdict_action": "flag_only",
+                "auto_regen_max_retries": 2,
+                # Auto-regen is suppressed for the manual/paste provider unless this
+                # is on, since each retry is another copy/paste round-trip.
+                "auto_regen_in_manual": False,
+                # On Anthropic (auto/cli/anthropic), invoke the anki-card-scorer
+                # skill instead of inlining the rubric, to save tokens. The bundled
+                # inline rubric is always the fallback so grading works on every
+                # provider (gemini/openai/ollama/manual).
+                "prefer_skill": True,
+                "grader_skill_invocation": "Use the anki-card-scorer skill",
+                "grader_skill_id": "",
+                # Per-family grader model. Grading is lighter than generation, so
+                # this defaults to the cheaper "fast" models.
+                "grader_model": dict(_FAST_MODELS),
+            },
         },
     },
 }
@@ -271,6 +374,7 @@ def load_config() -> dict:
     _migrate_provider_schema(cfg)
     _migrate_creator_notetypes(cfg)
     _migrate_auto_tag_scheme(cfg)
+    _migrate_ai_matrix(cfg)
     _migrate_dead_gemini_models(cfg)
     return cfg
 
@@ -317,6 +421,64 @@ def _migrate_provider_schema(cfg: dict) -> None:
             t["model"] = _as_model_dict(t.get("model"), _SMART_MODELS)
 
 
+def _migrate_ai_matrix(cfg: dict) -> None:
+    """Seed the consolidated `ai_matrix` from the legacy scattered per-tool model
+    keys, ONCE (guarded by `ai_matrix_migrated`). Mirrors _migrate_provider_schema.
+
+    Each matrix tool takes its model from a PRIMARY legacy slot:
+        card_creation ← card_creator.model
+        search        ← browse.model
+        gap_analysis  ← gap_analyser.model
+        quality_pass  ← card_creator.quality_pass.grader_model
+    SECONDARY slots that drive the same tool (qbank.search_model → search,
+    qbank.card_gen_model → card_creation) are preserved exactly: if a secondary's
+    stored model differs from the seeded matrix value for any family, its
+    `<field>_override` flag is switched on so the tool keeps reading its own value.
+    This makes the consolidation behaviour-preserving — nothing silently resets.
+
+    Assumes _migrate_provider_schema already ran (legacy string models are now
+    {family: id} dicts)."""
+    if cfg.get("ai_matrix_migrated"):
+        return
+    tools = cfg.get("tools", {}) or {}
+    matrix = cfg.setdefault("ai_matrix", {})
+
+    def seed(tool_key: str, holder: dict | None, field: str, fallback: dict) -> dict:
+        seeded = _as_model_dict((holder or {}).get(field), fallback)
+        matrix.setdefault(tool_key, {})["model"] = seeded
+        return seeded
+
+    cc = tools.get("card_creator") if isinstance(tools.get("card_creator"), dict) else {}
+    br = tools.get("browse") if isinstance(tools.get("browse"), dict) else {}
+    ga = tools.get("gap_analyser") if isinstance(tools.get("gap_analyser"), dict) else {}
+    qb = tools.get("qbank") if isinstance(tools.get("qbank"), dict) else {}
+    qp = cc.get("quality_pass") if isinstance(cc.get("quality_pass"), dict) else {}
+
+    card_seed   = seed("card_creation", cc, "model",        _SMART_MODELS)
+    search_seed = seed("search",        br, "model",        _SMART_MODELS)
+    seed("gap_analysis", ga, "model", _SMART_MODELS)
+    seed("quality_pass", qp, "grader_model", _FAST_MODELS)
+
+    # Seed the card-creation skill default from the legacy qbank card_skill_id.
+    legacy_skill = (qb.get("card_skill_id") or "").strip() if isinstance(qb, dict) else ""
+    if legacy_skill:
+        matrix.setdefault("card_creation", {}).setdefault("skill", {})["anthropic"] = legacy_skill
+
+    def preserve_override(holder: dict | None, field: str, seeded: dict, default: dict) -> None:
+        """Turn on `<field>_override` when the holder's stored model differs from the
+        matrix seed for any family, so the tool keeps its own model post-consolidation."""
+        if not isinstance(holder, dict):
+            return
+        own = _as_model_dict(holder.get(field), default)
+        if any(own.get(fam) != seeded.get(fam) for fam in own):
+            holder[field + "_override"] = True
+
+    preserve_override(qb, "search_model",   search_seed, _FAST_MODELS)
+    preserve_override(qb, "card_gen_model", card_seed,   _SMART_MODELS)
+
+    cfg["ai_matrix_migrated"] = True
+
+
 def _migrate_dead_gemini_models(cfg: dict) -> bool:
     """Rewrite stored Gemini model IDs that don't work on the free tier.
 
@@ -360,6 +522,9 @@ def _migrate_dead_gemini_models(cfg: dict) -> bool:
         t = tools.get(tool_key)
         if isinstance(t, dict):
             fix(t, "model")
+    cc = tools.get("card_creator")
+    if isinstance(cc, dict) and isinstance(cc.get("quality_pass"), dict):
+        fix(cc["quality_pass"], "grader_model")
 
     if not pro_done:
         cfg["gemini_freetier_migrated"] = True
@@ -464,6 +629,43 @@ def tool_model(tool_cfg: dict, field: str, family: str) -> str | None:
     return None
 
 
+def ai_tools() -> list[dict]:
+    """The canonical AI tool list for the consolidated matrix (Settings → AI)."""
+    return [dict(t) for t in _AI_TOOLS]
+
+
+def skill_anthropic_id(name: str, cfg: dict | None = None) -> str:
+    """The optional Anthropic custom skill_id the user pasted for bundled skill
+    `name` (for native by-id invocation on the Anthropic API). '' when unset."""
+    cfg = cfg if cfg is not None else load_config()
+    return str(((cfg.get("skills") or {}).get(name) or {}).get("anthropic_skill_id", "") or "")
+
+
+def tool_model_for(tool_key: str, family: str | None = None, *,
+                   cfg: dict | None = None,
+                   override_cfg: dict | None = None,
+                   override_field: str | None = None) -> str | None:
+    """Resolve the model for an AI matrix tool, in order:
+        1. per-tool OVERRIDE — `override_cfg[override_field]` when the tool has
+           `override_cfg[override_field + "_override"]` truthy (hybrid: a tool tab
+           may pin its own model);
+        2. the consolidated `ai_matrix[tool_key].model` for the family;
+        3. the family default (default_model_for).
+    `family` defaults to the active provider's family. `cfg` is the full config
+    (loaded if absent); `override_cfg` is the tool's own config slice."""
+    cfg = cfg if cfg is not None else load_config()
+    family = family or active_family(cfg)
+    if override_cfg is not None and override_field and override_cfg.get(override_field + "_override"):
+        m = tool_model(override_cfg, override_field, family)
+        if m:
+            return m
+    matrix = (cfg.get("ai_matrix") or {}).get(tool_key) or {}
+    m = tool_model(matrix, "model", family)
+    if m:
+        return m
+    return default_model_for(family, cfg)
+
+
 _DEFAULT_TAG_TEMPLATE = "{base}::{type}::{system}::{subsystem}::{topic}"
 
 
@@ -507,6 +709,15 @@ def auto_tag_base() -> str:
         return (tool_config("knowledge_gaps").get("auto_tag_base") or "").strip()
     except Exception:
         return ""
+
+
+def quality_pass_cfg() -> dict:
+    """The card-creator quality-pass config slice (toggle, mode, action, grader
+    model/skill). Returns {} if unset. See tools/quality_pass.py."""
+    try:
+        return tool_config("card_creator").get("quality_pass", {}) or {}
+    except Exception:
+        return {}
 
 
 def mq_explain_enabled() -> bool:

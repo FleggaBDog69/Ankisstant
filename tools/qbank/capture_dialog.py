@@ -9,11 +9,61 @@ import re
 from aqt import mw
 from aqt.qt import (
     QBuffer, QDialog, QHBoxLayout, QImage, QIODevice, QKeySequence, QLabel,
-    QLineEdit, QPushButton, QShortcut, Qt, QTextEdit, QUrl, QVBoxLayout,
+    QLineEdit, QPlainTextEdit, QPushButton, QShortcut, Qt, QTextEdit, QUrl,
+    QVBoxLayout,
 )
 
 from ...core.config import tool_config, save_tool_config
+from ...core.qt_utils import attach_tag_completer
 from ..kg import store as kg_store
+from ..kg import engine
+
+
+def _capture_type_meta(type_key: str) -> dict | None:
+    """The KG type definition (with its field schema) for `type_key`."""
+    try:
+        for t in tool_config("knowledge_gaps").get("types") or []:
+            if isinstance(t, dict) and str(t.get("key", "")).lower() == type_key:
+                return t
+    except Exception:
+        pass
+    return None
+
+
+def _capture_widget(spec: dict, prefill: dict):
+    """(widget, getter, setter) for one capture field spec — reusing the
+    screenshot-aware _StemEdit for html fields. Single-line text fields are
+    prefilled from `prefill` (the user's last-used system/subsystem/topic)."""
+    kind = spec.get("kind", "text")
+    ph = spec.get("placeholder", "")
+    key = spec.get("key", "")
+    if kind == "html":
+        w = _StemEdit()
+        w.setAcceptRichText(True)
+        w.setPlaceholderText(ph or "Paste text or a screenshot (Cmd/Ctrl+V)…")
+        w.setMinimumHeight(140)
+        return w, (lambda: "" if w.is_empty() else w.get_html()), \
+                  (lambda v: w.setHtml(v) if v else w.clear())
+    if kind == "longtext":
+        w = QPlainTextEdit()
+        w.setPlaceholderText(ph)
+        w.setMinimumHeight(60)
+        return w, (lambda: w.toPlainText().strip()), \
+                  (lambda v: w.setPlainText(str(v or "")))
+    if kind == "tag":
+        w = QLineEdit()
+        w.setPlaceholderText(ph or "School::Year3::…")
+        try:
+            attach_tag_completer(w, multi=False)
+        except Exception:
+            pass
+        return w, (lambda: w.text().strip()), (lambda v: w.setText(str(v or "")))
+    # text / url — single line, prefilled if it's a remembered level
+    w = QLineEdit()
+    w.setPlaceholderText(ph)
+    if prefill.get(key):
+        w.setText(prefill[key])
+    return w, (lambda: w.text().strip()), (lambda v: w.setText(str(v or "")))
 
 
 # Webviews whose zoom we tweak while the capture popup is open. We restore
@@ -162,50 +212,50 @@ class CaptureDialog(QDialog):
             src.setStyleSheet("color: gray; font-size: 11px;")
             layout.addWidget(src)
 
-        layout.addWidget(QLabel("<b>Specific concept missed</b>"))
-        self._concept = QLineEdit()
-        self._concept.setPlaceholderText("e.g. digoxin toxicity is worsened by hypokalaemia")
-        layout.addWidget(self._concept)
-
-        layout.addWidget(QLabel("<b>System / Subsystem / Topic</b>"))
-        levels_row = QHBoxLayout()
-        self._system = QLineEdit(last_system)
-        self._system.setPlaceholderText("System (e.g. Cardio)")
-        self._subsystem = QLineEdit(last_subsystem)
-        self._subsystem.setPlaceholderText("Subsystem (e.g. Arrhythmia)")
-        self._topic = QLineEdit(last_topic)
-        self._topic.setPlaceholderText("Topic (e.g. Digoxin)")
-        levels_row.addWidget(self._system)
-        levels_row.addWidget(self._subsystem)
-        levels_row.addWidget(self._topic)
-        layout.addLayout(levels_row)
+        # Render the capture inputs from the active KG type's schema — the fields
+        # whose source includes capture and that opt into the mq_capture surface
+        # (set per field in Settings → Knowledge Gaps). The QBank popup always
+        # captures a missed question, so the type is "mq". This makes the popup
+        # follow the user's field configuration instead of a hardcoded form.
+        self._type_key = "mq"
+        type_meta = _capture_type_meta(self._type_key)
+        prefill = {"system": last_system, "subsystem": last_subsystem, "topic": last_topic}
+        self._field_getters: dict = {}   # key -> getter
+        self._has_stem = False
+        first_input = None
+        specs = engine.capture_fields(type_meta, "mq_capture")
+        for spec in specs:
+            key = spec["key"]
+            label = spec.get("label") or key
+            w, getter, _setter = _capture_widget(spec, prefill)
+            if spec["kind"] == "html":
+                row = QHBoxLayout()
+                row.addWidget(QLabel(f"<b>{label}</b>"))
+                row.addStretch()
+                pbtn = QPushButton("Paste from clipboard")
+                pbtn.setStyleSheet("font-size: 11px; padding: 2px 8px;")
+                pbtn.clicked.connect(lambda _c=False, ww=w: (ww.setFocus(), ww.paste()))
+                row.addWidget(pbtn)
+                layout.addLayout(row)
+                layout.addWidget(w)
+                self._has_stem = True
+            else:
+                layout.addWidget(QLabel(f"<b>{label}</b>"))
+                layout.addWidget(w)
+            self._field_getters[key] = getter
+            if first_input is None:
+                first_input = w
 
         levels_hint = QLabel(
             "<span style='color:gray;font-size:10px'>"
-            "Saved with the missed question — used to build the tag later when "
-            "you make a card.</span>"
+            "Saved with the missed question — system/subsystem/topic build the tag "
+            "later when you make a card. Screenshots in the stem are saved to Anki's "
+            "media folder automatically.</span>"
         )
         levels_hint.setTextFormat(Qt.TextFormat.RichText)
+        levels_hint.setWordWrap(True)
         layout.addWidget(levels_hint)
-
-        stem_row = QHBoxLayout()
-        stem_row.addWidget(QLabel("<b>Question stem</b>"))
-        stem_row.addStretch()
-        paste_btn = QPushButton("Paste from clipboard")
-        paste_btn.setStyleSheet("font-size: 11px; padding: 2px 8px;")
-        paste_btn.clicked.connect(self._paste)
-        stem_row.addWidget(paste_btn)
-        layout.addLayout(stem_row)
-
-        self._stem = _StemEdit()
-        self._stem.setAcceptRichText(True)
-        self._stem.setPlaceholderText("Paste text or a screenshot (Cmd/Ctrl+V)…")
-        self._stem.setMinimumHeight(140)
-        layout.addWidget(self._stem)
-
-        img_hint = QLabel("Screenshots work — they're saved to Anki's media folder automatically.")
-        img_hint.setStyleSheet("color: gray; font-size: 10px;")
-        layout.addWidget(img_hint)
+        self._first_input = first_input
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()
@@ -222,7 +272,8 @@ class CaptureDialog(QDialog):
         QShortcut(QKeySequence("Ctrl+Return"), self, self._save)
         QShortcut(QKeySequence("Meta+Return"), self, self._save)
 
-        self._concept.setFocus()
+        if self._first_input is not None:
+            self._first_input.setFocus()
 
     # ── window placement ───────────────────────────────────────────────
     # Open at the bottom-right of the active Anki window so the popup
@@ -280,16 +331,21 @@ class CaptureDialog(QDialog):
         self._restore_zoom()
         super().reject()
 
-    def _paste(self) -> None:
-        self._stem.setFocus()
-        self._stem.paste()
-
     def _save(self) -> None:
-        concept   = self._concept.text().strip()
-        system    = self._system.text().strip()
-        subsystem = self._subsystem.text().strip()
-        topic     = self._topic.text().strip()
-        stem      = "" if self._stem.is_empty() else self._stem.get_html()
+        # Collect every rendered schema field, then add the auto-filled platform.
+        fields: dict = {}
+        for key, getter in self._field_getters.items():
+            try:
+                fields[key] = getter()
+            except Exception:
+                fields[key] = ""
+        fields["platform"] = self._platform_key
+        fields.setdefault("notes", "")
+        concept = str(fields.get("concept", "")).strip()
+        stem = str(fields.get("stem_html", "")).strip()
+        system = str(fields.get("system", "")).strip()
+        subsystem = str(fields.get("subsystem", "")).strip()
+        topic = str(fields.get("topic", "")).strip()
         if not concept and not stem:
             return
         # Title defaults to concept; falls back to first ~60 chars of stem plaintext.
@@ -302,17 +358,9 @@ class CaptureDialog(QDialog):
         kg_store.add(
             title=title,
             source="qbank",
-            type="mq",
+            type=self._type_key,
             status="open",
-            fields={
-                "concept":   concept,
-                "stem_html": stem,
-                "system":    system,
-                "subsystem": subsystem,
-                "topic":     topic,
-                "platform":  self._platform_key,
-                "notes":     "",
-            },
+            fields=fields,
         )
         # Tell any open KG panel to refresh.
         try:

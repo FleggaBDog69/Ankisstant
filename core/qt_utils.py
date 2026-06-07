@@ -155,17 +155,35 @@ def manual_ai_complete(prompt: str, system: str = "",
     if cancelled."""
     combined = ((f"[SYSTEM INSTRUCTIONS]\n{system.strip()}\n\n" if system and system.strip() else "")
                 + f"[YOUR TASK]\n{prompt.strip()}")
+    # Task-only payload for users who run the prebuilt Ankisstant Custom GPT / Gem:
+    # the instructions already live in the GPT, so they paste just the task.
+    task_only = prompt.strip()
+
+    from .config import load_config as _load_cfg, DEFAULTS as _DEF
+    _mcfg = _load_cfg()
+    # `or _DEF[...]` so a stale empty saved value doesn't shadow the shipped link.
+    gpt_url = (_mcfg.get("manual_gpt_url") or _DEF.get("manual_gpt_url") or "").strip()
+    gem_url = (_mcfg.get("manual_gem_url") or _DEF.get("manual_gem_url") or "").strip()
+    has_assistant = bool(gpt_url or gem_url)
 
     dlg = QDialog(parent or mw)
     dlg.setWindowTitle("Run this in your AI")
     dlg.setMinimumSize(640, 600)
     v = QVBoxLayout(dlg)
 
-    intro = QLabel(
-        "<b>Step 1.</b> Copy the prompt below and paste it into any AI "
-        "(ChatGPT, Gemini, Claude.ai — the free versions all work).<br>"
-        "<b>Step 2.</b> Paste the AI's full reply into the bottom box and click OK."
-    )
+    if has_assistant:
+        intro = QLabel(
+            "<b>Easiest:</b> open the <b>Ankisstant</b> assistant below — it already "
+            "knows the instructions, so just <b>Copy task only</b>, paste it in, and "
+            "paste the reply back here.<br>"
+            "<small>Or use any AI with the full prompt (Copy prompt).</small>"
+        )
+    else:
+        intro = QLabel(
+            "<b>Step 1.</b> Copy the prompt below and paste it into any AI "
+            "(ChatGPT, Gemini, Claude.ai — the free versions all work).<br>"
+            "<b>Step 2.</b> Paste the AI's full reply into the bottom box and click OK."
+        )
     intro.setTextFormat(Qt.TextFormat.RichText)
     intro.setWordWrap(True)
     v.addWidget(intro)
@@ -200,6 +218,31 @@ def manual_ai_complete(prompt: str, system: str = "",
 
     copy_btn.clicked.connect(_copy)
     copy_row.addWidget(copy_btn)
+
+    if has_assistant:
+        from aqt.utils import openLink
+
+        task_btn = QPushButton("📋 Copy task only")
+        task_btn.setAutoDefault(False)
+
+        def _copy_task():
+            QApplication.clipboard().setText(task_only)
+            tooltip("Task copied — paste it into the Ankisstant assistant.", period=2500)
+
+        task_btn.clicked.connect(_copy_task)
+        copy_row.addWidget(task_btn)
+
+        if gpt_url:
+            gpt_btn = QPushButton("↗ Open Ankisstant GPT")
+            gpt_btn.setAutoDefault(False)
+            gpt_btn.clicked.connect(lambda: openLink(gpt_url))
+            copy_row.addWidget(gpt_btn)
+        if gem_url:
+            gem_btn = QPushButton("↗ Open Gemini Gem")
+            gem_btn.setAutoDefault(False)
+            gem_btn.clicked.connect(lambda: openLink(gem_url))
+            copy_row.addWidget(gem_btn)
+
     copy_row.addStretch(1)
     v.addLayout(copy_row)
 

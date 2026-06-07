@@ -17,23 +17,27 @@ from datetime import datetime as _dt
 
 from aqt import mw, gui_hooks
 from aqt.qt import (
-    QApplication, QButtonGroup, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
-    QFrame, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QPlainTextEdit, QPushButton, QRadioButton, QScrollArea,
-    QSpinBox, Qt, QTimer, QVBoxLayout, QWidget,
+    QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QFileDialog, QFrame, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QPlainTextEdit, QPushButton, QRadioButton,
+    QScrollArea, QSpinBox, Qt, QTimer, QVBoxLayout, QWidget,
 )
 from aqt.utils import askUser, showWarning, tooltip
 
+from . import autotag
+from . import quality_pass as qp
 from ..core import anki_utils, api as core_api, log
 from ..core.config import (
-    active_family, auto_tag_base, format_hierarchical_tag, load_config, month_tag,
-    mq_explain_enabled, tool_config, tool_model, save_tool_config,
+    active_family, auto_tag_base, kg_type_info,
+    load_config, month_tag, mq_explain_enabled, tool_config, tool_model_for,
+    save_tool_config,
 )
 from ..core.qt_utils import (
     attach_tag_completer, is_manual_provider, loading, make_help_button,
     make_setup_banner, provider_configured, run_claude_json,
     set_ai_buttons_enabled,
 )
+from .kg import engine
 
 
 NAME = "AI Create"
@@ -46,31 +50,99 @@ CARD_GEN_SYSTEM = """You generate high-yield Anki cloze cards for a Year 3 Austr
 OUTPUT FORMAT
 Return ONLY a JSON array. Each element:
   {"front": "<cloze text with {{c1::...}} / {{c2::...}} etc>",
-   "extra": "<supporting clinical context, mnemonics, why-it-matters>"}
+   "extra": "<the clinical 'so what' or mechanism — do NOT repeat the front>"}
+No prose outside the JSON array. No markdown fences.
 
-CARD RULES (derived from Wozniak's 20 Rules / Med School Insiders best practices)
-- MINIMUM INFORMATION PRINCIPLE: one atomic fact per card. If a card tests more than one thing, split it. Simple cards are easier to review, easier to schedule, and don't fail-cascade.
-- CONCISION: ruthless. Cut every word that doesn't change the meaning. No filler ("important to know that…", "remember that…"). At hundreds of reviews/day, every extra word costs.
-- Use standard Anki cloze syntax: {{c1::answer}}, {{c2::answer}}.
-  - Prefer SHORT cloze answers (1–4 words). Long clozed phrases are hard to grade honestly.
-  - Multiple clozes per card are fine ONLY if they test tightly-coupled facts (e.g. drug + class + mechanism). Otherwise split into separate cards.
-- CLOZE NUMBERING — read carefully, this is commonly done wrong:
-  - When ONE card front has several deletions that should be tested SEPARATELY (each hidden on its own sibling card), you MUST number them sequentially: {{c1::…}}, {{c2::…}}, {{c3::…}}. Do NOT label them all {{c1::…}}.
-  - Give two deletions the SAME number (e.g. {{c1::A}} … {{c1::B}}) ONLY when they are meant to be revealed together as a single card.
-  - Reusing {{c1::…}} for every deletion on a card — when they're actually separate facts — is WRONG: it collapses everything into one card. If in doubt, number them c1, c2, c3, ….
-- AVOID ENUMERATIONS / SETS: never make a single card with "list the 5 causes of X". Either pick the 1–2 highest-yield items per card, or use overlapping/sequential clozes.
-- LEVEL: Year 3 Australian medical student. Australian drug names and guidelines (e.g. eTG, RACGP) preferred when relevant.
-- FORMATTING: <b> for high-yield terms, <u> for underline. No other HTML.
-- EXTRA: clinical context, mnemonic, or one-line "why it matters". Do not repeat the front. Skip if you have nothing meaningful to add.
-- UNDERSTAND BEFORE MEMORIZE: don't cloze a number / classification the student can't make sense of. If a fact only makes sense with framing, put the framing in the front (unclozed) and cloze the testable part.
+THE ONE THING THAT MATTERS: RETRIEVAL FORCE
+Every card has a CLOZE (what gets retrieved) and a CUE (the visible text around it). A
+card is only worth making if the cue forces the student to RECALL the answer from memory
+— not read it off the prompt or recognise a label.
+
+Two kinds of cue. Only one is allowed:
+- LABEL CUE (BANNED): names the answer's own category and asks you to fill it in. The
+  retrieval path is keyword → answer; it doesn't exist on the ward.
+    BAD: "The first-line treatment for anaphylaxis is {{c1::adrenaline}}."  ← the cue IS the answer's restated label.
+- PROCESSING CUE (REQUIRED): gives a mechanism, presentation, contrast, cause, or
+  consequence the student must work THROUGH to reach the answer.
+    GOOD: "{{c1::Adrenaline}} reverses the bronchospasm, vasodilation, and capillary leak of anaphylaxis."  ← same fact, same atomicity, mechanism cue.
+
+THE TEST (apply to every card before writing it): if I delete the answer, can the reader
+reconstruct it from the TYPE OF THINKING the cue demands — or only from recognising a
+label? If only the label, redesign the cue.
+
+CUE TOOLKIT — build the visible part from one of:
+  Mechanism ("the drug that reverses the bronchospasm of…") · Presentation ("a patient
+  with stridor and hypotension after a sting…") · Contrast ("what distinguishes X from
+  Y…") · Cause ("why does…") · Consequence ("what happens if…").
+Function over anatomy: cue what a structure DOES, not its origin/insertion.
+
+PRECISION vs LEAKAGE: give enough context that exactly ONE answer fits, WITHOUT restating
+the answer's label. Specify the SHAPE of the answer (a drug? a vessel? a phase?), not
+which specific one. "The immediate drug…" says it's a drug without saying which.
+
+SUBSTRING CHECK (run on every card before finalising): does the cloze answer appear as a
+literal substring or shared word-stem of any word in the visible cue? If yes it's a
+morphological give-away — redesign.
+    BAD: "Vasospastic angina is caused by coronary {{c1::spasm}}."  ("spasm" sits inside "Vasospastic")
+
+ATOMICITY: one retrievable unit per card. Multi-fact cards spawn sibling clozes that
+DESYNC under spaced repetition — the easy sub-fact keeps the card off the queue while the
+hard one never matures.
+- Split a multi-component fact into separate clozes rather than clozing the whole phrase:
+    CORRECT: prevents {{c1::anterior shear}} of {{c2::L5}} on {{c3::S1}}
+    WRONG:   prevents {{c1::anterior shear of L5 on S1}}
+- Coupled-but-separable facts (a disease name AND its vessel) are TWO cards, each cued
+  from a different angle — not one card with two clozes.
+
+LIST-SHAPED CONTENT ("the N X are A, B, C…", or enumeration words three/four/several):
+STOP and pick a format deliberately —
+  A) SPLIT into N cards, each cued from that item's own mechanism/presentation. Default
+     for long lists (≥5) or items with independent meaning.
+  B) ONE card with HINT SYNTAX {{c1::answer::hint}} — for short lists (≤4), conceptually
+     paired, where the gestalt "what are the X" recall matters. Hints anchor each cloze
+     to its retrieval angle without giving the answer away.
+  C) ONE card without hints, ACCEPTING desync — only for fixed sequences / mnemonics /
+     ordered cascades that lose meaning if split.
+Never default to a multi-cloze enumeration without choosing A/B/C.
+
+CLOZE NUMBERING (commonly done wrong):
+- Separate facts each meant to be hidden on their OWN sibling card → number sequentially
+  {{c1::…}}, {{c2::…}}, {{c3::…}}.
+- Deletions meant to be revealed TOGETHER as a single card → give them the SAME number.
+- Reusing {{c1::…}} for every separate fact collapses them into one card — WRONG. When in
+  doubt, number c1, c2, c3.
+
+INHERENT LABEL-ASSOCIATION (rare, allowed): some content is genuinely a name↔feature
+mapping with no processing-cue equivalent — mnemonics, eponym→lesion (Marfan →
+{{c1::cystic medial degeneration}}), etymologically self-revealing terms. Write these
+honestly. But FIRST apply the test: could a processing cue preserve the same fact? If
+YES, write the better version — a flag here is laziness. Definitional clozes and
+"first-line treatment of X" are FIXABLE, never inherent.
+
+CLOZE FORMAT & STYLE
+- Cloze only (no Q&A). 1–3 clozes per card, each a discrete fact. Short answers (1–4 words).
+- LEVEL: Year 3 Australian med student; Australian drugs/guidelines (eTG, RACGP, PBS,
+  ANZCOR) where relevant.
+- Ruthless concision — cut filler ("important to know that…", "remember that…"). No
+  bold/headers/bullets inside the cloze front.
+- Cloze the YIELD (the high-value fact), not background framing. If a fact only makes
+  sense with framing, put the framing UNCLOZED in the front and cloze the testable part.
+
+EXTRA FIELD: the clinical "so what", mechanism, or exam pearl — never a repeat of the
+front. 2–4 sentences max. Skip if you have nothing meaningful to add. <b>/<u> sparingly;
+no other HTML.
 
 DO NOT include any prose outside the JSON array. No markdown fences. Just the JSON array."""
 
 SINGLE_REGEN_SYSTEM = (
     "Regenerate ONE Anki cloze card on the same subject as the card supplied. "
-    "Return a JSON object with keys 'front' and 'extra' only. Same rules as before: "
-    "standard {{c1::...}} cloze syntax, <b>/<u> only, no markdown fences, no prose. "
-    "Honour the minimum information principle and keep cloze answers SHORT (1–4 words)."
+    "Return a JSON object with keys 'front' and 'extra' only. "
+    "RETRIEVAL FORCE is the priority: the cue (visible text) must force the student to "
+    "RECALL the answer via a mechanism, presentation, contrast, cause, or consequence — "
+    "never restate the answer's label or let the answer be read off the cue. Run the "
+    "substring check (the cloze answer must not appear as a substring or shared word-stem "
+    "of the visible cue). One atomic fact; short cloze answers (1–4 words). Standard "
+    "{{c1::...}} syntax, <b>/<u> only, no markdown fences, no prose."
 )
 
 SPLIT_SYSTEM = (
@@ -139,26 +211,6 @@ ONE_BY_ONE_SYSTEM = (
 )
 
 
-AUTO_TAG_SYSTEM = (
-    "You extract a hierarchical Anki tag path from a clinical concept.\n\n"
-    "Given the title and optional context of a knowledge gap, return a JSON "
-    "object: {\"system\": \"...\", \"subsystem\": \"...\", \"topic\": \"...\"}.\n\n"
-    "RULES:\n"
-    "- system: top-level body system or domain — e.g. Cardio, Neuro, Endo, GI, "
-    "Resp, Renal, Heme, MSK, Derm, Repro, Psych, ID, Onc, Pharm, Stats, "
-    "Genetics, Biochem, Immuno. Pick the single best fit.\n"
-    "- subsystem: more specific anatomy / disease category within the system — "
-    "e.g. Arrhythmias for Cardio, Stroke for Neuro, Diabetes for Endo.\n"
-    "- topic: the most specific clinical entity, drug, sign, or mechanism — "
-    "e.g. AFib, MCA_stroke, Digoxin, McDonald_criteria.\n"
-    "- Use PascalCase or snake_case (no spaces, no '::', no slashes).\n"
-    "- Avoid generic placeholders ('General', 'Misc', 'Other'). If a level is "
-    "genuinely unclear, return an empty string for that level — the caller "
-    "will skip it.\n\n"
-    "Return ONLY the JSON object. No prose, no markdown fences."
-)
-
-
 def _kg_type_meta(kg_type_key: str) -> dict | None:
     """Look up a KG type's settings (auto_tag flag + prefix) from config.
     Returns None if no matching type exists."""
@@ -175,33 +227,13 @@ def _kg_type_meta(kg_type_key: str) -> dict | None:
     return None
 
 
-def _default_kg_type_meta() -> dict | None:
-    """The KG type used to tag pasted cards when no gap is loaded — the
-    configured default-on-add type, else the first defined type."""
-    try:
-        kgc = tool_config("knowledge_gaps")
-        types = kgc.get("types") or []
-        default_key = str(kgc.get("default_type_on_add") or "kg").lower()
-        for t in types:
-            if isinstance(t, dict) and str(t.get("key", "")).lower() == default_key:
-                return t
-        return types[0] if types and isinstance(types[0], dict) else None
-    except Exception:
-        return None
-
-
 def _apply_tag_levels(gap: dict, type_meta: dict, levels: dict) -> str:
     """Format {system, subsystem, topic} levels into the consolidated
     {base}::{type}::… tag, cache it on the gap, and persist it to the KG store.
-    Returns '' if unusable (tagging off, no base, or this type opted out)."""
-    if not isinstance(type_meta, dict) or not type_meta.get("auto_tag"):
-        return ""
-    base = auto_tag_base()
-    if not base:
-        return ""
-    type_seg = type_meta.get("name") or type_meta.get("key") or ""
-    tag = format_hierarchical_tag(base, levels or {}, type_seg=type_seg)
-    if not tag or tag == base:
+    Whether to tag at all is the caller's call (the Auto-tag checkbox); this only
+    needs the type's name segment. Returns '' if unusable (no base/levels)."""
+    tag = autotag.tag_from_levels(levels, type_meta=type_meta)
+    if not tag:
         return ""
     gap["auto_tag"] = tag
     kg_id = gap.get("kg_id")
@@ -218,50 +250,63 @@ def _apply_tag_levels(gap: dict, type_meta: dict, levels: dict) -> str:
     return tag
 
 
+def _topic_tag_from_levels(levels: dict, type_meta: dict | None) -> str:
+    """Build a {base}::{type}::… hierarchical tag from classification levels
+    for a NO-GAP generation (plain topic/source, or pasted cards). Uses the
+    given KG type's segment, falling back to the default type. Returns '' when
+    unusable (no base, no levels, or it collapses to just the base). Unlike
+    _apply_tag_levels this has no gap to cache on, so it's a pure format. Thin
+    wrapper over the shared autotag formatter so Create and Browse agree."""
+    return autotag.tag_from_levels(levels, type_meta=type_meta)
+
+
+def _tag_material(gap: dict | None, topic_label: str | None,
+                  source_label: str | None, focus: str) -> str:
+    """The text handed to the shared classifier for a separate-call auto-tag
+    (skill flows, where the tag can't be folded into the bare card reply).
+    For a gap: its title + stem + notes; otherwise the topic / focus / source."""
+    bits: list[str] = []
+    if isinstance(gap, dict):
+        if (gap.get("title") or "").strip():
+            bits.append(gap["title"].strip())
+        stem = re.sub(r"<[^>]+>", " ", str(gap.get("stem_html") or ""))
+        stem = re.sub(r"\s+", " ", stem).strip()
+        if stem:
+            bits.append(stem[:600])
+        if (gap.get("notes") or "").strip():
+            bits.append(gap["notes"].strip()[:300])
+    else:
+        if topic_label:
+            bits.append(str(topic_label))
+        if focus:
+            bits.append(str(focus))
+        if source_label:
+            bits.append(str(source_label))
+    return "\n".join(bits).strip()
+
+
 # Tag classification and the MQ explanation are folded into the card-gen request
 # via _merged_gen_instructions() (built below), so they come back in the same
 # round-trip — important in manual/BYO mode where each call is a copy/paste.
 
 
 def _generate_auto_tag_for_gap(gap: dict, type_meta: dict, model: str | None = None) -> str:
-    """Ask Claude for {system, subsystem, topic} for this KG and format the
-    tag. Returns '' on failure. Cached on the gap dict to avoid re-calls."""
+    """Classify this KG (via the shared classifier) and format + cache the tag
+    on the gap. Returns '' on failure. Used by skill flows, where the tag can't
+    be folded into the bare card reply."""
     if not isinstance(gap, dict) or not isinstance(type_meta, dict):
         return ""
-    if not type_meta.get("auto_tag"):
-        return ""
-    # Cached on the gap dict (set by previous Generate run for the same KG).
+    # Cached on the gap dict (set by a previous Generate run for the same KG).
     cached = (gap.get("auto_tag") or "").strip()
     if cached:
         return cached
-    if not auto_tag_base():
+    if not auto_tag_base() or not (gap.get("title") or "").strip():
         return ""
-    title = (gap.get("title") or "").strip()
-    if not title:
+    levels = autotag.classify(_tag_material(gap, None, None, ""), model=model)
+    if not isinstance(levels, dict):
         return ""
-    # Build a compact context — title + stripped stem + notes.
-    context_bits = [f"Title: {title}"]
-    stem = (gap.get("stem_html") or "").strip()
-    if stem:
-        plain = re.sub(r"<[^>]+>", " ", stem)
-        plain = re.sub(r"\s+", " ", plain).strip()
-        if plain:
-            context_bits.append(f"Stem: {plain[:600]}")
-    notes = (gap.get("notes") or "").strip()
-    if notes:
-        context_bits.append(f"Notes: {notes[:300]}")
-    user_msg = "\n".join(context_bits)
-    try:
-        resp = core_api.ask_claude_json(
-            prompt=user_msg, system=AUTO_TAG_SYSTEM,
-            max_tokens=256, model=model,
-        )
-    except Exception as e:
-        print(f"[ankisstant] auto-tag Claude call failed: {e}")
-        return ""
-    if not isinstance(resp, dict):
-        return ""
-    return _apply_tag_levels(gap, type_meta, resp)
+    # _apply_tag_levels formats AND caches the tag on the gap + KG store.
+    return _apply_tag_levels(gap, type_meta, levels)
 
 
 # ── MQ knowledge-gap explanation ───────────────────────────────────────────────
@@ -297,42 +342,6 @@ _MQ_EXPLANATION_GUIDANCE = (
 )
 
 
-def _merged_gen_instructions(*, want_tag: bool, want_explanation: bool) -> str:
-    """Build the 'return an OBJECT' instruction block folded into the card-gen
-    request, so tag classification and/or the MQ explanation come back in the
-    SAME round-trip (critical in manual/BYO mode). Returns '' when neither extra
-    is wanted — the reply then stays a bare card array as before."""
-    if not want_tag and not want_explanation:
-        return ""
-    keys: list[str] = []
-    if want_tag:
-        keys.append('"tags": {"system": "...", "subsystem": "...", "topic": "..."}')
-    if want_explanation:
-        keys.append('"mq_explanation": "..."')
-    keys.append('"cards": [ ...the card objects exactly as specified above... ]')
-    out = [
-        "\n\nIN ADDITION to the cards, return your ENTIRE answer as a single JSON "
-        "OBJECT (not a bare array) with these keys:",
-        "  {" + ", ".join(keys) + "}",
-    ]
-    if want_tag:
-        out.append(
-            "Tag rules:\n"
-            "- system: top-level body system/domain — Cardio, Neuro, Endo, GI, "
-            "Resp, Renal, Heme, MSK, Derm, Repro, Psych, ID, Onc, Pharm, Stats, "
-            "Genetics, Biochem, Immuno. Single best fit.\n"
-            "- subsystem: more specific category within the system (e.g. "
-            "Arrhythmias, Stroke, Diabetes).\n"
-            "- topic: most specific entity/drug/sign/mechanism (e.g. AFib, Digoxin).\n"
-            "- PascalCase or snake_case; no spaces, '::', or slashes. Use an empty "
-            "string for any level that's genuinely unclear."
-        )
-    if want_explanation:
-        out.append('The "mq_explanation" value is ' + _MQ_EXPLANATION_GUIDANCE + ".")
-    out.append('The "cards" array uses EXACTLY the card object shape described above.')
-    return "\n".join(out)
-
-
 def _persist_mq_explanation(gap: dict, text: str) -> str:
     """Cache an MQ explanation on the gap dict and write it back to the KG
     store so it survives and is reused. Returns the stored text."""
@@ -352,6 +361,44 @@ def _persist_mq_explanation(gap: dict, text: str) -> str:
         except Exception as e:
             print(f"[ankisstant] mq explanation persist failed: {e}")
     return text
+
+
+def _gap_field_values(gap: dict | None) -> dict:
+    """Flatten a gap into {field_key: value} for the engine's note_field_plan —
+    the stored fields blob plus any top-level scalar values (captured + AI). Used
+    to route user-defined literal-field targets into their Anki fields."""
+    if not isinstance(gap, dict):
+        return {}
+    out = dict(gap.get("fields") or {})
+    for k, v in gap.items():
+        if k != "fields" and isinstance(v, (str, int, float)):
+            out.setdefault(k, v)
+    return out
+
+
+def _persist_ai_field_values(gap: dict, values: dict) -> None:
+    """Cache per-note AI field values (the explanation + any custom AI fields the
+    engine produced) on the gap dict and write them into the KG store so they
+    survive and aren't regenerated. Generalises _persist_mq_explanation to N
+    declarative fields. Pure-ish: only touches the gap dict + the KG store."""
+    if not isinstance(gap, dict) or not values:
+        return
+    text_vals = {str(k): str(v).strip() for k, v in values.items()
+                 if isinstance(v, (str, int, float)) and str(v).strip()}
+    if not text_vals:
+        return
+    gap.update(text_vals)
+    kg_id = gap.get("kg_id")
+    if kg_id:
+        try:
+            from .kg import store as kg_store
+            existing = kg_store.get(kg_id)
+            if existing:
+                fields = dict(existing.get("fields") or {})
+                fields.update(text_vals)
+                kg_store.update(kg_id, fields=fields)
+        except Exception as e:
+            print(f"[ankisstant] ai field persist failed: {e}")
 
 
 MQ_EXPLANATION_SYSTEM = (
@@ -440,10 +487,19 @@ def _resolve_skill(profile: dict | None) -> tuple[str, str]:
     """
     if not profile:
         return ("", "")
-    cfg = load_config()
-    provider = (cfg.get("provider") or "auto").lower()
+    # Skill-vs-prompt is mutually exclusive per notetype. In 'prompt' mode the
+    # profile's inline/field instructions are sent and NO skill is applied, so the
+    # engine's declarative prompts aren't fighting a skill's tuned output. Default
+    # (legacy profiles): 'skill' iff a skill is configured, else 'prompt'.
+    mode = str(profile.get("card_creation_mode") or "").lower()
     skill_id = (profile.get("card_creation_skill_id") or "").strip()
     invocation = (profile.get("card_creation_skill_invocation") or "").strip()
+    if not mode:
+        mode = "skill" if (skill_id or invocation) else "prompt"
+    if mode != "skill":
+        return ("", "")
+    cfg = load_config()
+    provider = (cfg.get("provider") or "auto").lower()
     if provider == "cli":
         return (invocation, "")
     if provider == "anthropic":
@@ -458,6 +514,131 @@ def _resolve_skill(profile: dict | None) -> tuple[str, str]:
     if skill_id:
         return ("", skill_id)
     return (invocation, "")
+
+
+# ── quality pass helpers ────────────────────────────────────────────────────
+
+def _quality_pass_active(cfg: dict, profile: dict | None) -> bool:
+    """Whether the card quality pass runs for this creation. A per-notetype
+    override ('on'/'off') beats the global toggle; 'inherit' (default) defers to
+    the global `enabled` flag. Lets e.g. the Q&A Malleus notetype force it off
+    while cloze decks use it."""
+    qpc = cfg.get("quality_pass") or {}
+    ov = (profile or {}).get("quality_pass_override", "inherit")
+    if ov == "on":
+        return True
+    if ov == "off":
+        return False
+    return bool(qpc.get("enabled", False))
+
+
+def _grader_model(cfg: dict) -> str | None:
+    """The grader model for the active family — the dedicated quality_pass model
+    if set, else the generator model, else the family default (resolved later)."""
+    qpc = cfg.get("quality_pass") or {}
+    fam = active_family()
+    return tool_model_for("quality_pass", fam)
+
+
+def _grader_skill(cfg: dict, profile: dict | None) -> tuple[str, str]:
+    """(skill_invocation, skill_id) for grading. Skills are Anthropic-only, so
+    return ('','') off Anthropic or when 'prefer_skill' is off — the caller then
+    falls back to the bundled inline rubric, which works on every provider."""
+    qpc = cfg.get("quality_pass") or {}
+    if not qpc.get("prefer_skill", True):
+        return ("", "")
+    provider = (load_config().get("provider") or "auto").lower()
+    if provider not in ("auto", "cli", "anthropic"):
+        return ("", "")
+    inv = (qpc.get("grader_skill_invocation") or "").strip()
+    sid = (qpc.get("grader_skill_id") or "").strip()
+    if provider == "cli":
+        return (inv, "")
+    if provider == "anthropic":
+        return ("", sid)
+    return ("", sid) if sid else (inv, "")  # auto: prefer the API id
+
+
+def _regenerate_one(old_card: dict, hint: str, profile: dict | None,
+                    focus: str, model: str | None) -> dict | None:
+    """Regenerate ONE card on the same subject, honouring an optional hint and
+    focus. Returns a new {front, extra} dict (preserving per-card images) or None
+    on failure. Shared by the review dialog's Regenerate button and the
+    quality-pass auto-regenerate loop."""
+    if hint:
+        instruction = (
+            f"Regenerate ONE card on the same subject, applying this user "
+            f"feedback: {hint}"
+        )
+    else:
+        instruction = (
+            "Regenerate ONE card on the same subject — different angle or wording."
+        )
+    prompt = (
+        "Original card front:\n" + old_card.get("front", "") + "\n\n"
+        "Original card extra:\n" + old_card.get("extra", "") + "\n\n"
+        + instruction + " "
+        + (f"Focus: {focus}" if focus else "")
+    )
+    skill_invocation, skill_id = _resolve_skill(profile)
+    new = core_api.ask_claude_json(
+        prompt=prompt,
+        system=_augment_system(SINGLE_REGEN_SYSTEM, profile),
+        max_tokens=1024, model=model,
+        skill_id=skill_id, skill_invocation=skill_invocation,
+    )
+    if not isinstance(new, dict) or "front" not in new or "extra" not in new:
+        return None
+    if old_card.get("_image_paths"):
+        new["_image_paths"] = list(old_card["_image_paths"])
+    return new
+
+
+def resolve_card_validity(cards) -> bool:
+    """True when `cards` is a non-empty list of {front, extra} dicts."""
+    return (isinstance(cards, list) and bool(cards)
+            and all(isinstance(c, dict) and "front" in c and "extra" in c
+                    for c in cards))
+
+
+def grade_cards_sync(cards: list, profile: dict | None, cfg: dict,
+                     *, same_call_grades=None) -> list | None:
+    """Qt-free quality-pass grading for the background worker (and the manual
+    main-thread path). Mirrors CreatorPanel._run_quality_pass but uses a direct
+    core_api.ask_claude_json call (no modal dialog) and does NOT auto-regenerate
+    (that needs Qt). Returns a list of qp.Verdict (one per card, fail-open to
+    PASS) or None when the quality pass is inactive. Never raises."""
+    try:
+        if not _quality_pass_active(cfg, profile):
+            return None
+        llm_verdicts = None
+        try:
+            if same_call_grades is not None:
+                llm_verdicts = qp.parse_same_call_grades(same_call_grades, cards)
+            else:
+                skill_inv, skill_id = _grader_skill(cfg, profile)
+                use_skill = bool(skill_inv or skill_id)
+                system = qp.SKILL_BATCH_SYSTEM if use_skill else qp.RUBRIC_BATCH_SYSTEM
+                raw = core_api.ask_claude_json(
+                    prompt=qp.batch_prompt(cards), system=system,
+                    max_tokens=2048, model=_grader_model(cfg),
+                    skill_id=skill_id, skill_invocation=skill_inv,
+                    show_errors=False,
+                )
+                if raw is not None:
+                    llm_verdicts = qp.parse_batch_verdicts(raw, cards)
+        except Exception as e:
+            print(f"[ankisstant] background quality pass grade skipped: {e}")
+            llm_verdicts = None
+        verdicts = qp.apply_prefilters_then(llm_verdicts, cards)
+        graded = llm_verdicts is not None
+        # Mirror the panel rule: when ungraded, only surface deterministic
+        # pre-filter findings (don't paint everything PASS).
+        return [vd if (graded or vd.source == "prefilter") else None
+                for vd in verdicts]
+    except Exception as e:
+        print(f"[ankisstant] background quality pass skipped: {e}")
+        return None
 
 
 def _import_image_to_media(path: str) -> str | None:
@@ -682,6 +863,7 @@ class CreatorPanel(QWidget):
         self._current_gap: dict | None = None
         self._build()
         self._rebuild_queue_view()
+        self.refresh_ready_lists()
 
     @staticmethod
     def _gap_title(gap) -> str:
@@ -916,10 +1098,21 @@ class CreatorPanel(QWidget):
                 self.deck.setEditText(default_deck)
         f.addRow("Deck:", self.deck)
 
+        tags_row = QHBoxLayout()
         self.tags = QLineEdit(", ".join(self.cfg.get("default_tags", [])))
-        self.tags.setMinimumWidth(500)
+        self.tags.setMinimumWidth(420)
         attach_tag_completer(self.tags, multi=True)
-        f.addRow("Tags (comma-sep):", self.tags)
+        tags_row.addWidget(self.tags, 1)
+        self.cb_autotag = QCheckBox("Auto-tag")
+        self.cb_autotag.setChecked(autotag.is_enabled(self.cfg))
+        self.cb_autotag.setToolTip(
+            "Add an AI-generated hierarchical tag "
+            "(base::Type::System::Subsystem::Topic) to every card, alongside any "
+            "tags you type. Uses the same scheme as AI Browse."
+        )
+        self.cb_autotag.toggled.connect(self._on_autotag_toggled)
+        tags_row.addWidget(self.cb_autotag)
+        f.addRow("Tags (comma-sep):", tags_row)
         audit_tag = self.cfg.get("audit_tag", "")
         if audit_tag:
             audit_hint = QLabel(
@@ -996,9 +1189,82 @@ class CreatorPanel(QWidget):
         btn_row.addWidget(self.go_btn)
         root.addLayout(btn_row)
 
+        # One-line reassurance that a background click isn't a no-op.
+        self.bg_hint = QLabel("Runs in the background — watch “In progress” below.")
+        self.bg_hint.setStyleSheet("color: gray; font-size: 11px;")
+        self.bg_hint.setVisible(False)
+        root.addWidget(self.bg_hint)
+
+        # ── background jobs: in-progress + ready-to-review ───────────────────
+        self.jobs_box = QFrame()
+        self.jobs_box.setObjectName("jobsBox")
+        self.jobs_box.setFrameShape(QFrame.Shape.StyledPanel)
+        self.jobs_box.setStyleSheet(
+            "QFrame#jobsBox { background: rgba(80,160,255,0.16); "
+            "border: 1px solid rgba(80,160,255,0.55); border-radius: 6px; }"
+        )
+        jbl = QVBoxLayout(self.jobs_box)
+        jbl.setContentsMargins(10, 8, 10, 8)
+        jbl.setSpacing(5)
+
+        _job_list_qss = (
+            "QListWidget { background: transparent; border: none; color: palette(text); }"
+            "QListWidget::item:selected { background: rgba(80,160,255,0.30); color: palette(text); }"
+        )
+
+        self.inprogress_header = QLabel("In progress")
+        self.inprogress_header.setStyleSheet("font-weight: 600; color: palette(text);")
+        jbl.addWidget(self.inprogress_header)
+        self.inprogress_list = QListWidget()
+        self.inprogress_list.setMaximumHeight(90)
+        self.inprogress_list.setStyleSheet(_job_list_qss)
+        jbl.addWidget(self.inprogress_list)
+        ip_row = QHBoxLayout()
+        ip_row.addStretch(1)
+        self.cancel_job_btn = QPushButton("Cancel")
+        self.cancel_job_btn.setAutoDefault(False)
+        self.cancel_job_btn.clicked.connect(self._on_cancel_job)
+        ip_row.addWidget(self.cancel_job_btn)
+        jbl.addLayout(ip_row)
+
+        self.ready_header = QLabel("Ready to review")
+        self.ready_header.setStyleSheet("font-weight: 600; color: palette(text);")
+        jbl.addWidget(self.ready_header)
+        self.ready_list = QListWidget()
+        self.ready_list.setMaximumHeight(130)
+        self.ready_list.setStyleSheet(_job_list_qss)
+        self.ready_list.itemDoubleClicked.connect(lambda _it: self._on_open_job())
+        jbl.addWidget(self.ready_list)
+        self.ready_hint = QLabel("Double-click a generation (or select it and press Open) to review its cards.")
+        self.ready_hint.setWordWrap(True)
+        self.ready_hint.setStyleSheet("color: palette(text); font-size: 11px;")
+        jbl.addWidget(self.ready_hint)
+        rd_row = QHBoxLayout()
+        rd_row.addStretch(1)
+        self.open_job_btn = QPushButton("Open")
+        self.open_job_btn.setAutoDefault(False)
+        self.open_job_btn.clicked.connect(self._on_open_job)
+        self.retry_job_btn = QPushButton("Retry")
+        self.retry_job_btn.setAutoDefault(False)
+        self.retry_job_btn.clicked.connect(self._on_retry_job)
+        self.discard_job_btn = QPushButton("Discard")
+        self.discard_job_btn.setAutoDefault(False)
+        self.discard_job_btn.clicked.connect(self._on_discard_job)
+        for b in (self.open_job_btn, self.retry_job_btn, self.discard_job_btn):
+            rd_row.addWidget(b)
+        jbl.addLayout(rd_row)
+        root.addWidget(self.jobs_box)
+
     def _sync_mode(self):
         self.source_box.setVisible(self.rb_source.isChecked())
         self.topic_box.setVisible(self.rb_topic.isChecked())
+
+    def _on_autotag_toggled(self, checked: bool) -> None:
+        self.cfg["auto_tag"] = bool(checked)
+        save_tool_config("card_creator", self.cfg)
+        self._update_autotag_hint(self._current_gap
+                                  if isinstance(getattr(self, "_current_gap", None), dict)
+                                  else None)
 
     def showEvent(self, ev):
         super().showEvent(ev)
@@ -1009,6 +1275,14 @@ class CreatorPanel(QWidget):
             attach_tag_completer(self.tags, multi=True)
         except Exception as e:
             print(f"[ankisstant] tag completer refresh failed: {e}")
+        # Reflect the saved checkbox state + show the auto-tag hint on open.
+        try:
+            self.cb_autotag.setChecked(autotag.is_enabled(self.cfg))
+            self._update_autotag_hint(self._current_gap
+                                      if isinstance(getattr(self, "_current_gap", None), dict)
+                                      else None)
+        except Exception as e:
+            print(f"[ankisstant] autotag state refresh failed: {e}")
 
     # ── notetype dropdown ────────────────────────────────────────────────────
 
@@ -1123,9 +1397,120 @@ class CreatorPanel(QWidget):
         except Exception:
             pass
 
+    # ── background jobs UI ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _job_label(it: dict) -> str:
+        st = it.get("status")
+        title = (it.get("title") or it.get("topic_label")
+                 or it.get("source_label") or "(generation)")
+        title = title if len(title) <= 48 else title[:47] + "…"
+        n = len(it.get("cards") or [])
+        noun = "card" if n == 1 else "cards"
+        return {
+            "running":     f"⏳ {title} — generating…",
+            "queued":      f"…  {title} — queued",
+            "ready":       f"✅ {title} — {n} {noun} ready",
+            "error":       f"⚠️ {title} — failed (Retry to re-run)",
+            "interrupted": f"⛔ {title} — interrupted (Retry to re-run)",
+        }.get(st, title)
+
+    def _update_go_btn_label(self, n_active: int | None = None) -> None:
+        if n_active is None:
+            try:
+                from . import create_jobs
+                n_active = create_jobs.active_count()
+            except Exception:
+                n_active = 0
+        self.go_btn.setText(f"Generate ({n_active} running…)" if n_active else "Generate")
+
+    def refresh_ready_lists(self) -> None:
+        """Repopulate the in-progress and ready-to-review lists from the job
+        store. Cheap, fail-open; called on show and on job completion."""
+        from . import create_jobs
+        try:
+            items = create_jobs.load_all()
+        except Exception:
+            items = []
+        active = [it for it in items if it.get("status") in ("queued", "running")]
+        done = [it for it in items if it.get("status") in ("ready", "error", "interrupted")]
+
+        self.inprogress_list.clear()
+        for it in active:
+            row = QListWidgetItem(self._job_label(it))
+            row.setData(Qt.ItemDataRole.UserRole, it.get("id"))
+            self.inprogress_list.addItem(row)
+        self.inprogress_header.setText(f"In progress ({len(active)})")
+        for w in (self.inprogress_header, self.inprogress_list, self.cancel_job_btn):
+            w.setVisible(bool(active))
+
+        self.ready_list.clear()
+        for it in done:
+            row = QListWidgetItem(self._job_label(it))
+            row.setData(Qt.ItemDataRole.UserRole, it.get("id"))
+            self.ready_list.addItem(row)
+        n_ready = sum(1 for it in done if it.get("status") == "ready")
+        self.ready_header.setText(f"Ready to review ({n_ready})")
+        for w in (self.ready_header, self.ready_list, self.ready_hint,
+                  self.open_job_btn, self.retry_job_btn, self.discard_job_btn):
+            w.setVisible(bool(done))
+
+        self.jobs_box.setVisible(bool(active or done))
+        bg_on = bool(self.cfg.get("background_generation", True))
+        self.bg_hint.setVisible(bg_on and not (active or done))
+        self._update_go_btn_label(len(active))
+
+    def _selected_job_id(self, listw) -> str | None:
+        it = listw.currentItem()
+        return it.data(Qt.ItemDataRole.UserRole) if it is not None else None
+
+    def _on_open_job(self) -> None:
+        jid = self._selected_job_id(self.ready_list)
+        if not jid:
+            tooltip("Select a generation to open.")
+            return
+        self.open_ready_job(jid)
+
+    def _on_retry_job(self) -> None:
+        jid = self._selected_job_id(self.ready_list)
+        if not jid:
+            tooltip("Select a failed/interrupted generation to retry.")
+            return
+        from . import create_jobs
+        create_jobs.retry_job(jid)
+        self.refresh_ready_lists()
+        self._refresh_badge()
+
+    def _on_discard_job(self) -> None:
+        jid = self._selected_job_id(self.ready_list)
+        if not jid:
+            tooltip("Select a generation to discard.")
+            return
+        if not askUser("Discard this generation and its cards?"):
+            return
+        from . import create_jobs
+        create_jobs.remove(jid)
+        self.refresh_ready_lists()
+        self._refresh_badge()
+
+    def _on_cancel_job(self) -> None:
+        jid = self._selected_job_id(self.inprogress_list)
+        if not jid:
+            tooltip("Select a running generation to cancel.")
+            return
+        from . import create_jobs
+        create_jobs.cancel(jid)
+        self.refresh_ready_lists()
+        self._refresh_badge()
+
+    def _refresh_badge(self) -> None:
+        if self._main_window is not None and hasattr(self._main_window, "refresh_queue_badge"):
+            self._main_window.refresh_queue_badge()
+
     def refresh_queue_state(self, main_window) -> None:
         self._main_window = main_window
         self._rebuild_queue_view()
+        self.refresh_ready_lists()
         queue = getattr(main_window, "gap_queue", []) or []
         if not queue:
             self._current_gap = None
@@ -1195,21 +1580,19 @@ class CreatorPanel(QWidget):
             print(f"[ankisstant] gap pre-fill failed: {e}")
 
     def _update_autotag_hint(self, gap) -> None:
-        """Show a notice when the loaded gap's type will auto-tag, so the user
-        knows not to add their own hierarchical tag by hand."""
+        """Reflect what the Auto-tag checkbox will produce: the type segment is
+        the loaded gap's KG type, else the default type for free generation."""
         try:
-            kg_type = ""
-            if isinstance(gap, dict):
-                kg_type = (gap.get("kg_type") or gap.get("type") or "").lower()
-            meta = _kg_type_meta(kg_type)
             base = auto_tag_base()
-            type_seg = (meta.get("name") or kg_type.upper()) if meta else ""
-            active = bool(meta and meta.get("auto_tag") and base)
+            active = bool(autotag.is_enabled(self.cfg) and base)
             if active:
+                kg_type = ""
+                if isinstance(gap, dict):
+                    kg_type = (gap.get("kg_type") or gap.get("type") or "").lower()
+                type_seg, _ = kg_type_info(kg_type or autotag.default_type_key())
                 self._autotag_hint.setText(
-                    f"<small>🏷️ Auto-tag is on for <b>{type_seg}</b> "
-                    f"— a tag under <code>{base}::{type_seg}</code> will be generated and "
-                    "added automatically. No need to add your own.</small>"
+                    f"<small>🏷️ Auto-tag on — a tag under "
+                    f"<code>{base}::{type_seg}</code> is added to every card.</small>"
                 )
             self._autotag_hint.setVisible(active)
         except Exception as e:
@@ -1523,7 +1906,7 @@ class CreatorPanel(QWidget):
                 + (_focus_directive(focus) + "\n" if focus else "")
             )
 
-        model = tool_model(self.cfg, "model", active_family())
+        model = tool_model_for("card_creation")
         loading_label = (
             "Asking AI (reading attachments)…" if attachments_for_api
             else "Asking AI…"
@@ -1531,50 +1914,121 @@ class CreatorPanel(QWidget):
         skill_invocation, skill_id = _resolve_skill(profile)
         system_prompt = _augment_system(CARD_GEN_SYSTEM, profile)
 
-        # Auto-tag: per-KG-type opt-in. When the active KG's type has auto_tag
-        # enabled we want a hierarchical {system::subsystem::topic} tag. Normally
-        # this is a separate AI call, but with no skill in play we fold it into
-        # the SAME request (one object reply) — critical in manual mode, where
-        # each call is its own copy/paste dialog. Skill flows keep the separate
-        # call so the skill's tuned array output isn't disturbed.
-        # Auto-tag and the MQ knowledge-gap explanation are both normally a
-        # separate AI call, but with no skill in play we fold them into the SAME
-        # request (one object reply) — critical in manual/BYO mode, where each
-        # call is its own copy/paste dialog. Skill flows keep the separate call
-        # so the skill's tuned array output isn't disturbed.
+        # The MQ knowledge-gap explanation is normally a separate AI call, but
+        # with no skill in play we fold it into the SAME request (one object
+        # reply) — critical in manual/BYO mode, where each call is its own
+        # copy/paste dialog. Skill flows keep the separate call so the skill's
+        # tuned array output isn't disturbed.
         gap = self._current_gap if isinstance(self._current_gap, dict) else None
-        type_meta = _kg_type_meta((gap.get("kg_type") or "").lower()) if gap else None
-        cached_tag = (gap.get("auto_tag") or "").strip() if gap else ""
-        want_tag = bool(gap and type_meta and type_meta.get("auto_tag")
-                        and auto_tag_base())
         no_skill = not skill_id and not skill_invocation
-        merge_tag = want_tag and not cached_tag and no_skill
+        # Auto-tag (the shared scheme used by AI Browse too) is controlled by the
+        # "Auto-tag" checkbox next to the tag box. Ticked → add a hierarchical
+        # base::Type::System::Subsystem::Topic tag to every card. A loaded gap
+        # uses that gap's KG type as the segment; free topic/source generation
+        # uses the default KG type. When no skill forces a bare reply we fold the
+        # tag into the card-gen call (cheap); with a skill we fall back to a
+        # separate classification call (tools/autotag.py), so skilled notetypes
+        # still get tagged. `tag_material` feeds that separate call.
+        want_auto = autotag.is_enabled(self.cfg) and bool(auto_tag_base())
+        if gap is not None:
+            type_meta = _kg_type_meta((gap.get("kg_type") or "").lower())
+        elif want_auto:
+            type_meta = autotag.type_meta_for(autotag.default_type_key())
+        else:
+            type_meta = None
+        want_tag = bool(want_auto and gap is not None)
+        topic_autotag = bool(want_auto and gap is None)
+        # A gap's previously-cached tag is reused only while auto-tag is on, so
+        # unticking the box means no tag at all (not even a stale cached one).
+        cached_tag = (gap.get("auto_tag") or "").strip() if (gap and want_auto) else ""
+        tag_material = _tag_material(gap, topic_label, source_label, focus)
+        merge_tag = ((want_tag and not cached_tag) or topic_autotag) and no_skill
         want_explanation = _wants_mq_explanation(gap)
         merge_explanation = want_explanation and no_skill
-        merged = _merged_gen_instructions(
-            want_tag=merge_tag, want_explanation=merge_explanation,
+        # same_call quality pass: fold the self-grade into this one reply. Only
+        # possible with no skill (skills force a bare array). When a skill is
+        # active, or grades don't come back, _finalize_review falls back to a
+        # separate scoring call.
+        qpc = self.cfg.get("quality_pass") or {}
+        merge_grade = (
+            _quality_pass_active(self.cfg, profile)
+            and qpc.get("grading_mode") == "same_call"
+            and no_skill
         )
-        if merged:
-            system_prompt += merged
+        # Build the one-call request from the KG type's declarative field specs
+        # (tools/kg/engine.py): the AI returns the tag + every AI-source field
+        # (e.g. the MQ explanation) + cards in a SINGLE JSON object. Skill flows
+        # force a bare card array, so the object form — and its per-field routing
+        # — is used only when no_skill. `exclude` drops a field already satisfied
+        # (a cached explanation) so it isn't re-requested. The plan is stashed for
+        # reply routing and (for background jobs) serialised into the record.
+        self._gen_plan = None
+        if no_skill:
+            exclude = set() if want_explanation else {"explanation"}
+            plan, req_fields = engine.plan_for(
+                type_meta, "create", want_cards=True, want_terms=False,
+                want_tag=merge_tag, want_grade=merge_grade, exclude=exclude)
+            grade_instr = qp.merged_grade_instructions() if merge_grade else ""
+            obj = engine.build_object_instructions(plan, req_fields, grade_instructions=grade_instr)
+            if obj:
+                system_prompt += obj
+            self._gen_plan = plan
+            if gap is not None and req_fields:
+                refs = engine.build_refs_context(req_fields, gap)
+                if refs:
+                    user_msg += "\n\nCONTEXT for the AI-written fields:\n" + refs
         if merge_tag:
             ctx = []
-            if (gap.get("title") or "").strip():
-                ctx.append(f"Title: {gap['title'].strip()}")
-            stem = re.sub(r"<[^>]+>", " ", str(gap.get("stem_html") or ""))
-            stem = re.sub(r"\s+", " ", stem).strip()
-            if stem:
-                ctx.append(f"Question/stem: {stem[:600]}")
-            if (gap.get("notes") or "").strip():
-                ctx.append(f"Notes: {gap['notes'].strip()[:300]}")
+            if gap is not None:
+                if (gap.get("title") or "").strip():
+                    ctx.append(f"Title: {gap['title'].strip()}")
+                stem = re.sub(r"<[^>]+>", " ", str(gap.get("stem_html") or ""))
+                stem = re.sub(r"\s+", " ", stem).strip()
+                if stem:
+                    ctx.append(f"Question/stem: {stem[:600]}")
+                if (gap.get("notes") or "").strip():
+                    ctx.append(f"Notes: {gap['notes'].strip()[:300]}")
+            else:
+                # No gap: classify the topic/source material above.
+                if topic_label:
+                    ctx.append(f"Topic: {topic_label}")
+                if focus:
+                    ctx.append(f"Focus: {focus}")
+                if not ctx and source_label:
+                    ctx.append(f"Source: {source_label}")
             if ctx:
                 user_msg += "\n\nCLASSIFY THIS MATERIAL for the tag:\n" + "\n".join(ctx)
-        if merge_explanation:
-            concept = (gap.get("concept") or gap.get("title") or "").strip()
-            if concept:
-                user_msg += (
-                    "\n\nThe student's specific knowledge gap (explain this in "
-                    f'"mq_explanation"): {concept}'
-                )
+
+        # Background generation: enqueue and return immediately so the user keeps
+        # using Anki. Manual/paste can't background (its dialog needs the main
+        # thread) — it falls through to the interactive path below.
+        bg_on = bool(self.cfg.get("background_generation", True))
+        if bg_on and not is_manual_provider():
+            from . import create_jobs
+            dup = create_jobs.find_active_duplicate(
+                mode=mode, topic_label=topic_label, source_label=source_label,
+                notetype_name=notetype_name, focus=focus)
+            if dup is not None and not askUser(
+                    "A generation for this is already running.\n\nStart another anyway?"):
+                return
+            record = self._make_job_record(
+                mode=mode, source_label=source_label, topic_label=topic_label,
+                focus=focus, deck_name=deck_name, notetype_name=notetype_name,
+                tags_raw=tags_raw, gap=gap, type_meta=type_meta, cached_tag=cached_tag,
+                want_tag=want_tag, want_explanation=want_explanation, merge_tag=merge_tag,
+                merge_explanation=merge_explanation, merge_grade=merge_grade,
+                user_msg=user_msg, system_prompt=system_prompt, model=model,
+                skill_id=skill_id, skill_invocation=skill_invocation,
+                attachments=attachments_for_api,
+                want_auto=want_auto, tag_material=tag_material)
+            self.cfg["default_n_cards"] = n
+            self.cfg["selected_notetype"] = notetype_name
+            save_tool_config("card_creator", self.cfg)
+            create_jobs.enqueue(record)
+            tooltip(f"Generating “{record['title']}” in the background…", period=3000)
+            self.refresh_ready_lists()
+            self._refresh_badge()
+            return
 
         reply = run_claude_json(
             self.go_btn, loading_label,
@@ -1583,17 +2037,21 @@ class CreatorPanel(QWidget):
             attachments=attachments_for_api or None,
         )
 
-        # Merged replies are an object {"tags": …, "mq_explanation": …,
-        # "cards": […]}; otherwise a bare array. Pull the extras out before
-        # validating the card list.
-        merged_tag_levels = None
-        cards = reply
-        if (merge_tag or merge_explanation) and isinstance(reply, dict):
-            cards = reply.get("cards")
-            if merge_tag:
-                merged_tag_levels = reply.get("tags")
-            if merge_explanation:
-                _persist_mq_explanation(gap, str(reply.get("mq_explanation") or ""))
+        # Route the one-call reply via the engine: an object {tags, <ai fields>,
+        # grades, cards} when a plan was built, else a bare card array (skill
+        # flow). Per-note AI field values (the explanation, plus any custom AI
+        # fields) are persisted to the KG store; the explanation also leads the
+        # Missed Questions field.
+        if self._gen_plan is not None:
+            routed = engine.route(reply, self._gen_plan)
+            cards = routed.cards
+            merged_tag_levels = routed.tag_levels
+            same_call_grades = routed.grades
+            mq_explanation = str(routed.field_values.get("explanation") or "")
+            if gap is not None:
+                _persist_ai_field_values(gap, routed.field_values)
+        else:
+            cards, merged_tag_levels, same_call_grades, mq_explanation = reply, None, None, ""
 
         if reply is None:
             return  # cancelled, or a parse failure already surfaced
@@ -1609,12 +2067,53 @@ class CreatorPanel(QWidget):
                 print(f"[ankisstant] mq explanation fallback skipped: {e}")
 
         self.cfg["default_n_cards"] = n
+
+        # Manual provider with background on: its paste happened just now (on the
+        # main thread); instead of opening review immediately, stash the cards in
+        # the ready queue for later. (Non-manual providers returned earlier.)
+        if bg_on and resolve_card_validity(cards):
+            from . import create_jobs
+            from dataclasses import asdict
+            verdicts = grade_cards_sync(cards, profile, self.cfg,
+                                        same_call_grades=same_call_grades)
+            record = self._make_job_record(
+                mode=mode, source_label=source_label, topic_label=topic_label,
+                focus=focus, deck_name=deck_name, notetype_name=notetype_name,
+                tags_raw=tags_raw, gap=gap, type_meta=type_meta, cached_tag=cached_tag,
+                want_tag=want_tag, want_explanation=want_explanation, merge_tag=merge_tag,
+                merge_explanation=merge_explanation, merge_grade=merge_grade,
+                user_msg=user_msg, system_prompt=system_prompt, model=model,
+                skill_id=skill_id, skill_invocation=skill_invocation,
+                attachments=attachments_for_api,
+                want_auto=want_auto, tag_material=tag_material)
+            job = create_jobs.add(**record, status="running")
+            # No folded levels (skill array) but auto-tag wanted: classify now so
+            # this path tags too. Skipped for the manual provider — a classify
+            # call there would pop another paste dialog.
+            if want_auto and not merged_tag_levels and not is_manual_provider():
+                merged_tag_levels = autotag.classify(tag_material, model=model)
+            result = {
+                "cards": cards, "merged_tag_levels": merged_tag_levels,
+                "mq_explanation": mq_explanation,
+                "verdicts": ([asdict(v) if v else None for v in verdicts]
+                             if verdicts else None),
+            }
+            create_jobs._apply_result_main_thread(job["id"], result)
+            self.cfg["selected_notetype"] = notetype_name
+            save_tool_config("card_creator", self.cfg)
+            tooltip("Cards saved to your review queue (open AI Create).", period=3000)
+            self.refresh_ready_lists()
+            self._refresh_badge()
+            return
+
         self._finalize_review(
             cards=cards, merged_tag_levels=merged_tag_levels, mode=mode,
             source_label=source_label, topic_label=topic_label, focus=focus,
             deck_name=deck_name, notetype_name=notetype_name, tags_raw=tags_raw,
             profile=profile, gap=gap, type_meta=type_meta,
             cached_tag=cached_tag, want_tag=want_tag, model=model,
+            same_call_grades=same_call_grades,
+            topic_autotag=topic_autotag, tag_material=tag_material,
         )
 
     def _on_paste_cards(self):
@@ -1653,22 +2152,57 @@ class CreatorPanel(QWidget):
         # key (present when the user ran our merged prompt) is honoured too.
         merged_tag_levels = None
         mq_explanation = ""
+        same_call_grades = None
         cards = parsed
         if isinstance(parsed, dict):
             if isinstance(parsed.get("tags"), dict):
                 merged_tag_levels = parsed["tags"]
             mq_explanation = str(parsed.get("mq_explanation") or "").strip()
+            # Honour grades if the user ran our merged same_call prompt externally.
+            if isinstance(parsed.get("grades"), list):
+                same_call_grades = parsed["grades"]
             cards = parsed.get("cards")
             if cards is None and "front" in parsed:
                 cards = [parsed]
 
         gap = self._current_gap if isinstance(self._current_gap, dict) else None
         type_meta = _kg_type_meta((gap.get("kg_type") or "").lower()) if gap else None
-        cached_tag = (gap.get("auto_tag") or "").strip() if gap else ""
+        # Respect the Auto-tag checkbox here too (consistent with Generate).
+        cached_tag = (gap.get("auto_tag") or "").strip() if (gap and autotag.is_enabled(self.cfg)) else ""
         # Persist any pasted explanation onto the gap. No model is ever called
         # here — BYO users supply it via the prompt they ran externally.
         if mq_explanation and _wants_mq_explanation(gap):
             _persist_mq_explanation(gap, mq_explanation)
+
+        # Background on: funnel pasted cards into the ready queue too, so every
+        # result is reviewed from one place. (There's no AI wait here, but it
+        # keeps the workflow consistent.)
+        bg_on = bool(self.cfg.get("background_generation", True))
+        if bg_on and resolve_card_validity(cards):
+            from . import create_jobs
+            from dataclasses import asdict
+            verdicts = grade_cards_sync(cards, profile, self.cfg,
+                                        same_call_grades=same_call_grades)
+            record = self._make_job_record(
+                mode="source", source_label="(pasted from your AI)", topic_label=None,
+                focus=focus, deck_name=deck_name, notetype_name=notetype_name,
+                tags_raw=tags_raw, gap=gap, type_meta=type_meta, cached_tag=cached_tag,
+                want_tag=False, want_explanation=False, merge_tag=False,
+                merge_explanation=False, merge_grade=False,
+                user_msg="", system_prompt="", model=None, skill_id="",
+                skill_invocation="", attachments=None)
+            job = create_jobs.add(**record, status="running")
+            result = {
+                "cards": cards, "merged_tag_levels": merged_tag_levels,
+                "mq_explanation": mq_explanation,
+                "verdicts": ([asdict(v) if v else None for v in verdicts]
+                             if verdicts else None),
+            }
+            create_jobs._apply_result_main_thread(job["id"], result)
+            tooltip("Cards saved to your review queue (open AI Create).", period=3000)
+            self.refresh_ready_lists()
+            self._refresh_badge()
+            return
 
         # want_tag=False: in paste mode we never fall back to an AI auto-tag
         # call (that would defeat the point). Pasted tag levels still apply.
@@ -1678,11 +2212,111 @@ class CreatorPanel(QWidget):
             deck_name=deck_name, notetype_name=notetype_name, tags_raw=tags_raw,
             profile=profile, gap=gap, type_meta=type_meta,
             cached_tag=cached_tag, want_tag=False, model=None,
+            same_call_grades=same_call_grades,
         )
+
+    def _grader_system(self, use_skill: bool) -> str:
+        return qp.SKILL_BATCH_SYSTEM if use_skill else qp.RUBRIC_BATCH_SYSTEM
+
+    def _grade_one_sync(self, card: dict, profile: dict | None) -> "qp.Verdict":
+        """Grade a single card synchronously (used by the auto-regen loop, which
+        already runs inside a `loading()` busy context). Direct ask_claude_json
+        keeps it on the main thread; manual provider pops a paste dialog."""
+        skill_inv, skill_id = _grader_skill(self.cfg, profile)
+        raw = core_api.ask_claude_json(
+            prompt=qp.batch_prompt([card]),
+            system=self._grader_system(bool(skill_inv or skill_id)),
+            max_tokens=512, model=_grader_model(self.cfg),
+            skill_id=skill_id, skill_invocation=skill_inv, show_errors=False,
+        )
+        verdicts = qp.parse_batch_verdicts(raw, [card]) if raw is not None else None
+        return qp.apply_prefilters_then(verdicts, [card])[0]
+
+    def _auto_regenerate_failures(self, cards: list, profile: dict | None,
+                                  qpc: dict) -> None:
+        """For each FAIL card, regenerate up to N times (re-grading each attempt,
+        feeding the worst-dimension reason back as the hint) and keep the best
+        attempt. Suppressed for the manual/paste provider unless explicitly
+        allowed (each retry is another round-trip)."""
+        if qpc.get("verdict_action") != "auto_regenerate":
+            return
+        if is_manual_provider() and not qpc.get("auto_regen_in_manual"):
+            return
+        max_retries = int(qpc.get("auto_regen_max_retries", 2) or 0)
+        if max_retries <= 0:
+            return
+        targets = [i for i, c in enumerate(cards)
+                   if isinstance(c.get("_verdict"), qp.Verdict)
+                   and c["_verdict"].verdict == qp.FAIL]
+        if not targets:
+            return
+        model = tool_model_for("card_creation")
+        focus = self.focus.text().strip() if hasattr(self, "focus") else ""
+        rank = {qp.PASS: 2, qp.FLAG: 1, qp.FAIL: 0}
+        with loading(self.go_btn, "Improving low-scoring cards…"):
+            for i in targets:
+                cur, cur_vd = cards[i], cards[i].get("_verdict")
+                best, best_vd = cur, cur_vd
+                for _ in range(max_retries):
+                    hint = cur_vd.reason if isinstance(cur_vd, qp.Verdict) else ""
+                    regen = _regenerate_one(cur, hint, profile, focus, model)
+                    if regen is None:
+                        break
+                    rv = self._grade_one_sync(regen, profile)
+                    regen["_verdict"] = rv
+                    cur, cur_vd = regen, rv
+                    if rank.get(rv.verdict, 0) > rank.get(
+                            best_vd.verdict if isinstance(best_vd, qp.Verdict) else qp.FAIL, 0):
+                        best, best_vd = regen, rv
+                    if rv.verdict == qp.PASS:
+                        break
+                cards[i] = best
+
+    def _run_quality_pass(self, cards: list, profile: dict | None,
+                          same_call_grades=None) -> None:
+        """Score `cards` and attach a Verdict to each as card['_verdict']. Fully
+        fail-open: any grader error leaves cards un-chipped (deterministic
+        pre-filter findings are still surfaced) and never blocks card creation.
+        Runs auto-regeneration of FAILs when configured."""
+        qpc = self.cfg.get("quality_pass") or {}
+        llm_verdicts = None  # None = LLM grade unavailable (cancel/fail/skill-array)
+        try:
+            if same_call_grades is not None:
+                llm_verdicts = qp.parse_same_call_grades(same_call_grades, cards)
+            else:
+                skill_inv, skill_id = _grader_skill(self.cfg, profile)
+                raw = run_claude_json(
+                    self.go_btn, "Scoring cards…",
+                    prompt=qp.batch_prompt(cards),
+                    system=self._grader_system(bool(skill_inv or skill_id)),
+                    max_tokens=2048, model=_grader_model(self.cfg),
+                    skill_id=skill_id, skill_invocation=skill_inv,
+                )
+                if raw is not None:
+                    llm_verdicts = qp.parse_batch_verdicts(raw, cards)
+        except Exception as e:
+            print(f"[ankisstant] quality pass grade call skipped: {e}")
+            llm_verdicts = None
+
+        # Merge with deterministic pre-filters. When the LLM grade is unavailable
+        # we still surface free pre-filter findings, but don't paint every card
+        # PASS — un-flagged cards simply get no chip.
+        try:
+            verdicts = qp.apply_prefilters_then(llm_verdicts, cards)
+        except Exception as e:
+            print(f"[ankisstant] quality pass merge skipped: {e}")
+            return
+        graded = llm_verdicts is not None
+        for c, vd in zip(cards, verdicts):
+            if graded or vd.source == "prefilter":
+                c["_verdict"] = vd
+        if graded:
+            self._auto_regenerate_failures(cards, profile, qpc)
 
     def _finalize_review(self, *, cards, merged_tag_levels, mode, source_label,
                          topic_label, focus, deck_name, notetype_name, tags_raw,
-                         profile, gap, type_meta, cached_tag, want_tag, model):
+                         profile, gap, type_meta, cached_tag, want_tag, model,
+                         same_call_grades=None, topic_autotag=False, tag_material=""):
         """Validate the card list, resolve the auto-tag, and open the review
         dialog. Shared by Generate (AI round-trip) and Paste cards (user brings
         their own JSON). Returns False on malformed input (a warning is shown)."""
@@ -1738,19 +2372,26 @@ class CreatorPanel(QWidget):
                 print(f"[ankisstant] auto-tag generation skipped: {e}")
             if auto_tag and auto_tag not in tags_raw:
                 tags_raw.append(auto_tag)
-        elif merged_tag_levels and auto_tag_base():
-            # Paste mode with no loaded KG: still honour the system/subsystem/
-            # topic the user's GPT returned, under the base + default KG type.
+        elif auto_tag_base() and (merged_tag_levels or topic_autotag):
+            # No loaded KG (pasted cards, or topic/source auto-tag). Use the
+            # levels the model folded into the reply; if a skill forced a bare
+            # array (no folded levels) but auto-tag is on, classify separately —
+            # the same shared classifier Browse uses.
             try:
-                dmeta = _default_kg_type_meta()
-                type_seg = (dmeta.get("name") or dmeta.get("key") or "") if dmeta else ""
-                tag = format_hierarchical_tag(
-                    auto_tag_base(), merged_tag_levels, type_seg=type_seg,
-                )
-                if tag and tag != auto_tag_base() and tag not in tags_raw:
+                levels = merged_tag_levels
+                if levels is None and topic_autotag and not is_manual_provider():
+                    with loading(self.go_btn, "Generating auto-tag…"):
+                        levels = autotag.classify(tag_material, model=model)
+                tag = _topic_tag_from_levels(levels, type_meta)
+                if tag and tag not in tags_raw:
                     tags_raw.append(tag)
             except Exception as e:
-                print(f"[ankisstant] paste-mode tag build skipped: {e}")
+                print(f"[ankisstant] no-gap tag build skipped: {e}")
+
+        # Quality pass: score cards (and optionally auto-regenerate failures)
+        # before the review screen. Fail-open — never blocks card creation.
+        if _quality_pass_active(self.cfg, profile):
+            self._run_quality_pass(cards, profile, same_call_grades)
 
         dlg = ReviewDialog(
             cards=cards, mode=mode,
@@ -1763,6 +2404,8 @@ class CreatorPanel(QWidget):
             kg_notes=kg_notes,
             kg_concept=kg_concept,
             kg_explanation=kg_explanation,
+            type_meta=type_meta,
+            kg_field_values=_gap_field_values(gap),
             parent=self,
         )
         result = dlg.exec()
@@ -1804,6 +2447,129 @@ class CreatorPanel(QWidget):
                 self._main_window.refresh_queue_badge()
             self.refresh_queue_state(self._main_window)
         return True
+
+    def _make_job_record(self, *, mode, source_label, topic_label, focus, deck_name,
+                         notetype_name, tags_raw, gap, type_meta, cached_tag, want_tag,
+                         want_explanation, merge_tag, merge_explanation, merge_grade,
+                         user_msg, system_prompt, model, skill_id, skill_invocation,
+                         attachments, want_auto=False, tag_material="") -> dict:
+        """Snapshot everything a background job needs to generate, grade, and
+        later reconstruct its review dialog — independent of live panel state.
+        Imports Extra images into media and copies attachments so the record
+        survives a restart."""
+        import uuid as _uuid
+        from . import create_jobs
+        job_id = _uuid.uuid4().hex[:12]
+        panel_fns = [fn for fn in (_import_image_to_media(p) for p in self._extra_image_paths)
+                     if fn]
+        attach_copied = create_jobs.copy_attachments(job_id, attachments or [])
+        is_mq = bool(gap and (gap.get("kg_type") or "").lower() == "mq")
+        return {
+            "id": job_id,
+            "title": (topic_label or source_label or "Generation"),
+            "mode": mode, "source_label": source_label, "topic_label": topic_label,
+            "focus": focus, "deck_name": deck_name, "notetype_name": notetype_name,
+            "tags_raw": list(tags_raw), "profile_name": notetype_name,
+            "kg_image_filenames": list(gap.get("images") or []) if gap else [],
+            "kg_type_for_image": (gap.get("kg_type") or "").lower() if gap else "",
+            "kg_stem_html": str(gap.get("stem_html") or "") if gap else "",
+            "kg_notes": str(gap.get("notes") or "") if gap else "",
+            "kg_concept": str(gap.get("concept") or "").strip() if is_mq else "",
+            "kg_explanation": str(gap.get("explanation") or "").strip() if is_mq else "",
+            "panel_image_filenames": panel_fns,
+            "attachment_paths": attach_copied,
+            "user_msg": user_msg, "system_prompt": system_prompt, "model": model,
+            "skill_id": skill_id, "skill_invocation": skill_invocation, "max_tokens": 4096,
+            "merge_tag": bool(merge_tag), "merge_explanation": bool(merge_explanation),
+            "merge_grade": bool(merge_grade), "want_tag": bool(want_tag),
+            "want_explanation": bool(want_explanation), "cached_tag": cached_tag or "",
+            # Auto-tag: when a skill forced a bare reply (no folded levels), the
+            # worker does a separate classification call on `tag_material`.
+            "want_auto": bool(want_auto), "tag_material": tag_material or "",
+            # Per-note AI field keys the engine requested in this object reply, so
+            # the off-thread worker can route the reply the same way the modal does.
+            "note_field_keys": (list(self._gen_plan.note_fields)
+                                if getattr(self, "_gen_plan", None) is not None else []),
+            "type_meta": type_meta, "gap": gap,
+            "provider_label": (load_config().get("provider") or "auto"),
+        }
+
+    def open_ready_job(self, job_id: str) -> None:
+        """Reconstruct and open the review dialog for a stored 'ready' job.
+        Works even in a freshly-restarted session: the profile is rebuilt by
+        name and image paths are rebuilt from media filenames (re-import is
+        idempotent so ReviewDialog needs no change). On accept the job is
+        removed; reject/cancel leaves it in the ready list."""
+        from . import create_jobs
+        rec = create_jobs.get(job_id)
+        if rec is None:
+            tooltip("That job is no longer available.")
+            self.refresh_ready_lists()
+            return
+        if rec.get("status") != create_jobs.READY:
+            tooltip("That generation isn't ready to review yet.")
+            return
+
+        cfg = tool_config("card_creator")
+        profile = _resolved_profile(cfg, rec.get("profile_name", ""))
+        try:
+            media_dir = mw.col.media.dir()
+        except Exception:
+            media_dir = ""
+
+        def _media_path(fn: str) -> str:
+            return os.path.join(media_dir, fn) if media_dir and fn else fn
+
+        panel_image_paths = [_media_path(fn) for fn in rec.get("panel_image_filenames", [])]
+        cards = [dict(c) for c in (rec.get("cards") or [])]
+        verdicts = rec.get("verdicts") or []
+        for i, c in enumerate(cards):
+            vd = verdicts[i] if i < len(verdicts) else None
+            if isinstance(vd, dict):
+                try:
+                    c["_verdict"] = qp.Verdict(**vd)
+                except Exception:
+                    pass
+            imgs = c.pop("_image_filenames", None)
+            if imgs:
+                c["_image_paths"] = [_media_path(fn) for fn in imgs]
+
+        dlg = ReviewDialog(
+            cards=cards, mode=rec.get("mode", "source"),
+            source_label=rec.get("source_label"), topic_label=rec.get("topic_label"),
+            focus=rec.get("focus", ""), deck_name=rec.get("deck_name", ""),
+            tags=list(rec.get("tags_raw", [])), profile=profile,
+            panel_image_paths=panel_image_paths,
+            kg_image_filenames=list(rec.get("kg_image_filenames", [])),
+            kg_type_for_image=rec.get("kg_type_for_image", ""),
+            kg_stem_html=rec.get("kg_stem_html", ""),
+            kg_notes=rec.get("kg_notes", ""),
+            kg_concept=rec.get("kg_concept", ""),
+            kg_explanation=rec.get("kg_explanation", ""),
+            type_meta=rec.get("type_meta") if isinstance(rec.get("type_meta"), dict) else None,
+            kg_field_values=_gap_field_values(rec.get("gap") if isinstance(rec.get("gap"), dict) else None),
+            parent=self,
+        )
+        result = dlg.exec()
+        try:
+            accepted = result == QDialog.DialogCode.Accepted
+        except Exception:
+            accepted = bool(result)
+        if accepted:
+            create_jobs.remove(job_id)
+            try:
+                gap = rec.get("gap") if isinstance(rec.get("gap"), dict) else None
+                kg_id = gap.get("kg_id") if gap else None
+                if kg_id:
+                    from .kg import store as kg_store
+                    kg_store.update(kg_id, status="done")
+                    from . import knowledge_gaps
+                    knowledge_gaps._refresh_open_panel()
+            except Exception as e:
+                print(f"[ankisstant] mark KG done (job) failed: {e}")
+        self.refresh_ready_lists()
+        if self._main_window is not None and hasattr(self._main_window, "refresh_queue_badge"):
+            self._main_window.refresh_queue_badge()
 
 
 # ── review dialog (separate window) ──────────────────────────────────────────
@@ -1893,6 +2659,13 @@ class _CardRow(QFrame):
         hint_row.addWidget(self.regen_btn)
         v.addLayout(hint_row)
 
+        # Quality pass: pre-fill the worst-dimension reason as the regen hint on
+        # FLAGged cards, so the user sees why and can regenerate with one click.
+        vd = self.card.get("_verdict")
+        if (isinstance(vd, qp.Verdict) and vd.verdict == qp.FLAG
+                and vd.reason and not self.hint_input.text()):
+            self.hint_input.setText(vd.reason)
+
         self._refresh_header()
 
     def _toggle_extra(self):
@@ -1910,9 +2683,13 @@ class _CardRow(QFrame):
 
     def _refresh_header(self):
         suffix = ""
+        vd = self.card.get("_verdict")
+        if isinstance(vd, qp.Verdict):
+            suffix += f"  · {vd.chip()}"
+            self.setToolTip(vd.reason or "")
         n_imgs = len(self.card.get("_image_paths") or [])
         if n_imgs:
-            suffix = f"  · 📷 {n_imgs}"
+            suffix += f"  · 📷 {n_imgs}"
         if self.state == self.REJECTED:
             self.header_label.setText(f"Card {self.idx + 1} — ✗ rejected{suffix}")
             self.reject_btn.setText("↺ Re-include")
@@ -1971,6 +2748,7 @@ class ReviewDialog(QDialog):
                  kg_image_filenames=None, kg_type_for_image="",
                  kg_stem_html="", kg_notes="",
                  kg_concept="", kg_explanation="",
+                 type_meta=None, kg_field_values=None,
                  parent=None):
         super().__init__(parent)
         self.cfg = tool_config("card_creator")
@@ -2005,6 +2783,12 @@ class ReviewDialog(QDialog):
         # screenshot in the Missed Questions field (see _kg_content_html).
         self.kg_concept: str = str(kg_concept or "").strip()
         self.kg_explanation: str = str(kg_explanation or "").strip()
+        # The KG type definition + this gap's per-note field values, used to route
+        # any USER-DEFINED fields that target a literal Anki field (kind="field")
+        # into that field. Built-in role composition (the Missed Questions field)
+        # stays in _kg_content_html; this only adds custom field→field targets.
+        self.type_meta: dict | None = type_meta if isinstance(type_meta, dict) else None
+        self.kg_field_values: dict = dict(kg_field_values or {})
         self.rows: list[_CardRow] = []
         self.setWindowTitle("Review proposed cards")
         self.setMinimumSize(800, 700)
@@ -2114,34 +2898,12 @@ class ReviewDialog(QDialog):
     # ── regenerate / one-by-one / split ───────────────────────────────────────
 
     def _on_regenerate(self, old_card, hint: str = ""):
-        if hint:
-            instruction = (
-                f"Regenerate ONE card on the same subject, applying this user "
-                f"feedback: {hint}"
-            )
-        else:
-            instruction = (
-                "Regenerate ONE card on the same subject — different angle or wording."
-            )
-        prompt = (
-            "Original card front:\n" + old_card.get("front", "") + "\n\n"
-            "Original card extra:\n" + old_card.get("extra", "") + "\n\n"
-            + instruction + " "
-            + (f"Focus: {self.focus}" if self.focus else "")
+        # Shared with the quality-pass auto-regenerate loop. Preserves per-card
+        # images the user attached pre-regen.
+        return _regenerate_one(
+            old_card, hint, self.profile, self.focus,
+            tool_model_for("card_creation"),
         )
-        skill_invocation, skill_id = _resolve_skill(self.profile)
-        new = core_api.ask_claude_json(
-            prompt=prompt,
-            system=_augment_system(SINGLE_REGEN_SYSTEM, self.profile),
-            max_tokens=1024, model=tool_model(self.cfg, "model", active_family()),
-            skill_id=skill_id, skill_invocation=skill_invocation,
-        )
-        if not isinstance(new, dict) or "front" not in new or "extra" not in new:
-            return None
-        # Preserve any per-card images the user attached pre-regen.
-        if old_card.get("_image_paths"):
-            new["_image_paths"] = list(old_card["_image_paths"])
-        return new
 
     def _on_one_by_one(self, old_card):
         prompt = (
@@ -2154,7 +2916,7 @@ class ReviewDialog(QDialog):
         new = core_api.ask_claude_json(
             prompt=prompt,
             system=_augment_system(ONE_BY_ONE_SYSTEM, self.profile),
-            max_tokens=1024, model=tool_model(self.cfg, "model", active_family()),
+            max_tokens=1024, model=tool_model_for("card_creation"),
             skill_id=skill_id, skill_invocation=skill_invocation,
         )
         if not isinstance(new, dict) or "front" not in new or "extra" not in new:
@@ -2178,7 +2940,7 @@ class ReviewDialog(QDialog):
         new_cards = core_api.ask_claude_json(
             prompt=prompt,
             system=_augment_system(SPLIT_SYSTEM, self.profile),
-            max_tokens=2048, model=tool_model(self.cfg, "model", active_family()),
+            max_tokens=2048, model=tool_model_for("card_creation"),
             skill_id=skill_id, skill_invocation=skill_invocation,
         )
         if (not isinstance(new_cards, list) or not new_cards
@@ -2352,6 +3114,22 @@ class ReviewDialog(QDialog):
                 note[target] = (existing + "<br>" if existing else "") + kg_content
         if card.get("one_by_one") and obo_field in note:
             note[obo_field] = "y"
+        # User-defined fields whose declarative target is a literal Anki field
+        # (kind="field") are composed and written here. Built-in role targets
+        # (front/extra/image/missed_q) are handled above; this only adds the
+        # custom field→field routing, so default types are unaffected.
+        if self.type_meta and self.kg_field_values:
+            try:
+                qb_cfg = tool_config("qbank")
+                custom = engine.note_field_plan(
+                    self.type_meta, self.profile, qb_cfg,
+                    lambda k: self.kg_field_values.get(k, ""), only_kinds=("field",))
+                for fname, val in custom.items():
+                    if val and fname in note:
+                        existing = note[fname] or ""
+                        note[fname] = (existing + "<br>" if existing else "") + val
+            except Exception as e:
+                log.warn(f"custom field routing skipped: {e}")
         for t in self.tags:
             note.add_tag(t)
 
@@ -2579,6 +3357,14 @@ _panel: CreatorPanel | None = None
 
 
 def init(main_window) -> None:
+    # Any background job left queued/running when Anki last quit had its work
+    # abandoned — mark it interrupted (recoverable via Retry) so it doesn't look
+    # stuck. Runs once per session.
+    try:
+        from . import create_jobs
+        create_jobs.mark_interrupted_on_startup()
+    except Exception as e:
+        print(f"[ankisstant] create_jobs startup cleanup failed: {e}")
     return None
 
 

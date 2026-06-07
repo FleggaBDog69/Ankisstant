@@ -259,4 +259,12 @@ class QBankPanel(QWidget):
         actions_wrapper.setLayout(actions_row)
         root.addWidget(actions_wrapper)
 
+        # ── Weakness dashboard ───────────────────────────────────────────────
+        if cfg.get("show_weakness", True):
+            try:
+                from .weakness import WeaknessSection
+                root.addWidget(WeaknessSection())
+            except Exception as e:
+                print(f"[ankisstant] weakness section failed: {e}")
+
         root.addStretch(1)

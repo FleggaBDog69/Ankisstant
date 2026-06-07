@@ -18,13 +18,15 @@ from aqt.utils import askUser, showWarning, tooltip
 
 from ..core import anki_utils, api as core_api, log
 from ..core.config import (
-    active_family, auto_tag_base, format_hierarchical_tag, kg_type_info, month_tag,
-    mq_explain_enabled, tool_config, tool_model, save_tool_config,
+    active_family, auto_tag_base, month_tag,
+    mq_explain_enabled, tool_config, tool_model_for, save_tool_config,
 )
 from ..core.qt_utils import (
     attach_tag_completer, loading, make_help_button, make_setup_banner,
     provider_configured, run_claude_json, set_ai_buttons_enabled,
 )
+from . import autotag
+from .kg import engine
 
 
 NAME = "AI Browse"
@@ -76,48 +78,10 @@ RESCOPE_SYSTEM = (
     "Same JSON-array-of-strings format as before. 3–6 items. No prose."
 )
 
-# Folded into the search-terms prompt so a hierarchical tag suggestion and/or an
-# MQ knowledge-gap explanation come back in the SAME round-trip (important in
-# manual/BYO mode). When either is requested the reply becomes an object instead
-# of a bare array. See _merged_terms_instructions().
-def _merged_terms_instructions(*, want_tag: bool, want_explanation: bool) -> str:
-    """Return the 'reply as an OBJECT' instruction block, or '' when neither
-    extra is wanted (the reply then stays a bare terms array)."""
-    if not want_tag and not want_explanation:
-        return ""
-    keys: list[str] = []
-    if want_tag:
-        keys.append('"tags": {"system": "...", "subsystem": "...", "topic": "..."}')
-    if want_explanation:
-        keys.append('"mq_explanation": "..."')
-    keys.append('"terms": [ ...the search-term strings as specified above... ]')
-    out = [
-        "\n\nALSO return your ENTIRE answer as a single JSON OBJECT (not a bare "
-        "array) with these keys:",
-        "  {" + ", ".join(keys) + "}",
-    ]
-    if want_tag:
-        out.append(
-            "Tag rules:\n"
-            "- system: top-level body system/domain — Cardio, Neuro, Endo, GI, "
-            "Resp, Renal, Heme, MSK, Derm, Repro, Psych, ID, Onc, Pharm, Stats, "
-            "Genetics, Biochem, Immuno. Single best fit.\n"
-            "- subsystem: more specific category within the system (e.g. "
-            "Arrhythmias).\n"
-            "- topic: most specific entity/drug/sign/mechanism (e.g. AFib).\n"
-            "- PascalCase or snake_case; no spaces, '::', or slashes. Empty "
-            "string for any level that's genuinely unclear."
-        )
-    if want_explanation:
-        out.append(
-            'The "mq_explanation" value is a brief teaching explanation (1-3 '
-            "plain sentences) of the specific concept the student missed — "
-            "explain the underlying mechanism or principle (the WHY/HOW), not "
-            "just a restatement; be factually careful; pitch it at a Year 3 "
-            "Australian medical student; plain prose, no markdown."
-        )
-    out.append('The "terms" array uses EXACTLY the string format described above.')
-    return "\n".join(out)
+# The search-terms request now folds a hierarchical tag suggestion and/or an MQ
+# knowledge-gap explanation into the SAME round-trip via the declarative engine
+# (tools/kg/engine.py) — see _search_with_system. When either is requested the
+# reply becomes an object instead of a bare array.
 
 TAG_SEARCH_SYSTEM = (
     "You generate Anki tag-name keywords for a medical student. Given a topic, "
@@ -267,31 +231,9 @@ class BrowsePanel(QWidget):
             print(f"[ankisstant] browse mq explanation persist failed: {e}")
 
     def _update_autotag_hint(self, kg: dict | None) -> None:
-        """Surface a notice when the loaded KG already carries a tag, so the
-        user doesn't add their own by hand."""
-        try:
-            carried = self.tag_input.text().strip()
-            kg_type = (kg.get("type") or "").lower() if isinstance(kg, dict) else ""
-            type_name = kg_type.upper()
-            try:
-                for t in tool_config("knowledge_gaps").get("types") or []:
-                    if str(t.get("key", "")).lower() == kg_type:
-                        type_name = t.get("name") or type_name
-                        break
-            except Exception:
-                pass
-            if carried:
-                self._autotag_hint.setText(
-                    f"<small>🏷️ This {type_name} KG's tag <code>{carried}</code> has "
-                    "been filled in above. Edit it if you like, but you don't need to "
-                    "add your own.</small>"
-                )
-                self._autotag_hint.setVisible(True)
-            else:
-                self._autotag_hint.setVisible(False)
-        except Exception as e:
-            print(f"[ankisstant] browse autotag hint failed: {e}")
-            self._autotag_hint.setVisible(False)
+        """No-op: the loaded-KG tag notice was removed (the tag is already
+        visible in the tag box). Kept as a stub for existing callers."""
+        return
 
     # ── queue (Knowledge Gaps → Browse) ────────────────────────────────────────
 
@@ -599,19 +541,19 @@ class BrowsePanel(QWidget):
         audit_hint.setStyleSheet("color: gray;")
         root.addWidget(audit_hint)
 
-        # Shown when a loaded KG carried its own tag over (auto-tag or a tag
-        # assigned in the KG menu) — tells the user it's already filled in.
-        self._autotag_hint = QLabel("")
-        self._autotag_hint.setTextFormat(Qt.TextFormat.RichText)
-        self._autotag_hint.setStyleSheet("color: #2563eb;")
-        self._autotag_hint.setWordWrap(True)
-        self._autotag_hint.setVisible(False)
-        root.addWidget(self._autotag_hint)
-
         # Side-effect toggles — each side effect of Confirm is optional so
         # users can use Browse as a pure search/tag tool when they don't
         # want to disturb the scheduler. Defaults mirror prior behaviour.
         toggles_row = QHBoxLayout()
+        self.cb_autotag = QCheckBox("Auto-tag")
+        self.cb_autotag.setChecked(autotag.is_enabled(self.cfg))
+        self.cb_autotag.setToolTip(
+            "Suggest a hierarchical tag (base::Type::System::Subsystem::Topic) "
+            "for a fresh topic search and fill it into the tag box. Same scheme "
+            "as AI Create. A tag you type yourself is never overwritten."
+        )
+        self.cb_autotag.toggled.connect(self._on_toggle_persist)
+        toggles_row.addWidget(self.cb_autotag)
         self.cb_unsuspend = QCheckBox("Unsuspend")
         self.cb_unsuspend.setChecked(bool(self.cfg.get("auto_unsuspend", True)))
         self.cb_unsuspend.setToolTip("Unsuspend every card on the selected notes.")
@@ -650,6 +592,7 @@ class BrowsePanel(QWidget):
         """Save toggle state to config so the user's preferences persist
         across panel rebuilds."""
         try:
+            self.cfg["auto_tag"]            = bool(self.cb_autotag.isChecked())
             self.cfg["auto_unsuspend"]      = bool(self.cb_unsuspend.isChecked())
             self.cfg["auto_audit_tag"]      = bool(self.cb_audit.isChecked())
             self.cfg["auto_grade_again_mq"] = bool(self.cb_grade.isChecked())
@@ -771,10 +714,11 @@ class BrowsePanel(QWidget):
         # Type segment: the loaded KG's type, else "KG" for a free search.
         base = auto_tag_base()
         kg_type_key = (getattr(self, "_linked_kg_type", "")
-                       if getattr(self, "_linked_kg_id", None) else "") or "kg"
-        type_name, type_enabled = kg_type_info(kg_type_key)
-        merge_tag = (want_tag and bool(self.cfg.get("auto_tag", True))
-                     and bool(base) and type_enabled
+                       if getattr(self, "_linked_kg_id", None) else "") or autotag.default_type_key()
+        # Gate: the Auto-tag checkbox (shared toggle with AI Create) + a base is
+        # set + we're not about to clobber a tag carried from a KG or hand-typed.
+        merge_tag = (want_tag and autotag.is_enabled(self.cfg)
+                     and bool(base)
                      and not self._tag_from_kg and not self._tag_user_set)
         # MQ explanation: fold it into this same search request when a missed-
         # question KG is loaded, the feature's on, and we don't already have one.
@@ -786,19 +730,27 @@ class BrowsePanel(QWidget):
             and bool((self._linked_kg_concept
                       or self.topic.text()).strip())
         )
-        merged = _merged_terms_instructions(
-            want_tag=merge_tag, want_explanation=merge_explanation,
-        )
-        if merged:
-            system_prompt = system_prompt + merged
-        if merge_explanation:
-            concept = (self._linked_kg_concept or self.topic.text()).strip()
-            user_prompt += (
-                "\n\nThe student's specific knowledge gap (explain this in "
-                f'"mq_explanation"): {concept}'
-            )
+        # Build the one-call request from the linked KG type's declarative field
+        # specs (tools/kg/engine.py): the AI returns the search terms plus, when
+        # wanted, a tag classification and the MQ explanation in a single object.
+        # The object form is requested only when there's something extra to fold
+        # in (tag or explanation); otherwise the reply stays a bare terms array.
+        types = tool_config("knowledge_gaps").get("types") or []
+        type_meta = next((t for t in types if isinstance(t, dict)
+                          and str(t.get("key", "")).lower() == kg_type_key), None)
+        exclude = set() if merge_explanation else {"explanation"}
+        plan, req_fields = engine.plan_for(
+            type_meta, "browse", want_cards=False, want_terms=True,
+            want_tag=merge_tag, exclude=exclude)
+        if merge_tag or merge_explanation:
+            obj = engine.build_object_instructions(plan, req_fields)
+            if obj:
+                system_prompt = system_prompt + obj
+            if merge_explanation:
+                concept = (self._linked_kg_concept or self.topic.text()).strip()
+                user_prompt += "\n\nCONTEXT for the AI-written fields:\nconcept: " + concept
 
-        model = tool_model(self.cfg, "model", active_family())
+        model = tool_model_for("search")
         reply = run_claude_json(
             self.search_btn, "Asking AI…",
             prompt=user_prompt,
@@ -807,21 +759,17 @@ class BrowsePanel(QWidget):
             model=model,
         )
 
-        # Merged replies are an object {"tags": …, "mq_explanation": …,
-        # "terms": […]}; otherwise a bare array. Pull the extras out.
-        terms = reply
-        if (merge_tag or merge_explanation) and isinstance(reply, dict):
-            terms = reply.get("terms")
-            if merge_tag:
-                levels = reply.get("tags")
-                if isinstance(levels, dict):
-                    tag = format_hierarchical_tag(base, levels, type_seg=type_name)
-                    if tag and tag != base:
-                        self.tag_input.setText(tag)
-            if merge_explanation:
-                self._store_linked_kg_explanation(
-                    str(reply.get("mq_explanation") or "")
-                )
+        # Route the reply with the engine: an object {tags, explanation, terms}
+        # when extras were folded in, else a bare terms array.
+        routed = engine.route(reply, plan)
+        terms = routed.terms if routed.terms else (reply if isinstance(reply, list) else None)
+        if merge_tag and isinstance(routed.tag_levels, dict):
+            tag = autotag.tag_from_levels(routed.tag_levels, kg_type_key=kg_type_key)
+            if tag:
+                self.tag_input.setText(tag)
+        if merge_explanation:
+            self._store_linked_kg_explanation(
+                str(routed.field_values.get("explanation") or ""))
 
         if not isinstance(terms, list) or not all(isinstance(t, str) for t in terms):
             self._refresh_rescope_enabled()
@@ -862,7 +810,7 @@ class BrowsePanel(QWidget):
         self.narrower_btn.setEnabled(False)
         self.status.setText("Asking AI for tag keywords…")
 
-        model = tool_model(self.cfg, "model", active_family())
+        model = tool_model_for("search")
         entries = run_claude_json(
             self.search_btn, "Asking AI…",
             prompt=f"Topic: {topic}",
@@ -1520,7 +1468,6 @@ class BrowsePanel(QWidget):
             self._linked_kg_images = []
             self._linked_kg_stem_html = ""
             self._linked_kg_type = ""
-            self._autotag_hint.setVisible(False)
             # Advance the Browse queue (if this KG came from one).
             try:
                 self._advance_queue_after_done(done_id)

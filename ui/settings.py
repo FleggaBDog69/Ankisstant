@@ -19,8 +19,10 @@ from aqt.utils import showInfo, showWarning, tooltip
 
 from ..core import api as core_api
 from ..core.config import (
-    DEFAULTS, PROVIDER_MODELS, active_family, family_for, load_config, save_config,
+    DEFAULTS, PROVIDER_MODELS, active_family, ai_tools, family_for, load_config,
+    save_config,
 )
+from ..tools import skills_catalog
 
 
 def _model_combo(current: str, fallback: str = "claude-sonnet-4-6",
@@ -96,6 +98,112 @@ class _ModelField(QWidget):
     def values(self) -> dict:
         self._capture()
         return dict(self._models)
+
+
+class _SkillField(QWidget):
+    """Provider-channel-aware skill editor for an AI matrix tool. Holds two
+    channels — `anthropic` (an Anthropic custom skill_id) and `cli` (a Claude
+    Code invocation like '/malleus-anki') — and shows the one that matches the
+    current provider. Other providers (gemini/openai/ollama/manual) can't use
+    skills, so the field is disabled with an explanatory placeholder. Switching
+    provider preserves each channel's value, mirroring _ModelField."""
+
+    def __init__(self, stored: dict | None, provider: str, min_width: int = 360, parent=None):
+        super().__init__(parent)
+        s = stored if isinstance(stored, dict) else {}
+        self._channels = {"anthropic": (s.get("anthropic") or "").strip(),
+                          "cli": (s.get("cli") or "").strip()}
+        self._provider = (provider or "auto").lower()
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        self._edit = QLineEdit()
+        self._edit.setMinimumWidth(min_width)
+        lay.addWidget(self._edit)
+        self._hint = QLabel("")
+        self._hint.setStyleSheet("color: gray;")
+        self._hint.setTextFormat(Qt.TextFormat.RichText)
+        self._hint.setWordWrap(True)
+        lay.addWidget(self._hint)
+        self._populate()
+
+    @staticmethod
+    def _channel_for(provider: str) -> str:
+        return "cli" if provider == "cli" else "anthropic"
+
+    @staticmethod
+    def _supported(provider: str) -> bool:
+        return provider in ("auto", "cli", "anthropic")
+
+    def _populate(self) -> None:
+        ch = self._channel_for(self._provider)
+        supported = self._supported(self._provider)
+        self._edit.blockSignals(True)
+        self._edit.setText(self._channels.get(ch, ""))
+        self._edit.setEnabled(supported)
+        if not supported:
+            self._edit.setPlaceholderText("Skills are Anthropic-only — ignored on this provider")
+            self._hint.setText(
+                "<small>This provider can't run skills; the inline prompt is used instead.</small>")
+        elif ch == "cli":
+            self._edit.setPlaceholderText("/skill-name  or  Use the <name> skill")
+            self._hint.setText(
+                "<small>CLI invocation — the skill body lives at "
+                "<code>~/.claude/skills/&lt;name&gt;/SKILL.md</code>.</small>")
+        else:
+            self._edit.setPlaceholderText("skill_… (Anthropic custom skill ID)")
+            self._hint.setText(
+                "<small>Anthropic custom skill ID (skills beta). Leave blank for none.</small>")
+        self._edit.blockSignals(False)
+
+    def _capture(self) -> None:
+        ch = self._channel_for(self._provider)
+        if self._supported(self._provider):
+            self._channels[ch] = self._edit.text().strip()
+
+    def set_provider(self, provider: str) -> None:
+        self._capture()
+        self._provider = (provider or "auto").lower()
+        self._populate()
+
+    def values(self) -> dict:
+        self._capture()
+        return dict(self._channels)
+
+
+class _OverridableModel(QWidget):
+    """A per-tool model picker that opts into overriding the consolidated AI-tab
+    default. The checkbox drives `<field>_override`; when off, the tool reads the
+    shared ai_matrix value and the picker is disabled. Lets a tool tab pin its own
+    model (the 'hybrid' model) without scattering the primary choice."""
+
+    def __init__(self, stored, default_dict: dict, family: str, override: bool,
+                 *, label: str = "Use a model just for this tool", min_width: int = 360,
+                 parent=None):
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(3)
+        self._chk = QCheckBox(label + "  (otherwise uses the AI-tab default)")
+        self._chk.setChecked(bool(override))
+        self._chk.setToolTip(
+            "Off: this tool uses the model set in Settings → AI for its tool row. "
+            "On: pin a different model here, just for this tool.")
+        lay.addWidget(self._chk)
+        self._model = _ModelField(stored, default_dict, family, min_width=min_width)
+        lay.addWidget(self._model)
+        self._chk.toggled.connect(self._model.setEnabled)
+        self._model.setEnabled(self._chk.isChecked())
+
+    def set_family(self, family: str) -> None:
+        self._model.set_family(family)
+
+    def set_enabled_all(self, enabled: bool) -> None:
+        """Hide/show in manual mode (no model needed)."""
+        self.setVisible(enabled)
+
+    def values(self) -> tuple[dict, bool]:
+        return self._model.values(), self._chk.isChecked()
 
 
 # ── small helpers ────────────────────────────────────────────────────────────
@@ -305,6 +413,23 @@ class _NotetypeProfileDialog(QDialog):
         self._obo.setPlaceholderText("AnKing 'One by one' toggle field (leave default if unused)")
         form.addRow("One-by-one field:", self._obo)
 
+        # ── Card creation: skill OR prompt (mutually exclusive) ──────────
+        # A notetype either delegates to a skill (cheaper — the skill carries the
+        # instructions) or uses the inline prompt/field instructions below. Never
+        # both: a skill's tuned output would fight the inline guidance.
+        self._cc_mode = QComboBox()
+        self._cc_mode.addItems(["Use a skill (cheaper)", "Use prompt instructions"])
+        _mode0 = str(e.get("card_creation_mode") or
+                     ("skill" if (e.get("card_creation_skill_id")
+                                  or e.get("card_creation_skill_invocation")) else "prompt")).lower()
+        self._cc_mode.setCurrentIndex(0 if _mode0 == "skill" else 1)
+        self._cc_mode.setToolTip(
+            "Skill: the AI loads your skill (its instructions live in the skill, not "
+            "the request) — cheaper per card. Prompt: send the inline instructions "
+            "below. The two are mutually exclusive.")
+        self._cc_mode.currentIndexChanged.connect(self._sync_cc_mode)
+        form.addRow("Card creation uses:", self._cc_mode)
+
         # ── Card-creation skill (per-notetype) ───────────────────────────
         # CLI mode → prepend the invocation string (e.g. '/malleus-anki'
         # or 'Use the malleus-anki skill') to the prompt. Claude Code's
@@ -325,6 +450,23 @@ class _NotetypeProfileDialog(QDialog):
         self._skill_id.setMinimumWidth(360)
         self._skill_id.setPlaceholderText("skill_… (Anthropic API custom skill ID, used in API mode)")
         form.addRow("Card creation skill (API):", self._skill_id)
+        self._sync_cc_mode()  # grey out skill fields when in prompt mode
+
+        # ── Quality-pass override (per-notetype) ─────────────────────────
+        # The cloze rubric doesn't fit Q&A notetypes (e.g. Malleus), so each
+        # profile can force the quality pass on/off regardless of the global
+        # toggle. 'Inherit' (default) follows the global setting.
+        self._qp_override = QComboBox()
+        self._qp_override.addItems(["Inherit global", "Force ON", "Force OFF"])
+        self._qp_override.setCurrentIndex(
+            {"inherit": 0, "on": 1, "off": 2}.get(
+                str(e.get("quality_pass_override", "inherit")).lower(), 0)
+        )
+        self._qp_override.setToolTip(
+            "Whether the card quality pass scores cards from this notetype. "
+            "Set 'Force OFF' for Q&A notetypes — the rubric is cloze-only."
+        )
+        form.addRow("Quality pass:", self._qp_override)
 
         root.addLayout(form)
 
@@ -358,6 +500,16 @@ class _NotetypeProfileDialog(QDialog):
         bb.accepted.connect(self._on_accept)
         bb.rejected.connect(self.reject)
         root.addWidget(bb)
+
+    def _cc_skill_mode(self) -> str:
+        return "skill" if self._cc_mode.currentIndex() == 0 else "prompt"
+
+    def _sync_cc_mode(self, *_args) -> None:
+        """Skill fields are live only in 'skill' mode; the inline-prompt box is the
+        focus in 'prompt' mode (always editable, but it's what's actually sent)."""
+        on = self._cc_skill_mode() == "skill"
+        self._skill_invocation.setEnabled(on)
+        self._skill_id.setEnabled(on)
 
     def _maybe_suggest_fields(self, _idx: int) -> None:
         # Only fill fields that are still at their default — never clobber
@@ -413,8 +565,10 @@ class _NotetypeProfileDialog(QDialog):
             "image_field":        self._image.text().strip() or (self._extra.text().strip() or "Extra"),
             "sources_field":      self._sources.text().strip(),
             "one_by_one_field":   self._obo.text().strip()   or "One by one",
+            "card_creation_mode":             self._cc_skill_mode(),
             "card_creation_skill_invocation": self._skill_invocation.text().strip(),
             "card_creation_skill_id":         self._skill_id.text().strip(),
+            "quality_pass_override": ["inherit", "on", "off"][self._qp_override.currentIndex()],
             "extra_instructions": self._instructions.toPlainText().strip(),
         }
 
@@ -595,7 +749,55 @@ class _AITab(QWidget):
             cfg.get("model_defaults"), DEFAULTS["model_defaults"],
             family_for(cfg.get("provider", "auto")), min_width=360,
         )
-        layout.addRow("Default model:", self._default_model)
+        layout.addRow("Fallback model:", self._default_model)
+
+        # ── Per-tool model & skill matrix ───────────────────────────────────
+        # The single place model (and skill) choices live. Each AI tool gets one
+        # model per provider, set here; the tool tabs only override. Skill-capable
+        # tools also get a provider-aware skill field.
+        prov = (cfg.get("provider") or "auto").lower()
+        fam0 = family_for(prov)
+        matrix_cfg = cfg.get("ai_matrix") or {}
+        self._matrix_box = QGroupBox("Per-tool models")
+        mf = _expand_form(QFormLayout(self._matrix_box))
+        mf.setVerticalSpacing(8)
+        intro_m = QLabel(
+            "<small>One model per tool, used everywhere that tool runs. Skills are "
+            "managed in the <b>Skills catalog</b> below.</small>")
+        intro_m.setWordWrap(True)
+        intro_m.setTextFormat(Qt.TextFormat.RichText)
+        intro_m.setStyleSheet("color: gray;")
+        mf.addRow(intro_m)
+        self._matrix_models: dict[str, _ModelField] = {}
+        for tool in ai_tools():
+            key = tool["key"]
+            slot = matrix_cfg.get(key) or {}
+            dflt = (DEFAULTS["ai_matrix"].get(key) or {}).get("model") or DEFAULTS["model_defaults"]
+            mfield = _ModelField(slot.get("model"), dflt, fam0, min_width=320)
+            self._matrix_models[key] = mfield
+            mf.addRow(f"{tool['label']} model:", mfield)
+        layout.addRow(self._matrix_box)
+
+        # ── Skills & assistants (provider-adaptive) ─────────────────────────
+        # Claude → one-click install bundled skills into ~/.claude/skills/ (each can
+        # carry an optional Anthropic skill_id). Manual → ready-made chat assistants.
+        # Direct-API providers → built-in prompts, nothing to install.
+        self._skill_cfg = dict(cfg.get("skills") or {})
+        # The section adapts to the selected provider: Claude → install CLI skills;
+        # manual → ready-made chat assistants (GPT / Gem / Claude Project); the
+        # direct-API providers → a note that built-in prompts are used.
+        # Fall back to the shipped default when a stale empty value was saved (older
+        # builds had editable URL fields; an empty save would otherwise shadow it).
+        self._gpt_url = (cfg.get("manual_gpt_url") or DEFAULTS.get("manual_gpt_url") or "").strip()
+        self._gem_url = (cfg.get("manual_gem_url") or DEFAULTS.get("manual_gem_url") or "").strip()
+        self._skills_box = QGroupBox("Skills & assistants")
+        sk_outer = QVBoxLayout(self._skills_box)
+        self._skills_rows = QVBoxLayout()
+        sk_outer.addLayout(self._skills_rows)
+        self._skill_id_edits: dict[str, QLineEdit] = {}
+        # Populated by _refresh() (called at the end of __init__), which builds the
+        # right variant for the current provider.
+        layout.addRow(self._skills_box)
 
         # Shown only for the 'manual' provider, which has no key/model/CLI.
         self._manual_note = QLabel(
@@ -662,6 +864,12 @@ class _AITab(QWidget):
         _set_form_row_visible(self._form, self._default_model, not manual)
         self._test_btn.setVisible(not manual)
         self._default_model.set_family(family_for(provider))
+        # Keep the per-tool matrix in sync with the provider; hide it in manual.
+        self._matrix_box.setVisible(not manual)
+        for mfield in self._matrix_models.values():
+            mfield.set_family(family_for(provider))
+        # Swap the Skills & assistants section to fit the selected provider.
+        self._rebuild_skills()
         if callable(self.on_provider_changed):
             self.on_provider_changed(self.current_provider())
 
@@ -720,10 +928,152 @@ class _AITab(QWidget):
 
         mw.taskman.run_in_background(work, done)
 
+    # ── skills catalog ──────────────────────────────────────────────────────
+    def _capture_skill_ids(self) -> None:
+        """Fold the visible Anthropic-ID edits back into the working cfg so a
+        rebuild (after install/remove) doesn't lose typed-but-unsaved IDs."""
+        for name, edit in self._skill_id_edits.items():
+            sid = edit.text().strip()
+            if sid:
+                self._skill_cfg.setdefault(name, {})["anthropic_skill_id"] = sid
+            elif name in self._skill_cfg:
+                self._skill_cfg[name].pop("anthropic_skill_id", None)
+
+    def _sk_add_note(self, html: str) -> None:
+        lbl = QLabel(html)
+        lbl.setWordWrap(True)
+        lbl.setTextFormat(Qt.TextFormat.RichText)
+        lbl.setStyleSheet("color: gray;")
+        self._skills_rows.addWidget(lbl)
+
+    def _sk_add_assistant(self, label_html: str, button_text: str, on_click) -> None:
+        row = QHBoxLayout()
+        lbl = QLabel(label_html)
+        lbl.setTextFormat(Qt.TextFormat.RichText)
+        lbl.setWordWrap(True)
+        row.addWidget(lbl, 1)
+        btn = QPushButton(button_text)
+        btn.setAutoDefault(False)
+        btn.clicked.connect(lambda _=False: on_click())
+        row.addWidget(btn)
+        w = QWidget()
+        w.setLayout(row)
+        self._skills_rows.addWidget(w)
+
+    def _rebuild_skills(self) -> None:
+        # Preserve any typed-but-unsaved Anthropic IDs before clearing.
+        self._capture_skill_ids()
+        while self._skills_rows.count():
+            item = self._skills_rows.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                # setParent(None) detaches it from the view NOW; deleteLater alone
+                # is deferred, so old rows would float over the new ones (overlay).
+                w.setParent(None)
+                w.deleteLater()
+        self._skill_id_edits = {}
+        provider = self.current_provider()
+
+        if provider in ("auto", "cli", "anthropic"):
+            self._sk_add_note(
+                "<small>Install Ankisstant's skills into your Claude Code folder "
+                "(<code>~/.claude/skills/</code>) with one click — no copying files. "
+                "Used automatically by the matching tool above. The optional Anthropic "
+                "ID is only for users who upload a skill to the Anthropic API.</small>")
+            for entry in skills_catalog.catalog():
+                self._sk_add_install_card(entry)
+            self._sk_add_note(
+                "<small>Prefer Claude.ai in the browser? Switch the provider to "
+                "<b>Manual / paste</b> for a ready-made Claude Project.</small>")
+        elif provider == "manual":
+            self._sk_add_note(
+                "<small>Ready-made <b>Ankisstant</b> assistants — the instructions "
+                "already live inside them, so you paste only the task. Use whichever "
+                "AI you have:</small>")
+            self._sk_add_manual_assistants()
+        else:  # gemini / openai / ollama — direct API, no skill mechanism
+            self._sk_add_note(
+                "<small>This provider uses Ankisstant's built-in prompts automatically "
+                "— nothing to install here. (Skills are a Claude-only feature; every "
+                "tool still works.) If you also use the ChatGPT or Gemini app, switch "
+                "the provider to <b>Manual / paste</b> for the ready-made assistants.</small>")
+
+    def _sk_add_install_card(self, entry: dict) -> None:
+        name = entry["name"]
+        card = QWidget()
+        cv = QVBoxLayout(card)
+        cv.setContentsMargins(0, 2, 0, 2)
+        cv.setSpacing(2)
+        row = QHBoxLayout()
+        status = ("<span style='color:#16a34a'>✓ installed</span>"
+                  if entry["installed"] else
+                  "<span style='color:gray'>not installed</span>")
+        lbl = QLabel(f"<b>{entry['label']}</b> "
+                     f"<span style='color:gray;font-size:11px'>· {name} · </span>{status}")
+        lbl.setTextFormat(Qt.TextFormat.RichText)
+        row.addWidget(lbl, 1)
+        btn = QPushButton("Remove" if entry["installed"] else "Install")
+        btn.setFixedWidth(72)
+        if entry["installed"]:
+            btn.clicked.connect(lambda _, n=name: self._on_remove_skill(n))
+        else:
+            btn.clicked.connect(lambda _, n=name: self._on_install_skill(n))
+        row.addWidget(btn)
+        cv.addLayout(row)
+        id_edit = QLineEdit((self._skill_cfg.get(name) or {}).get("anthropic_skill_id", ""))
+        id_edit.setPlaceholderText("Anthropic skill_id (optional — API only)")
+        self._skill_id_edits[name] = id_edit
+        id_widget = QWidget()
+        id_form = _expand_form(QFormLayout(id_widget))
+        id_form.setContentsMargins(16, 0, 0, 0)
+        id_form.addRow("Anthropic ID:", id_edit)
+        cv.addWidget(id_widget)
+        self._skills_rows.addWidget(card)
+
+    def _sk_add_manual_assistants(self) -> None:
+        from aqt.utils import openLink
+        if self._gpt_url:
+            self._sk_add_assistant(
+                "<b>ChatGPT</b> — Ankisstant Custom GPT",
+                "↗ Open", lambda: openLink(self._gpt_url))
+        if self._gem_url:
+            self._sk_add_assistant(
+                "<b>Gemini</b> — Ankisstant Gem",
+                "↗ Open", lambda: openLink(self._gem_url))
+        self._sk_add_assistant(
+            "<b>Claude.ai</b> — paste these into a new Project (or the first message)",
+            "📋 Copy instructions", self._copy_claude_project)
+
+    def _copy_claude_project(self) -> None:
+        text = skills_catalog.claude_project_instructions()
+        if not text:
+            showWarning("Couldn't find the bundled Claude Project instructions.")
+            return
+        QApplication.clipboard().setText(text)
+        tooltip("Claude Project instructions copied — paste into a new claude.ai Project.",
+                period=3000)
+
+    def _on_install_skill(self, name: str) -> None:
+        self._capture_skill_ids()
+        ok, msg = skills_catalog.install_skill(name)
+        (tooltip if ok else showWarning)(msg)
+        self._rebuild_skills()
+
+    def _on_remove_skill(self, name: str) -> None:
+        self._capture_skill_ids()
+        ok, msg = skills_catalog.uninstall_skill(name)
+        (tooltip if ok else showWarning)(msg)
+        self._rebuild_skills()
+
+    def _skill_values(self) -> dict:
+        self._capture_skill_ids()
+        return {n: v for n, v in self._skill_cfg.items() if v.get("anthropic_skill_id")}
+
     def get_values(self) -> dict:
         self._capture_key()
         return {
             "provider":              self.current_provider(),
+            "skills":                self._skill_values(),
             "anthropic_api_key":     self._keys.get("anthropic", ""),
             "gemini_api_key":        self._keys.get("gemini", ""),
             "openai_api_key":        self._keys.get("openai", ""),
@@ -731,7 +1081,15 @@ class _AITab(QWidget):
             "claude_cli_extra_args": [t for t in self._cli_extra.text().strip().split() if t],
             "ollama_url":            self._ollama_url.text().strip() or "http://localhost:11434",
             "model_defaults":        self._default_model.values(),
+            "ai_matrix":             self._matrix_values(),
+            # Persisting an edited matrix marks the one-time seed done so later
+            # loads don't re-seed over the user's choices.
+            "ai_matrix_migrated":    True,
         }
+
+    def _matrix_values(self) -> dict:
+        # Models only — skills are managed by the Skills catalog, not the matrix.
+        return {key: {"model": mfield.values()} for key, mfield in self._matrix_models.items()}
 
 
 class _GlobalTab(QWidget):
@@ -796,6 +1154,36 @@ class _QBankTab(QWidget):
         self._show_heatmap.setChecked(bool(qb_cfg.get("show_heatmap", True)))
         root.addWidget(self._show_heatmap)
 
+        # ── Weakness dashboard ────────────────────────────────────────────────
+        weak_box = QGroupBox("Weakness dashboard")
+        wl = QFormLayout(weak_box)
+        self._show_weakness = QCheckBox("Show weakness dashboard in the AI QBank panel")
+        self._show_weakness.setChecked(bool(qb_cfg.get("show_weakness", True)))
+        self._show_weakness.setToolTip(
+            "Aggregates your captured missed questions by System / Subsystem / "
+            "Topic so you can see where you miss most."
+        )
+        wl.addRow(self._show_weakness)
+
+        # Window options mirror tools/qbank/weakness._WINDOWS: (label, days).
+        self._weak_windows = [("Last 7 days", 7), ("Last 30 days", 30),
+                              ("Last 90 days", 90), ("All time", 0)]
+        self._weakness_window = QComboBox()
+        for label, _days in self._weak_windows:
+            self._weakness_window.addItem(label)
+        cur_days = int(qb_cfg.get("weakness_window_days", 30))
+        cur_idx = next((i for i, (_l, d) in enumerate(self._weak_windows)
+                        if d == cur_days), 1)
+        self._weakness_window.setCurrentIndex(cur_idx)
+        wl.addRow("Default time window:", self._weakness_window)
+
+        self._weakness_top_n = QSpinBox()
+        self._weakness_top_n.setRange(1, 50)
+        self._weakness_top_n.setValue(int(qb_cfg.get("weakness_top_n", 8)))
+        self._weakness_top_n.setToolTip("How many systems and topics to list.")
+        wl.addRow("Show top N systems/topics:", self._weakness_top_n)
+        root.addWidget(weak_box)
+
         # ── Platforms ─────────────────────────────────────────────────────────
         plat_box = QGroupBox("QBanks")
         pl = QVBoxLayout(plat_box)
@@ -842,21 +1230,12 @@ class _QBankTab(QWidget):
         self._rebuild_periods()
         self._rebuild_exams()
 
-        # ── Capture / card-gen ───────────────────────────────────────────────
-        cap_box = QGroupBox("Capture & AI card generation")
+        # ── Capture / new-card defaults ──────────────────────────────────────
+        # The AI model & skill used when generating a card from a captured gap
+        # now live on the AI tab's per-tool matrix (Card creation / Search).
+        # There are deliberately no tool-local model/skill dropdowns here.
+        cap_box = QGroupBox("Capture & new-card defaults")
         cf = _expand_form(QFormLayout(cap_box))
-
-        fam = active_family()
-        self._search_model = _ModelField(
-            qb_cfg.get("search_model"), DEFAULTS["tools"]["qbank"]["search_model"],
-            fam, min_width=360)
-        cf.addRow("Search model (fast):", self._search_model)
-
-        self._card_model = _ModelField(
-            qb_cfg.get("card_gen_model"), DEFAULTS["tools"]["qbank"]["card_gen_model"],
-            fam, min_width=360)
-        cf.addRow("Card-gen model:", self._card_model)
-        self._model_form = cf
 
         self._notetype = QLineEdit(qb_cfg.get("card_notetype", ""))
         self._notetype.setMinimumWidth(360)
@@ -867,11 +1246,6 @@ class _QBankTab(QWidget):
         self._deck.setMinimumWidth(360)
         self._deck.setPlaceholderText("e.g. Default")
         cf.addRow("New card deck:", self._deck)
-
-        self._skill = QLineEdit(qb_cfg.get("card_skill_id", ""))
-        self._skill.setMinimumWidth(360)
-        self._skill.setPlaceholderText("skill_01… (leave blank for none)")
-        cf.addRow("Card-gen skill ID:", self._skill)
 
         self._field = QLineEdit(qb_cfg.get("missed_q_field", "Missed Questions"))
         self._field.setMinimumWidth(360)
@@ -1057,24 +1431,22 @@ class _QBankTab(QWidget):
         self._rebuild_exams()
 
     def set_model_family(self, family: str, manual: bool = False) -> None:
-        self._search_model.set_family(family)
-        self._card_model.set_family(family)
-        _set_form_row_visible(self._model_form, self._search_model, not manual)
-        _set_form_row_visible(self._model_form, self._card_model, not manual)
+        # QBank has no tool-local model widgets; models resolve from the AI tab.
+        pass
 
     def get_values(self) -> dict:
         return {
             "enabled":        self._enabled.isChecked(),
             "show_heatmap":   self._show_heatmap.isChecked(),
+            "show_weakness":  self._show_weakness.isChecked(),
+            "weakness_window_days": self._weak_windows[self._weakness_window.currentIndex()][1],
+            "weakness_top_n": int(self._weakness_top_n.value()),
             "platforms":      list(self._platforms),
             "default_daily":  int(self._spin.value()),
             "target_periods": sorted(self._periods, key=lambda p: p.get("from", "")),
             "exam_dates":     sorted(self._exams,   key=lambda e: e.get("date", "")),
-            "search_model":   self._search_model.values(),
-            "card_gen_model": self._card_model.values(),
             "card_notetype":  self._notetype.text().strip(),
             "card_deck":      self._deck.text().strip(),
-            "card_skill_id":  self._skill.text().strip(),
             "missed_q_field": self._field.text().strip()         or "Missed Questions",
             "mq_explain":     self._mq_explain.isChecked(),
             "tag_root":       self._tag_root.text().strip()      or "Missed_Questions",
@@ -1095,11 +1467,9 @@ class _BrowseTab(QWidget):
         self._enabled.setChecked(bool(br_cfg.get("enabled", True)))
         layout.addRow(self._enabled)
 
-        self._model = _ModelField(
-            br_cfg.get("model"), DEFAULTS["tools"]["browse"]["model"],
-            active_family(), min_width=420)
-        layout.addRow("Model:", self._model)
-        self._model_form = layout
+        # Model lives on the AI tab (Settings → AI → "Search / Browse" model).
+        # There is deliberately no tool-local model picker here any more — the
+        # per-tool matrix is the single source of truth.
 
         self._last_tag = QLineEdit(br_cfg.get("last_used_tag", ""))
         self._last_tag.setMinimumWidth(420)
@@ -1155,13 +1525,12 @@ class _BrowseTab(QWidget):
         self._source_tags = list(br_cfg.get("source_tags") or [])
 
     def set_model_family(self, family: str, manual: bool = False) -> None:
-        self._model.set_family(family)
-        _set_form_row_visible(self._model_form, self._model, not manual)
+        # No tool-local model widget: the model resolves from the AI tab matrix.
+        return
 
     def get_values(self) -> dict:
         return {
             "enabled":           self._enabled.isChecked(),
-            "model":             self._model.values(),
             "last_used_tag":     self._last_tag.text().strip(),
             "max_results":       int(self._max.value()),
             "notetype_filter":   self._notetype_filter.text().strip(),
@@ -1186,16 +1555,44 @@ FIELD_KIND_LABELS = [
 ]
 
 
+_ROLE_LABELS = [
+    ("front",      "Front (cloze/question)"),
+    ("extra",      "Extra (back/supporting)"),
+    ("image",      "Image field"),
+    ("one_by_one", "One-by-one toggle"),
+    ("missed_q",   "Missed Questions field"),
+]
+_TARGET_KIND_LABELS = [
+    ("none",  "Keep in the gap only (don't write to a card)"),
+    ("role",  "A card role (resolved per notetype)"),
+    ("field", "A named field on a notetype"),
+    ("tag",   "An Anki tag (hierarchical scheme)"),
+]
+
+
 class _FieldEditorDialog(QDialog):
-    """Modal for editing a single field spec inside a type's schema."""
+    """Modal for editing a single field spec inside a type's schema, including the
+    declarative behaviour (where it's captured, whether the AI fills it, which AI
+    flows request it, and which Anki field it writes to)."""
 
     def __init__(self, parent=None, existing: dict | None = None):
         super().__init__(parent)
         self.setWindowTitle("Edit field" if existing else "Add field")
-        self.setMinimumWidth(440)
-        layout = _expand_form(QFormLayout(self))
-        layout.setContentsMargins(14, 14, 14, 14)
+        self.setMinimumWidth(480)
+        # Pre-fill from the engine's normalised view so known fields (concept,
+        # explanation, …) show their inferred defaults rather than blanks.
+        try:
+            from ..tools.kg import engine as _eng
+            norm = _eng.normalise_field(existing or {}) if existing else {}
+        except Exception:
+            norm = dict(existing or {})
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(8)
+        layout = _expand_form(QFormLayout())
         layout.setVerticalSpacing(8)
+        root.addLayout(layout)
 
         self._existing_key = (existing or {}).get("key", "")
 
@@ -1206,8 +1603,7 @@ class _FieldEditorDialog(QDialog):
         self._kind = QComboBox()
         for k, lbl in FIELD_KIND_LABELS:
             self._kind.addItem(lbl, k)
-        existing_kind = (existing or {}).get("kind", "text")
-        idx = self._kind.findData(existing_kind)
+        idx = self._kind.findData((existing or {}).get("kind", "text"))
         if idx >= 0:
             self._kind.setCurrentIndex(idx)
         layout.addRow("Kind:", self._kind)
@@ -1216,34 +1612,171 @@ class _FieldEditorDialog(QDialog):
         self._placeholder.setPlaceholderText("Hint shown inside the empty input")
         layout.addRow("Placeholder:", self._placeholder)
 
+        # ── Source ──────────────────────────────────────────────────────────
+        self._source = QComboBox()
+        for k, lbl in [("capture", "Captured (you type/paste it)"),
+                       ("ai", "AI-generated"),
+                       ("capture+ai", "Captured, AI may fill")]:
+            self._source.addItem(lbl, k)
+        si = self._source.findData(norm.get("source", "capture"))
+        self._source.setCurrentIndex(si if si >= 0 else 0)
+        self._source.currentIndexChanged.connect(self._sync_dynamic)
+        layout.addRow("Source:", self._source)
+
+        # Show-on (capture surfaces)
+        surf = set(norm.get("surfaces") or ["mq_capture", "home", "add_kg"])
+        self._surf_mq = QCheckBox("MQ capture");  self._surf_mq.setChecked("mq_capture" in surf)
+        self._surf_home = QCheckBox("Home");       self._surf_home.setChecked("home" in surf)
+        self._surf_add = QCheckBox("Add-KG");      self._surf_add.setChecked("add_kg" in surf)
+        srow = QHBoxLayout()
+        for w in (self._surf_mq, self._surf_home, self._surf_add):
+            srow.addWidget(w)
+        srow.addStretch(1)
+        self._surf_wrap = QWidget(); self._surf_wrap.setLayout(srow)
+        srow.setContentsMargins(0, 0, 0, 0)
+        layout.addRow("Show on:", self._surf_wrap)
+
+        # Used-in (AI flows)
+        flows = set(norm.get("flows") or ["create"])
+        self._flow_create = QCheckBox("Create"); self._flow_create.setChecked("create" in flows)
+        self._flow_browse = QCheckBox("Browse"); self._flow_browse.setChecked("browse" in flows)
+        frow = QHBoxLayout()
+        frow.addWidget(self._flow_create); frow.addWidget(self._flow_browse); frow.addStretch(1)
+        frow.setContentsMargins(0, 0, 0, 0)
+        fwrap = QWidget(); fwrap.setLayout(frow)
+        layout.addRow("Used in:", fwrap)
+
+        # Cardinality
+        self._cardinality = QComboBox()
+        self._cardinality.addItem("Per note (one value)", "note")
+        self._cardinality.addItem("Per card (one each)", "card")
+        ci = self._cardinality.findData(norm.get("cardinality", "note"))
+        self._cardinality.setCurrentIndex(ci if ci >= 0 else 0)
+        layout.addRow("Cardinality:", self._cardinality)
+
+        # ── Anki output target ─────────────────────────────────────────────
+        tgt = norm.get("anki_target") or {}
+        self._tgt_kind = QComboBox()
+        for k, lbl in _TARGET_KIND_LABELS:
+            self._tgt_kind.addItem(lbl, k)
+        ki = self._tgt_kind.findData(tgt.get("kind", "none"))
+        self._tgt_kind.setCurrentIndex(ki if ki >= 0 else 0)
+        self._tgt_kind.currentIndexChanged.connect(self._sync_dynamic)
+        layout.addRow("Write to:", self._tgt_kind)
+
+        self._tgt_role = QComboBox()
+        for k, lbl in _ROLE_LABELS:
+            self._tgt_role.addItem(lbl, k)
+        ri = self._tgt_role.findData(tgt.get("role", "front"))
+        self._tgt_role.setCurrentIndex(ri if ri >= 0 else 0)
+        self._tgt_role_row = self._tgt_role
+        layout.addRow("Role:", self._tgt_role)
+
+        self._tgt_field = QLineEdit(str(tgt.get("field", "")))
+        self._tgt_field.setPlaceholderText("exact field name on the notetype")
+        layout.addRow("Field name:", self._tgt_field)
+        self._tgt_notetype = QLineEdit(str(tgt.get("notetype", "")))
+        self._tgt_notetype.setPlaceholderText("notetype this field belongs to (optional)")
+        layout.addRow("On notetype:", self._tgt_notetype)
+
+        self._tgt_pos = QSpinBox(); self._tgt_pos.setRange(0, 99)
+        self._tgt_pos.setValue(int(tgt.get("position", 0) or 0))
+        layout.addRow("Order (position):", self._tgt_pos)
+        self._tgt_mode = QComboBox()
+        for k in ("append", "prepend", "replace"):
+            self._tgt_mode.addItem(k, k)
+        mi = self._tgt_mode.findData(tgt.get("mode", "append"))
+        self._tgt_mode.setCurrentIndex(mi if mi >= 0 else 0)
+        layout.addRow("Combine mode:", self._tgt_mode)
+
+        # ── Advanced: AI prompt + refs ─────────────────────────────────────
+        self._adv_lbl = QLabel("<b>AI prompt</b> — what the AI should produce for this field:")
+        self._adv_lbl.setTextFormat(Qt.TextFormat.RichText)
+        root.addWidget(self._adv_lbl)
+        self._ai_prompt = QPlainTextEdit(str(norm.get("ai_prompt", "")))
+        self._ai_prompt.setPlaceholderText(
+            "e.g. a brief teaching explanation (1–3 sentences) of the concept missed — "
+            "the mechanism/principle, pitched at a Year 3 AU med student, plain prose")
+        self._ai_prompt.setMinimumHeight(70)
+        root.addWidget(self._ai_prompt)
+        self._ai_refs = QLineEdit(", ".join(norm.get("ai_refs") or []))
+        self._ai_refs.setPlaceholderText("other field keys to feed as context, comma-separated (e.g. concept, stem_html)")
+        refrow = _expand_form(QFormLayout())
+        refrow.addRow("AI inputs:", self._ai_refs)
+        root.addLayout(refrow)
+
         if existing:
             key_lbl = QLabel(f"<small>key: <code>{existing.get('key', '')}</code>"
                              f" — locked once a field has data</small>")
             key_lbl.setTextFormat(Qt.TextFormat.RichText)
             key_lbl.setStyleSheet("color: gray;")
-            layout.addRow(key_lbl)
+            root.addWidget(key_lbl)
 
         bb = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
         bb.accepted.connect(self._on_save)
         bb.rejected.connect(self.reject)
-        layout.addRow(bb)
+        root.addWidget(bb)
+        self._sync_dynamic()
+
+    def _sync_dynamic(self, *_args) -> None:
+        src = self._source.currentData() or "capture"
+        has_capture = "capture" in src
+        has_ai = "ai" in src
+        for w in (self._surf_mq, self._surf_home, self._surf_add):
+            w.setEnabled(has_capture)
+        self._adv_lbl.setVisible(has_ai)
+        self._ai_prompt.setVisible(has_ai)
+        self._ai_refs.setEnabled(has_ai)
+        kind = self._tgt_kind.currentData() or "none"
+        self._tgt_role.setEnabled(kind == "role")
+        self._tgt_field.setEnabled(kind == "field")
+        self._tgt_notetype.setEnabled(kind == "field")
+        ordered = kind in ("role", "field")
+        self._tgt_pos.setEnabled(ordered)
+        self._tgt_mode.setEnabled(ordered)
 
     def _on_save(self):
         if not self._label.text().strip():
             showWarning("Label is required.")
+            return
+        if self._source.currentData() == "ai" and not self._flow_create.isChecked() \
+                and not self._flow_browse.isChecked():
+            showWarning("An AI field must be used in at least one flow (Create or Browse).")
+            return
+        if self._tgt_kind.currentData() == "field" and not self._tgt_field.text().strip():
+            showWarning("Pick a field name for the 'named field' target.")
             return
         self.accept()
 
     def values(self) -> dict:
         label = self._label.text().strip()
         key = self._existing_key or _slugify_type_key(label)
+        surfaces = [s for s, w in (("mq_capture", self._surf_mq), ("home", self._surf_home),
+                                   ("add_kg", self._surf_add)) if w.isChecked()]
+        flows = [f for f, w in (("create", self._flow_create), ("browse", self._flow_browse))
+                 if w.isChecked()]
+        refs = [r.strip() for r in self._ai_refs.text().split(",") if r.strip()]
         return {
             "key":         key,
             "label":       label,
             "kind":        self._kind.currentData() or "text",
             "placeholder": self._placeholder.text().strip(),
+            "source":      self._source.currentData() or "capture",
+            "surfaces":    surfaces,
+            "flows":       flows or ["create"],
+            "cardinality": self._cardinality.currentData() or "note",
+            "ai_prompt":   self._ai_prompt.toPlainText().strip(),
+            "ai_refs":     refs,
+            "anki_target": {
+                "kind":     self._tgt_kind.currentData() or "none",
+                "role":     self._tgt_role.currentData() or "",
+                "field":    self._tgt_field.text().strip(),
+                "notetype": self._tgt_notetype.text().strip(),
+                "position": int(self._tgt_pos.value()),
+                "mode":     self._tgt_mode.currentData() or "append",
+            },
         }
 
 
@@ -1594,11 +2127,8 @@ class _KnowledgeGapsTab(QWidget):
         self._ga_enabled.setChecked(bool(ga_cfg.get("enabled", True)))
         ab.addRow(self._ga_enabled)
 
-        self._ga_model = _ModelField(
-            ga_cfg.get("model"), DEFAULTS["tools"]["gap_analyser"]["model"],
-            active_family(), min_width=420)
-        ab.addRow("Model:", self._ga_model)
-        self._model_form = ab
+        # Model lives on the AI tab (Settings → AI → "Gap analysis" model).
+        # No tool-local picker here — the per-tool matrix is the single source.
 
         self._ga_front_field = QLineEdit(ga_cfg.get("front_field", "Text"))
         ab.addRow("Front field:", self._ga_front_field)
@@ -1753,13 +2283,12 @@ class _KnowledgeGapsTab(QWidget):
         }
 
     def set_model_family(self, family: str, manual: bool = False) -> None:
-        self._ga_model.set_family(family)
-        _set_form_row_visible(self._model_form, self._ga_model, not manual)
+        # No tool-local model widget: the model resolves from the AI tab matrix.
+        return
 
     def get_gap_analyser_values(self) -> dict:
         return {
             "enabled":         self._ga_enabled.isChecked(),
-            "model":           self._ga_model.values(),
             "front_field":     self._ga_front_field.text().strip() or "Text",
             "notetype_filter": self._ga_notetype_filter.text().strip(),
             "last_used_tag":   self._ga_last_tag.text().strip(),
@@ -1791,11 +2320,8 @@ class _CreatorTab(QWidget):
         self._enabled.setChecked(bool(cc_cfg.get("enabled", True)))
         top_form.addRow(self._enabled)
 
-        self._model = _ModelField(
-            cc_cfg.get("model"), DEFAULTS["tools"]["card_creator"]["model"],
-            active_family(), min_width=420)
-        top_form.addRow("Model:", self._model)
-        self._model_form = top_form
+        # Model lives on the AI tab (Settings → AI → "Card creation" model).
+        # No tool-local picker here — the per-tool matrix is the single source.
 
         self._deck = QComboBox()
         self._deck.setEditable(True)
@@ -1835,6 +2361,24 @@ class _CreatorTab(QWidget):
         self._gap_n_cards.setValue(int(cc_cfg.get("gap_n_cards", 3)))
         top_form.addRow("# cards per LO gap:", self._gap_n_cards)
 
+        self._bg_gen = QCheckBox("Generate cards in the background (review later)")
+        self._bg_gen.setChecked(bool(cc_cfg.get("background_generation", True)))
+        self._bg_gen.setToolTip(
+            "When on, Generate runs in the background so you can keep using Anki; "
+            "finished cards appear in a 'Ready to review' list. When off, generation "
+            "blocks and opens the review window immediately (the old behaviour)."
+        )
+        top_form.addRow("Background:", self._bg_gen)
+
+        self._max_parallel = QSpinBox()
+        self._max_parallel.setRange(1, 6)
+        self._max_parallel.setValue(int(cc_cfg.get("max_parallel_jobs", 2)))
+        self._max_parallel.setToolTip(
+            "How many background generations may run at once. Extra ones queue. "
+            "The manual/paste provider always runs one at a time."
+        )
+        top_form.addRow("Max parallel background jobs:", self._max_parallel)
+
         root.addLayout(top_form)
 
         # ── Notetype profiles ────────────────────────────────────────────────
@@ -1858,6 +2402,64 @@ class _CreatorTab(QWidget):
         nt_layout.addWidget(add_nt)
         root.addWidget(nt_box)
         self._rebuild_profiles()
+
+        # ── Card quality pass ────────────────────────────────────────────────
+        # Seed preserves keys we don't surface in the UI (grader skill id/
+        # invocation) so the wholesale {**existing, **get_values()} save in
+        # _on_save doesn't drop them.
+        self._qp_seed = dict(cc_cfg.get("quality_pass", {}) or {})
+        qp_box = QGroupBox("Card quality pass")
+        qp_layout = QVBoxLayout(qp_box)
+        qp_hint = QLabel(
+            "Scores each generated card against a retrieval-force rubric before "
+            "the review screen, and acts on the score (pass / flag / regenerate). "
+            "Off by default. Per-notetype overrides live in each notetype's editor."
+        )
+        qp_hint.setWordWrap(True)
+        qp_hint.setStyleSheet("color: gray; font-size: 11px;")
+        qp_layout.addWidget(qp_hint)
+
+        self._qp_enabled = QCheckBox("Score generated cards before review")
+        self._qp_enabled.setChecked(bool(self._qp_seed.get("enabled", False)))
+        qp_layout.addWidget(self._qp_enabled)
+
+        qp_form = _expand_form(QFormLayout())
+        qp_form.setVerticalSpacing(8)
+
+        self._qp_mode = QComboBox()
+        self._qp_mode.addItem("Separate batch call (can use a cheaper grader model)", "separate_call")
+        self._qp_mode.addItem("Same call as generation (self-grade, no extra round-trip)", "same_call")
+        self._qp_mode.setCurrentIndex(
+            1 if self._qp_seed.get("grading_mode") == "same_call" else 0)
+        qp_form.addRow("Grading mode:", self._qp_mode)
+
+        self._qp_action = QComboBox()
+        self._qp_action.addItem("Flag only — pre-fill the regen hint", "flag_only")
+        self._qp_action.addItem("Auto-regenerate failures", "auto_regenerate")
+        self._qp_action.setCurrentIndex(
+            1 if self._qp_seed.get("verdict_action") == "auto_regenerate" else 0)
+        qp_form.addRow("On failure:", self._qp_action)
+
+        self._qp_retries = QSpinBox()
+        self._qp_retries.setRange(0, 3)
+        self._qp_retries.setValue(int(self._qp_seed.get("auto_regen_max_retries", 2)))
+        qp_form.addRow("Max auto-regen retries:", self._qp_retries)
+
+        # Grader model lives on the AI tab (Settings → AI → "Quality pass" model).
+
+        qp_layout.addLayout(qp_form)
+
+        self._qp_regen_manual = QCheckBox(
+            "Allow auto-regenerate in manual/paste mode (each retry is another paste)")
+        self._qp_regen_manual.setChecked(bool(self._qp_seed.get("auto_regen_in_manual", False)))
+        qp_layout.addWidget(self._qp_regen_manual)
+
+        self._qp_prefer_skill = QCheckBox(
+            "Prefer the anki-card-scorer skill on Anthropic (saves tokens)")
+        self._qp_prefer_skill.setChecked(bool(self._qp_seed.get("prefer_skill", True)))
+        qp_layout.addWidget(self._qp_prefer_skill)
+
+        root.addWidget(qp_box)
 
         root.addStretch(1)
 
@@ -1887,13 +2489,15 @@ class _CreatorTab(QWidget):
             sources_marker = ""
             if p.get("sources_field"):
                 sources_marker = f" · src=<code>{p['sources_field']}</code>"
+            qp_ov = str(p.get("quality_pass_override", "inherit")).lower()
+            qp_marker = f" · QP:{qp_ov}" if qp_ov in ("on", "off") else ""
             lbl = QLabel(
                 f"<b>{p['name']}</b>"
                 f"  <span style='color:gray;font-size:11px'>"
                 f"front=<code>{p.get('front_field', 'Text')}</code> · "
                 f"extra=<code>{p.get('extra_field', 'Extra')}</code> · "
                 f"image=<code>{p.get('image_field', p.get('extra_field', 'Extra'))}</code>"
-                f"{sources_marker}{skill_marker}{instr_marker}</span>"
+                f"{sources_marker}{skill_marker}{qp_marker}{instr_marker}</span>"
             )
             lbl.setTextFormat(Qt.TextFormat.RichText)
             row.addWidget(lbl, stretch=1)
@@ -1927,8 +2531,9 @@ class _CreatorTab(QWidget):
         self._rebuild_profiles()
 
     def set_model_family(self, family: str, manual: bool = False) -> None:
-        self._model.set_family(family)
-        _set_form_row_visible(self._model_form, self._model, not manual)
+        # No tool-local model widgets: card-creation and grader models both
+        # resolve from the AI tab matrix.
+        return
 
     def get_values(self) -> dict:
         tags_raw = [t.strip() for t in self._tags.text().split(",") if t.strip()]
@@ -1941,18 +2546,33 @@ class _CreatorTab(QWidget):
         first = self._profiles[0] if self._profiles else {}
         return {
             "enabled":          self._enabled.isChecked(),
-            "model":            self._model.values(),
             "default_deck":     self._deck.currentText().strip(),
             "default_tags":     tags_raw,
             "audit_tag":        self._audit_tag.text().strip(),
             "default_n_cards":  int(self._n_cards.value()),
             "gap_n_cards":      int(self._gap_n_cards.value()),
+            "background_generation": self._bg_gen.isChecked(),
+            "max_parallel_jobs": int(self._max_parallel.value()),
             "notetypes":        list(self._profiles),
             "selected_notetype": selected,
             "default_notetype": selected,  # legacy mirror
             "front_field":      first.get("front_field", "Text"),
             "extra_field":      first.get("extra_field", "Extra"),
             "one_by_one_field": first.get("one_by_one_field", "One by one"),
+            # Spread over the seed so un-exposed keys (grader skill id/invocation)
+            # survive the wholesale replace in _on_save.
+            "quality_pass": {
+                **self._qp_seed,
+                "enabled":              self._qp_enabled.isChecked(),
+                "grading_mode":         self._qp_mode.currentData(),
+                "verdict_action":       self._qp_action.currentData(),
+                "auto_regen_max_retries": int(self._qp_retries.value()),
+                "auto_regen_in_manual": self._qp_regen_manual.isChecked(),
+                "prefer_skill":         self._qp_prefer_skill.isChecked(),
+                # Grader model now resolves from the AI tab matrix; neutralise any
+                # stale per-tool override so it can't shadow the matrix choice.
+                "grader_model_override": False,
+            },
         }
 
 

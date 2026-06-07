@@ -171,11 +171,21 @@ class MainWindow(QDialog):
         create_btn = self._nav_buttons.get("card_creator")
         if create_btn is not None:
             n = len(self.gap_queue)
+            try:
+                from ..tools import create_jobs
+                ready = create_jobs.ready_count()
+            except Exception:
+                ready = 0
             base = "AI Create"
-            create_btn.setText(f"{base}  ●{n}" if n else base)
-            create_btn.setToolTip(
-                f"{n} gap{'s' if n != 1 else ''} queued for Create" if n else ""
-            )
+            # ●{gaps} for queued LO-gaps, ✓{ready} for generations awaiting review.
+            badge = (f"  ●{n}" if n else "") + (f"  ✓{ready}" if ready else "")
+            create_btn.setText(base + badge)
+            tips = []
+            if n:
+                tips.append(f"{n} gap{'s' if n != 1 else ''} queued for Create")
+            if ready:
+                tips.append(f"{ready} generation{'s' if ready != 1 else ''} ready to review")
+            create_btn.setToolTip(" · ".join(tips))
         browse_btn = self._nav_buttons.get("browse")
         if browse_btn is not None:
             n = len(self.browse_queue)
