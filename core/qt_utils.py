@@ -370,6 +370,26 @@ def attach_tag_completer(line_edit, multi: bool = False) -> None:
         log.warn(f"tag completer setup failed: {e}")
 
 
+def attach_deck_completer(line_edit, multi: bool = False) -> None:
+    """Attach an Anki-deck-name autocomplete to a QLineEdit. No-op if mw.col
+    isn't ready (e.g. called before profile load)."""
+    try:
+        if mw is None or mw.col is None:
+            return
+        names = sorted(d.name for d in mw.col.decks.all_names_and_ids())
+        if not names:
+            return
+        if multi:
+            completer = _MultiTagCompleter(names, line_edit)
+        else:
+            completer = QCompleter(names, line_edit)
+            completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+            completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        line_edit.setCompleter(completer)
+    except Exception as e:
+        log.warn(f"deck completer setup failed: {e}")
+
+
 def provider_configured() -> bool:
     """True if the selected AI provider is usable — the Claude Code CLI is
     detectable, or the relevant API key is set. Used by tool panels to decide

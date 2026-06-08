@@ -99,26 +99,55 @@ _MODEL_META: dict[str, tuple[str, str]] = {
     "claude-opus-4-7":           ("Opus 4.7",         "Most capable — complex multi-step reasoning"),
     "claude-sonnet-4-6":         ("Sonnet 4.6",        "Recommended — excellent quality, reasonable speed"),
     "claude-haiku-4-5-20251001": ("Haiku 4.5",         "Fast & cheap — great for searches and quick tasks"),
+    "gemini-3.5-flash":          ("Gemini 3.5 Flash",  "Recommended — fast and the most reliable free-tier option"),
     "gemini-2.5-pro":            ("Gemini 2.5 Pro",    "Highest quality — PAID plan only (no free quota)"),
-    "gemini-2.5-flash":          ("Gemini 2.5 Flash",  "Recommended — the only free-tier Gemini model"),
-    "gemini-2.0-flash":          ("Gemini 2.0 Flash",  "Legacy — no longer free; prefer 2.5 Flash"),
+    "gemini-2.5-flash":          ("Gemini 2.5 Flash",  "Free-tier capable, but often hits quota errors — try 3.5 Flash first"),
+    "gemini-2.0-flash":          ("Gemini 2.0 Flash",  "Legacy — no longer free; prefer 3.5 Flash"),
     "gpt-4o":                    ("GPT-4o",            "Most capable OpenAI model"),
     "gpt-4o-mini":               ("GPT-4o mini",       "Recommended — cheap and capable"),
     "gpt-4.1-mini":              ("GPT-4.1 mini",      "Fast and economical"),
 }
 
 # Default model index (into PROVIDER_MODELS list) per family
-# Gemini → index 1 = gemini-2.5-flash. (2.0-flash, index 2, no longer has a
-# free tier — defaulting to it 429'd new free-tier users on first run.)
-_DEFAULT_IDX = {"anthropic": 1, "gemini": 1, "openai": 1, "ollama": 0}
+# Gemini → index 0 = gemini-3.5-flash, the most reliable free-tier model —
+# 2.5-flash (index 2) frequently 429s with quota errors, and 2.0-flash
+# (index 3) lost its free tier entirely.
+_DEFAULT_IDX = {"anthropic": 1, "gemini": 0, "openai": 1, "ollama": 0}
 
 # Page indices
-_P_INTRO    = 0
-_P_CREDS    = 1
-_P_MODEL    = 2
-_P_DEFAULTS = 3
-_P_TEST     = 4
-_P_QBANKS   = 5
+_P_TOOLS    = 0
+_P_INTRO    = 1
+_P_CREDS    = 2
+_P_MODEL    = 3
+_P_DEFAULTS = 4
+_P_TEST     = 5
+_P_QBANKS   = 6
+
+# Quick-start steps for getting an API key — shown on the credentials page so
+# non-technical users aren't left guessing what to do once the link opens.
+# Keyed by provider; each is a short ordered list of plain-English steps.
+_QUICKSTART: dict[str, list[str]] = {
+    "anthropic": [
+        "Open the link above and sign up (or log in) — it's free to create an account.",
+        "Add a small amount of credit: <b>Settings → Billing</b> (a few dollars covers a lot of use).",
+        "Go to <b>API Keys</b> and click <b>Create Key</b>.",
+        "Copy the key (starts with <code>sk-ant-…</code>) and paste it below.",
+    ],
+    "gemini": [
+        "Open the link above and sign in with any Google account.",
+        "<b>No need to set up billing</b> — unlike the other API providers, "
+        "Gemini's free tier works straight away with no credit card or "
+        "payment details required.",
+        "Click <b>Create API key</b>.",
+        "Copy the key (starts with <code>AIza…</code>) and paste it below.",
+    ],
+    "openai": [
+        "Open the link above and sign up (or log in).",
+        "Add billing details: <b>Settings → Billing</b> — OpenAI requires prepaid credit before the API works.",
+        "Click <b>Create new secret key</b>.",
+        "Copy the key (starts with <code>sk-…</code>) and paste it below.",
+    ],
+}
 
 # Curated list of popular question banks, surfaced as checkboxes in the wizard
 # so a new user can seed their QBank list in one click instead of typing URLs.
@@ -210,8 +239,127 @@ def _rich(html: str, wrap: bool = True) -> QLabel:
 
 # ── pages ─────────────────────────────────────────────────────────────────────
 
+class _PageTools(QWidget):
+    """Page 0: which tools do you actually want? Asked BEFORE the AI-provider
+    page so the rest of setup can adapt — fewer pages, fewer questions, and
+    AI setup tailored to what's actually going to be used. Lets someone who
+    only cares about search pick "just Browse" and breeze through."""
+
+    _SIMPLE_TOOLS = [
+        ("qbank", "AI QBank",
+         "Capture missed questions from your QBank and turn them into Anki cards"),
+        ("knowledge_gaps", "Knowledge Gaps",
+         "Track what you don't know yet, then turn gaps into cards or searches"),
+        ("card_creator", "AI Create",
+         "Generate cards from text, PDFs, or web pages"),
+    ]
+
+    _BROWSE_MODES = [
+        ("off", "Off", "Skip AI Browse entirely"),
+        ("native_only", "Just the in-browser AI search",
+         "Adds a ✨ AI Search checkbox to Anki's own Browse window — type a "
+         "topic in plain English, get matching cards. Lightweight, no extra panel."),
+        ("full", "Full AI Browse panel",
+         "A dedicated search panel in Ankisstant — source-deck badges, audit "
+         "tags, auto-tagging — plus the in-browser search above."),
+    ]
+
+    def __init__(self, wizard: SetupWizard, parent=None):
+        super().__init__(parent)
+        self._wizard = wizard
+        root = QVBoxLayout(self)
+        root.setContentsMargins(24, 16, 24, 12)
+        root.setSpacing(8)
+
+        root.addWidget(_h2("Which tools do you want?"))
+        root.addWidget(_muted(
+            "Pick what you'll actually use. The rest of setup adapts to your "
+            "choices — fewer questions, less to configure — and anything you "
+            "skip stays out of your way. Change these any time in "
+            "<b>Settings → Tools</b>."
+        ))
+        root.addWidget(_hsep())
+
+        tools_cfg = (wizard.cfg.get("tools") or {})
+        self._boxes: dict[str, QCheckBox] = {}
+        for key, label, desc in self._SIMPLE_TOOLS:
+            cb = QCheckBox(label)
+            cb.setChecked(bool(tools_cfg.get(key, {}).get("enabled", True)))
+            root.addWidget(cb)
+            sub = _muted(f"<small>{desc}</small>")
+            root.addWidget(sub)
+            self._boxes[key] = cb
+
+        root.addWidget(_hsep())
+
+        browse_lbl = QLabel("<b>AI Browse</b>")
+        browse_lbl.setTextFormat(Qt.TextFormat.RichText)
+        root.addWidget(browse_lbl)
+
+        br_cfg = tools_cfg.get("browse", {})
+        if not br_cfg.get("enabled", True):
+            cur_mode = "off"
+        elif br_cfg.get("native_only"):
+            cur_mode = "native_only"
+        else:
+            cur_mode = "full"
+
+        self._browse_grp = QButtonGroup(self)
+        for i, (mode_key, label, desc) in enumerate(self._BROWSE_MODES):
+            rb = QRadioButton()
+            self._browse_grp.addButton(rb, i)
+            row_widget = QWidget()
+            row_lay = QHBoxLayout(row_widget)
+            row_lay.setContentsMargins(0, 0, 0, 0)
+            row_lay.setSpacing(8)
+            row_lay.addWidget(rb)
+            inner = QVBoxLayout()
+            inner.setSpacing(1)
+            name_lbl = QLabel(f"<b>{label}</b>")
+            name_lbl.setTextFormat(Qt.TextFormat.RichText)
+            sub_lbl = QLabel(desc)
+            sub_lbl.setStyleSheet("color: gray; font-size: 11px;")
+            sub_lbl.setWordWrap(True)
+            inner.addWidget(name_lbl)
+            inner.addWidget(sub_lbl)
+            row_lay.addLayout(inner, 1)
+            name_lbl.mousePressEvent = lambda _e, b=rb: b.setChecked(True)
+            sub_lbl.mousePressEvent  = lambda _e, b=rb: b.setChecked(True)
+            root.addWidget(row_widget)
+            if mode_key == cur_mode:
+                rb.setChecked(True)
+
+        root.addStretch(1)
+
+    def _browse_mode(self) -> str:
+        idx = self._browse_grp.checkedId()
+        if 0 <= idx < len(self._BROWSE_MODES):
+            return self._BROWSE_MODES[idx][0]
+        return "full"
+
+    def selected_tools(self) -> dict:
+        mode = self._browse_mode()
+        return {
+            "qbank":              self._boxes["qbank"].isChecked(),
+            "browse":             mode != "off",
+            "browse_native_only": mode == "native_only",
+            "knowledge_gaps":     self._boxes["knowledge_gaps"].isChecked(),
+            "card_creator":       self._boxes["card_creator"].isChecked(),
+        }
+
+    def validate(self) -> bool:
+        sel = self.selected_tools()
+        if not (sel["qbank"] or sel["browse"] or sel["knowledge_gaps"] or sel["card_creator"]):
+            showWarning(
+                "Pick at least one tool to continue — you can turn any of "
+                "them on or off later in Settings."
+            )
+            return False
+        return True
+
+
 class _PageIntro(QWidget):
-    """Page 0: explain what Ankisstant is, pick provider."""
+    """Page 1: explain what Ankisstant is, pick provider."""
 
     def __init__(self, wizard: SetupWizard, parent=None):
         super().__init__(parent)
@@ -437,6 +585,21 @@ class _PageCredentials(QWidget):
                 link_lbl.setOpenExternalLinks(True)
                 link_lbl.setStyleSheet("color: #2563eb;")
                 lay.addWidget(link_lbl)
+
+            # Quick-start steps — spell out exactly what to click, in order,
+            # so non-technical users can get a key without getting stuck.
+            steps = _QUICKSTART.get(provider)
+            if steps:
+                items = "".join(f"<li>{s}</li>" for s in steps)
+                quickstart = QLabel(f"<b>Quick start:</b><ol style='margin:4px 0 0 -18px;'>{items}</ol>")
+                quickstart.setTextFormat(Qt.TextFormat.RichText)
+                quickstart.setWordWrap(True)
+                quickstart.setStyleSheet(
+                    "background: rgba(28,128,0,0.08); border: 1px solid "
+                    "rgba(28,128,0,0.3); border-radius: 8px; padding: 12px;"
+                )
+                lay.addWidget(quickstart)
+
             lay.addWidget(_hsep())
 
             placeholders = {
@@ -1156,7 +1319,8 @@ class _PageTest(QWidget):
 # ── wizard ─────────────────────────────────────────────────────────────────────
 
 class SetupWizard(QDialog):
-    """Five-page setup wizard. Pages adapt to the chosen provider."""
+    """Multi-page setup wizard. The Tools page (asked first) and the chosen
+    provider both shape which later pages appear."""
 
     def __init__(self, parent=None):
         super().__init__(parent or mw)
@@ -1167,6 +1331,14 @@ class SetupWizard(QDialog):
 
         self._flow: list[int] = []
         self._flow_pos: int = 0
+
+        # Populated when the user leaves the Tools page — drives which later
+        # pages (Defaults / QBanks) are even shown. Defaults to "everything
+        # on" so flow-building never KeyErrors before that page is visited.
+        self.selected_tools: dict = {
+            "qbank": True, "browse": True, "browse_native_only": False,
+            "knowledge_gaps": True, "card_creator": True,
+        }
 
         self.current_provider: str = (self.cfg.get("provider") or "auto").lower()
         if self.current_provider == "auto":
@@ -1191,18 +1363,20 @@ class SetupWizard(QDialog):
         root.addWidget(_hsep())
 
         self._stack = QStackedWidget()
+        self.page_tools    = _PageTools(self)
         self.page_intro    = _PageIntro(self)
         self.page_creds    = _PageCredentials(self)
         self.page_model    = _PageModel(self)
         self.page_defaults = _PageDefaults(self)
         self.page_test     = _PageTest(self)
         self.page_qbanks   = _PageQbanks(self)
-        self._stack.addWidget(self.page_intro)    # _P_INTRO = 0
-        self._stack.addWidget(self.page_creds)    # _P_CREDS = 1
-        self._stack.addWidget(self.page_model)    # _P_MODEL = 2
-        self._stack.addWidget(self.page_defaults) # _P_DEFAULTS = 3
-        self._stack.addWidget(self.page_test)     # _P_TEST = 4
-        self._stack.addWidget(self.page_qbanks)   # _P_QBANKS = 5
+        self._stack.addWidget(self.page_tools)    # _P_TOOLS = 0
+        self._stack.addWidget(self.page_intro)    # _P_INTRO = 1
+        self._stack.addWidget(self.page_creds)    # _P_CREDS = 2
+        self._stack.addWidget(self.page_model)    # _P_MODEL = 3
+        self._stack.addWidget(self.page_defaults) # _P_DEFAULTS = 4
+        self._stack.addWidget(self.page_test)     # _P_TEST = 5
+        self._stack.addWidget(self.page_qbanks)   # _P_QBANKS = 6
         root.addWidget(self._stack, 1)
 
         root.addWidget(_hsep())
@@ -1232,18 +1406,33 @@ class SetupWizard(QDialog):
 
         root.addLayout(nav)
 
-        self._enter_page(_P_INTRO)
+        self._flow = [_P_TOOLS]
+        self._flow_pos = 0
+        self._enter_page(_P_TOOLS)
 
     # ── navigation ────────────────────────────────────────────────────────────
 
     def _page_flow_for(self, provider: str) -> list[int]:
-        if provider == "manual":
-            # Copy-paste workflow has no programmatic AI to test, so the
-            # "Test connection" / generate-a-card page is meaningless here —
-            # end on QBanks instead. (Showing the test page just fired a doomed
-            # CLI call.)
-            return [_P_INTRO, _P_CREDS, _P_DEFAULTS, _P_QBANKS]
-        return [_P_INTRO, _P_CREDS, _P_MODEL, _P_DEFAULTS, _P_QBANKS, _P_TEST]
+        """Pages AFTER Tools+Intro (both always shown), tailored to the
+        chosen provider AND the tools picked on the first page — e.g.
+        skipping the QBanks seed page entirely if QBank wasn't selected."""
+        flow = [_P_CREDS]
+        if provider != "manual":
+            flow.append(_P_MODEL)
+
+        # Defaults (deck/notetype) only matter to Create and QBank.
+        if self.selected_tools.get("card_creator") or self.selected_tools.get("qbank"):
+            flow.append(_P_DEFAULTS)
+
+        if self.selected_tools.get("qbank"):
+            flow.append(_P_QBANKS)
+
+        if provider != "manual":
+            # Copy-paste workflow has no programmatic AI to test — the "Test
+            # connection" / generate-a-card page would just fire a doomed call.
+            flow.append(_P_TEST)
+
+        return flow
 
     def _enter_page(self, page_idx: int):
         self._stack.setCurrentIndex(page_idx)
@@ -1256,17 +1445,23 @@ class SetupWizard(QDialog):
         elif page_idx == _P_QBANKS:
             self.page_qbanks.refresh()
 
-        pos = self._flow_pos + 1 if self._flow else 1
-        total = len(self._flow) if self._flow else 5
+        pos = self._flow_pos + 1
+        total = max(len(self._flow), pos)
         self._step_lbl.setText(f"Step {pos} of {total}")
 
-        self._back_btn.setVisible(page_idx != _P_INTRO)
+        self._back_btn.setVisible(page_idx != _P_TOOLS)
 
-        # "Finish" on the last page of whatever flow this provider has.
-        is_last = bool(self._flow) and self._flow_pos == len(self._flow) - 1
+        # "Finish" on the last page of whatever flow this provider/tool
+        # selection produced. Tools and Intro always have a page after them —
+        # the full flow length isn't known until Intro's provider choice, so
+        # exclude both from the "last page" check.
+        is_last = (
+            page_idx not in (_P_TOOLS, _P_INTRO)
+            and self._flow_pos == len(self._flow) - 1
+        )
         self._next_btn.setText("Finish" if is_last else "Next →")
 
-        self._skip_btn.setVisible(page_idx == _P_INTRO)
+        self._skip_btn.setVisible(page_idx in (_P_TOOLS, _P_INTRO))
 
     def _go_next(self):
         current_page = self._stack.currentIndex()
@@ -1275,10 +1470,17 @@ class SetupWizard(QDialog):
         if not current_widget.validate():
             return
 
+        if current_page == _P_TOOLS:
+            self.selected_tools = self.page_tools.selected_tools()
+            self._flow = [_P_TOOLS, _P_INTRO]
+            self._flow_pos = 1
+            self._enter_page(_P_INTRO)
+            return
+
         if current_page == _P_INTRO:
             self.current_provider = self.page_intro.selected_provider()
-            self._flow = self._page_flow_for(self.current_provider)
-            self._flow_pos = 0
+            self._flow = [_P_TOOLS, _P_INTRO] + self._page_flow_for(self.current_provider)
+            self._flow_pos = 1
 
         if self._flow_pos < len(self._flow) - 1:
             self._flow_pos += 1
@@ -1330,6 +1532,18 @@ class SetupWizard(QDialog):
         notetype = self.page_defaults.selected_notetype()
 
         tools = self.cfg.setdefault("tools", {})
+
+        # Tool on/off + Browse's panel mode, from the Tools page — the single
+        # source of truth this wizard writes for `tools.<key>.enabled` /
+        # `tools.browse.native_only` (mirrors Settings → Tools).
+        sel = self.selected_tools
+        tools.setdefault("qbank", {})["enabled"]              = sel["qbank"]
+        tools.setdefault("browse", {})["enabled"]             = sel["browse"]
+        tools["browse"]["native_only"]                        = sel["browse_native_only"]
+        tools.setdefault("knowledge_gaps", {})["enabled"]     = sel["knowledge_gaps"]
+        tools.setdefault("gap_analyser", {})["enabled"]       = sel["knowledge_gaps"]
+        tools.setdefault("card_creator", {})["enabled"]       = sel["card_creator"]
+
         cc = tools.setdefault("card_creator", {})
         if deck:
             cc["default_deck"] = deck

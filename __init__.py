@@ -156,6 +156,36 @@ def _on_top_toolbar_init_links(links, top_toolbar) -> None:
         log.error(f"toolbar link failed: {e}")
 
 
+# ── Native browser — Ankisstant menu + AI Search checkbox ────────────────────
+#
+# Two things land in Anki's own card browser, both wired up here:
+#  - An "Ankisstant" menu with a "Settings…" entry — always present, regardless
+#    of which tools are enabled, so users can reach Ankisstant Settings (and
+#    set up an AI provider in the first place) without leaving the browser or
+#    needing the rest of Ankisstant "connected" first.
+#  - A "✨ AI Search" checkbox next to the search bar (gated on the AI Browse
+#    tool, since it reuses that tool's search-term-generation prompts/config).
+#    When it's on, typing a topic and pressing Enter sends it to AI and
+#    searches for the generated terms instead of the literal text.
+
+def _on_browser_menus_did_init(browser) -> None:
+    try:
+        menu = browser.form.menubar.addMenu("Ankisstant")
+        settings_action = QAction("Ankisstant Settings…", browser)
+        # Jump straight to the AI Browse tab — this menu only exists inside
+        # Anki's own Browse window, so that's almost always what's wanted.
+        settings_action.triggered.connect(lambda _checked=False: open_settings("browse"))
+        menu.addAction(settings_action)
+    except Exception as e:
+        log.error(f"browser settings menu failed: {e}")
+
+    try:
+        if tool_enabled("browse"):
+            _browse.install_native_ai_search(browser)
+    except Exception as e:
+        log.error(f"native AI search setup failed: {e}")
+
+
 def _on_deck_browser_render(deck_browser, content) -> None:
     try:
         # Heatmap (only when QBank is enabled and `show_heatmap` is true)
@@ -219,6 +249,7 @@ def _on_js_message(handled, message, context):
 # ── Register hooks ────────────────────────────────────────────────────────────
 
 gui_hooks.profile_did_open.append(_on_profile_loaded)
+gui_hooks.browser_menus_did_init.append(_on_browser_menus_did_init)
 gui_hooks.deck_browser_will_render_content.append(_on_deck_browser_render)
 gui_hooks.webview_did_receive_js_message.append(_on_js_message)
 gui_hooks.top_toolbar_did_init_links.append(_on_top_toolbar_init_links)

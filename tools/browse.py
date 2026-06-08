@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import html as _html
 import re
+import threading
 
 from aqt import mw
 from aqt.qt import (
@@ -22,8 +23,8 @@ from ..core.config import (
     mq_explain_enabled, tool_config, tool_model_for, save_tool_config,
 )
 from ..core.qt_utils import (
-    attach_tag_completer, loading, make_help_button, make_setup_banner,
-    provider_configured, run_claude_json, set_ai_buttons_enabled,
+    attach_tag_completer, is_manual_provider, loading, make_help_button,
+    make_setup_banner, provider_configured, run_claude_json, set_ai_buttons_enabled,
 )
 from . import autotag
 from .kg import engine
@@ -1473,6 +1474,187 @@ class BrowsePanel(QWidget):
                 self._advance_queue_after_done(done_id)
             except Exception as e:
                 print(f"[ankisstant] browse queue advance failed: {e}")
+
+
+# ── Native-browser AI search ─────────────────────────────────────────────────
+#
+# A small "✨ AI Search" checkbox sits right next to Anki's own search bar in
+# the native card browser. When it's on, pressing Enter doesn't run the typed
+# text as a literal Anki query — instead it's sent to AI as a topic (the exact
+# same SEARCH_TERMS_SYSTEM prompt and run_claude_json plumbing as AI Browse),
+# and the returned terms are combined into one query and searched instead.
+# Toggle it off to use the search bar normally. This keeps the workflow fully
+# inside Anki's familiar browser — no separate panel or popup to learn.
+
+_AI_CHECKBOX_TOOLTIP = (
+    "When on, typing a topic and pressing Enter sends it to AI for Anki search "
+    "terms (the same process as AI Browse) and searches for those instead of "
+    "the literal text. Turn off to search normally."
+)
+
+
+def _on_native_ai_toggle(checked: bool) -> None:
+    try:
+        cfg = tool_config("browse")
+        cfg["native_ai_search_enabled"] = bool(checked)
+        save_tool_config("browse", cfg)
+    except Exception as e:
+        print(f"[ankisstant] persist native AI search toggle failed: {e}")
+
+
+def _scoped_native_ai_query(cfg: dict, terms: list[str]) -> str:
+    """AND the AI-generated OR-group with the user's deck/tag/suspended scope
+    filters from Settings → AI Browse → "Native browser AI Search — scope"."""
+    clauses = ["(" + " OR ".join(f"({t})" for t in terms) + ")"]
+    scope = cfg.get("native_ai_search_scope") or {}
+    decks = [d.strip() for d in (scope.get("decks") or []) if d.strip()]
+    if decks:
+        clauses.append("(" + " OR ".join(f'deck:"{d}"' for d in decks) + ")")
+    tags = [t.strip() for t in (scope.get("tags") or []) if t.strip()]
+    if tags:
+        clauses.append("(" + " OR ".join(f'tag:"{t}"' for t in tags) + ")")
+    suspended = (scope.get("suspended") or "any").strip().lower()
+    if suspended == "suspended":
+        clauses.append("is:suspended")
+    elif suspended == "unsuspended":
+        clauses.append("-is:suspended")
+    return " ".join(clauses)
+
+
+def _apply_native_ai_results(browser, cfg: dict, reply) -> None:
+    if not isinstance(reply, list) or not all(isinstance(t, str) for t in reply):
+        return  # ask_claude_json already reported the failure
+    terms = [t.strip() for t in reply if t.strip()]
+    if not terms:
+        tooltip("AI returned no usable search terms.")
+        return
+
+    query = _scoped_native_ai_query(cfg, terms)
+    try:
+        # search_for() (lowercase) sets _lastSearchTxt, updates the line edit
+        # text and runs the search directly — unlike search_for_terms(), it
+        # does NOT call back into onSearchActivated, so it can't re-enter our
+        # wrapper above and mistake the generated query for a fresh topic.
+        browser.search_for(query)
+    except Exception as e:
+        print(f"[ankisstant] AI search couldn't run query: {e}")
+        return
+    tooltip("AI search for: " + ", ".join(terms), period=4000)
+
+
+def _set_native_ai_busy(checkbox, line_edit, busy: bool) -> None:
+    """Toggle the inline '⏳ Thinking…' state on the checkbox itself — a
+    lightweight in-place indicator next to the search bar instead of the modal
+    progress dialog (which yanks focus to the main Anki window)."""
+    try:
+        checkbox.setText("✨ AI Search ⏳ Thinking…" if busy else "✨ AI Search")
+        checkbox.setEnabled(not busy)
+        line_edit.setEnabled(not busy)
+    except RuntimeError:
+        pass  # browser closed mid-call
+
+
+def _run_native_ai_search(browser, checkbox, line_edit, topic: str) -> None:
+    if not provider_configured():
+        tooltip("Set up an AI provider in Ankisstant Settings first.", period=4000)
+        return
+
+    cfg = tool_config("browse")
+    model = tool_model_for("native_search")
+    kwargs = dict(prompt=f"Topic: {topic}", system=SEARCH_TERMS_SYSTEM,
+                  max_tokens=512, model=model)
+
+    if is_manual_provider():
+        # Interactive: the manual provider shows its own copy/paste dialog and
+        # must run on the main thread — no inline indicator needed here, the
+        # dialog itself is the "loading" state.
+        reply = core_api.ask_claude_json(**kwargs)
+        _apply_native_ai_results(browser, cfg, reply)
+        return
+
+    # Run the call on a background thread with a small inline indicator —
+    # *not* the modal QProgressDialog from run_claude_json/_run_claude, which
+    # is parented to the main window and yanks focus away from the browser.
+    _set_native_ai_busy(checkbox, line_edit, True)
+    cancel_ev = threading.Event()
+
+    def _bg():
+        core_api.set_cancel_event(cancel_ev)
+        try:
+            return core_api.ask_claude_json(show_errors=False, **kwargs)
+        finally:
+            core_api.set_cancel_event(None)
+
+    def _done(fut):
+        _set_native_ai_busy(checkbox, line_edit, False)
+        try:
+            reply = fut.result()
+        except Exception as e:
+            log.error(f"native AI search failed: {e}")
+            tooltip("Claude call failed — see console for details.", period=4000)
+            return
+        if reply is None:
+            tooltip("Claude call failed — see console for details.", period=4000)
+            return
+        _apply_native_ai_results(browser, cfg, reply)
+
+    mw.taskman.run_in_background(_bg, _done)
+
+
+def install_native_ai_search(browser) -> None:
+    """Add the '✨ AI Search' checkbox next to the browser's search bar and
+    wrap onSearchActivated so that, while it's checked, pressing Enter sends
+    the typed topic to AI and searches the generated terms instead of the
+    literal text. Called once per browser window from __init__.py via
+    gui_hooks.browser_menus_did_init (which — despite the name — fires once
+    at window construction, the usual place addons add one-off browser UI,
+    and crucially *before* Browser.setupSearch() wires up the search bar)."""
+    try:
+        search_edit = browser.form.searchEdit
+        line_edit = search_edit.lineEdit()
+
+        cfg = tool_config("browse")
+        cb = QCheckBox("✨ AI Search")
+        cb.setToolTip(_AI_CHECKBOX_TOOLTIP)
+        cb.setChecked(bool(cfg.get("native_ai_search_enabled", False)))
+        cb.toggled.connect(_on_native_ai_toggle)
+
+        # The search bar and the Cards/Notes switch both live in
+        # browser.form.gridLayout, row 0 — switch at column 0, search box at
+        # column 1 (see aqt.browser.browser.Browser.setup_table /
+        # _aqt.forms.browser_qt6). Column 2 is free; placing the checkbox
+        # there puts it inline with both, not appended after the whole page.
+        grid = getattr(browser.form, "gridLayout", None)
+        if grid is not None:
+            grid.addWidget(cb, 0, 2)
+        else:
+            search_edit.parentWidget().layout().addWidget(cb)
+
+        # Wrap the bound onSearchActivated as an instance attribute. Because
+        # this hook fires before setupSearch() runs, Anki's own
+        # `qconnect(line_edit.returnPressed, self.onSearchActivated)` resolves
+        # `self.onSearchActivated` to *our* wrapper (instance attributes shadow
+        # class methods) — so a real Enter-press in the search bar routes
+        # through us. Other paths that trigger a search programmatically
+        # (sidebar clicks via search_for, AI Browse's search_for_terms, etc.)
+        # either skip onSearchActivated entirely or invoke it as a plain method
+        # call rather than through the line edit's signal — neither carries its
+        # signal context, so checking sender() lets us tell a genuine keypress
+        # apart from those and only intercept the former.
+        original_on_search_activated = browser.onSearchActivated
+
+        def _wrapped_on_search_activated():
+            if cb.isChecked() and browser.sender() is line_edit:
+                topic = browser.current_search().strip()
+                if topic:
+                    _run_native_ai_search(browser, cb, line_edit, topic)
+                    return
+            original_on_search_activated()
+
+        browser.onSearchActivated = _wrapped_on_search_activated
+        browser._ankisstant_ai_search_checkbox = cb
+    except Exception as e:
+        log.error(f"native AI search install failed: {e}")
 
 
 # ── Tool contract ────────────────────────────────────────────────────────────

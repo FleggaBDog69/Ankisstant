@@ -1,6 +1,6 @@
 # Unified settings dialog for Ankisstant.
-# Tabs: Global, QBank, Browse, Create with Claude.
-# Global section owns the shared API key, CLI path and provider mode.
+# Tabs: AI, Tools, QBank, Browse, Knowledge Gaps, Create, About.
+# AI tab owns the shared API key, CLI path and provider mode.
 # Each tool tab edits its tools[<key>] config slice.
 
 from __future__ import annotations
@@ -20,8 +20,9 @@ from aqt.utils import showInfo, showWarning, tooltip
 from ..core import api as core_api
 from ..core.config import (
     DEFAULTS, PROVIDER_MODELS, active_family, ai_tools, family_for, load_config,
-    save_config,
+    save_config, tool_config, tool_enabled,
 )
+from ..core.qt_utils import attach_deck_completer, attach_tag_completer
 from ..tools import skills_catalog
 
 
@@ -256,6 +257,47 @@ def _set_form_row_visible(form: QFormLayout, field: QWidget, visible: bool) -> N
 
 def _slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (text or "").lower())[:24] or "qbank"
+
+
+def _link_checkbox(a: QCheckBox, b: QCheckBox) -> None:
+    """Keep two checkboxes that edit the same shared setting in sync — Qt
+    only re-emits `toggled` when the value actually changes, so this can't
+    loop. Used for "Month tag", which is shown on both the Browse and Create
+    tabs (it's a single global setting, just relevant to both flows)."""
+    a.toggled.connect(b.setChecked)
+    b.toggled.connect(a.setChecked)
+
+
+def _link_lineedit(a: QLineEdit, b: QLineEdit) -> None:
+    """Keep two line edits that edit the same shared setting in sync (see
+    `_link_checkbox` — same no-loop guarantee via Qt's change-only emission)."""
+    a.textChanged.connect(b.setText)
+    b.textChanged.connect(a.setText)
+
+
+def _month_tag_group(cfg: dict) -> tuple[QGroupBox, QCheckBox, QLineEdit]:
+    """Build a 'Month tag' group box — shown on both the Browse and Create
+    tabs since both flows can apply it. Returns the box plus the checkbox/
+    line-edit so the caller can sync the two copies and read back values."""
+    box = QGroupBox("Month tag")
+    form = _expand_form(QFormLayout(box))
+    form.setVerticalSpacing(8)
+    chk = QCheckBox("Add a month tag to created & unsuspended cards")
+    chk.setChecked(bool(cfg.get("month_tag_enabled", True)))
+    chk.setToolTip(
+        "When on, every card you create (Create) or unsuspend/tag (Browse) "
+        "also gets a tag <prefix>::<YYYY-MM> for the current month."
+    )
+    form.addRow(chk)
+    prefix = QLineEdit(str(cfg.get("month_tag_prefix", "Ankisstant::Month") or ""))
+    prefix.setMinimumWidth(360)
+    prefix.setPlaceholderText("e.g. Ankisstant::Month")
+    prefix.setToolTip(
+        "Root of the month tag. The current month (YYYY-MM) is appended, "
+        "e.g. Ankisstant::Month::2026-05."
+    )
+    form.addRow("Prefix:", prefix)
+    return box, chk, prefix
 
 
 # ── sub-dialogs (for QBank list editing) ──────────────────────────────────────
@@ -646,6 +688,24 @@ def _key_family_for(provider: str) -> str | None:
     return None  # cli
 
 
+def _matrix_tool_in_use(matrix_key: str) -> bool:
+    """Whether a per-tool model row on the AI tab corresponds to a tool the
+    user has actually selected (Settings → Tools). Greyed out otherwise —
+    e.g. no point seeing a 'Card creation' model picker if only Browse is on.
+    Mirrors the call sites of `tool_model_for(<matrix_key>, ...)`."""
+    if matrix_key == "card_creation":
+        return tool_enabled("card_creator")
+    if matrix_key == "search":
+        return tool_enabled("browse") and not tool_config("browse").get("native_only")
+    if matrix_key == "native_search":
+        return tool_enabled("browse")
+    if matrix_key == "gap_analysis":
+        return tool_enabled("knowledge_gaps") and tool_enabled("gap_analyser")
+    if matrix_key == "quality_pass":
+        return tool_enabled("card_creator")
+    return True
+
+
 class _AITab(QWidget):
     """Dedicated AI/provider screen: pick a provider, paste its key, choose a
     default model. The key field and CLI rows adapt to the selected provider."""
@@ -776,6 +836,18 @@ class _AITab(QWidget):
             mfield = _ModelField(slot.get("model"), dflt, fam0, min_width=320)
             self._matrix_models[key] = mfield
             mf.addRow(f"{tool['label']} model:", mfield)
+            # Grey out rows for tools the user hasn't selected — no point
+            # showing a "Card creation model" picker to someone who only
+            # wants Browse. Toggle tools in Settings → Tools.
+            if not _matrix_tool_in_use(key):
+                mfield.setEnabled(False)
+                mfield.setToolTip(
+                    "Greyed out — this tool isn't selected. Turn it on in "
+                    "Settings → Tools to use this model."
+                )
+                row_label = mf.labelForField(mfield)
+                if row_label is not None:
+                    row_label.setEnabled(False)
         layout.addRow(self._matrix_box)
 
         # ── Skills & assistants (provider-adaptive) ─────────────────────────
@@ -922,8 +994,9 @@ class _AITab(QWidget):
             else:
                 showWarning(
                     "Test failed — see Anki's console for the error. If you're on "
-                    "Gemini's free tier, make sure the model is Gemini 2.5 Flash "
-                    "(2.0 Flash and 2.5 Pro have no free quota)."
+                    "Gemini's free tier, try the model Gemini 3.5 Flash — it's "
+                    "the most reliable free-tier option (2.0 Flash and 2.5 Pro "
+                    "have no free quota, and 2.5 Flash often hits quota errors)."
                 )
 
         mw.taskman.run_in_background(work, done)
@@ -1100,38 +1173,88 @@ class _GlobalTab(QWidget):
         layout.setVerticalSpacing(10)
 
         intro = QLabel(
-            "General options. AI provider, keys and models now live on the "
-            "<b>AI</b> tab."
+            "Pick which Ankisstant tools you actually want — disabled ones "
+            "stop showing up here and in the Ankisstant window. (AI provider, "
+            "keys and models live on the <b>AI</b> tab; Month tag lives in "
+            "Browse / Create settings.)"
         )
         intro.setWordWrap(True)
         intro.setTextFormat(Qt.TextFormat.RichText)
         intro.setStyleSheet("color: gray;")
         layout.addRow(intro)
 
-        # ── Month tag — temporality for created / unsuspended cards ──────────
-        self._month_tag = QCheckBox("Add a month tag to created & unsuspended cards")
-        self._month_tag.setChecked(bool(cfg.get("month_tag_enabled", True)))
-        self._month_tag.setToolTip(
-            "When on, every card you create (Create) or unsuspend/tag (Browse) "
-            "also gets a tag <prefix>::<YYYY-MM> for the current month."
-        )
-        layout.addRow("Month tag:", self._month_tag)
+        # ── Tools — single on/off switchboard ─────────────────────────────────
+        # Moved here from each tool's own tab so users who only want a couple
+        # of tools aren't shown a wall of tabs/settings for the rest. A
+        # disabled tool's tab disappears from this dialog (reopen to see the
+        # change) and its entry disappears from the Ankisstant window sidebar.
+        tools_box = QGroupBox()
+        tb = QVBoxLayout(tools_box)
+        tb.setSpacing(6)
 
-        self._month_tag_prefix = QLineEdit(
-            str(cfg.get("month_tag_prefix", "Ankisstant::Month") or "")
+        tools_hint = QLabel(
+            "<small>Turn tools on or off — disabled tools are hidden from "
+            "both this dialog and the Ankisstant window. Reopen Settings "
+            "after changing these to see updated tabs.</small>"
         )
-        self._month_tag_prefix.setMinimumWidth(360)
-        self._month_tag_prefix.setPlaceholderText("e.g. Ankisstant::Month")
-        self._month_tag_prefix.setToolTip(
-            "Root of the month tag. The current month (YYYY-MM) is appended, "
-            "e.g. Ankisstant::Month::2026-05."
-        )
-        layout.addRow("Month tag prefix:", self._month_tag_prefix)
+        tools_hint.setWordWrap(True)
+        tools_hint.setTextFormat(Qt.TextFormat.RichText)
+        tools_hint.setStyleSheet("color: gray;")
+        tb.addWidget(tools_hint)
 
-    def get_values(self) -> dict:
+        tools_cfg = cfg.get("tools", {})
+
+        self._tool_qbank = QCheckBox("AI QBank")
+        self._tool_qbank.setChecked(bool(tools_cfg.get("qbank", {}).get("enabled", True)))
+        tb.addWidget(self._tool_qbank)
+
+        browse_row = QHBoxLayout()
+        browse_row.addWidget(QLabel("AI Browse:"))
+        self._browse_mode = QComboBox()
+        self._browse_mode.addItem("Off", "off")
+        self._browse_mode.addItem(
+            "Native search only — lightweight checkbox in Anki's own Browse window",
+            "native_only",
+        )
+        self._browse_mode.addItem("Full AI Browse panel (includes native search)", "full")
+        br_cfg = tools_cfg.get("browse", {})
+        if not br_cfg.get("enabled", True):
+            cur_mode = "off"
+        elif br_cfg.get("native_only"):
+            cur_mode = "native_only"
+        else:
+            cur_mode = "full"
+        self._browse_mode.setCurrentIndex(max(0, self._browse_mode.findData(cur_mode)))
+        browse_row.addWidget(self._browse_mode, 1)
+        tb.addLayout(browse_row)
+
+        self._tool_kg = QCheckBox("Knowledge Gaps")
+        self._tool_kg.setChecked(bool(tools_cfg.get("knowledge_gaps", {}).get("enabled", True)))
+        tb.addWidget(self._tool_kg)
+
+        self._tool_ga = QCheckBox("    ↳ Analyse Knowledge Gaps (AI sub-feature)")
+        self._tool_ga.setChecked(bool(tools_cfg.get("gap_analyser", {}).get("enabled", True)))
+        self._tool_ga.setEnabled(self._tool_kg.isChecked())
+        self._tool_kg.toggled.connect(self._tool_ga.setEnabled)
+        tb.addWidget(self._tool_ga)
+
+        self._tool_creator = QCheckBox("AI Create")
+        self._tool_creator.setChecked(bool(tools_cfg.get("card_creator", {}).get("enabled", True)))
+        tb.addWidget(self._tool_creator)
+
+        layout.addRow(tools_box)
+
+    def get_tool_states(self) -> dict:
+        """Per-tool enabled flags (+ Browse's panel mode) — the single source
+        of truth for `tools.<key>.enabled` / `tools.browse.native_only`."""
+        mode = self._browse_mode.currentData() or "full"
         return {
-            "month_tag_enabled":   bool(self._month_tag.isChecked()),
-            "month_tag_prefix":    self._month_tag_prefix.text().strip(),
+            "qbank":              self._tool_qbank.isChecked(),
+            "browse":             mode != "off",
+            "browse_native_only": mode == "native_only",
+            "knowledge_gaps":     self._tool_kg.isChecked(),
+            "gap_analyser":       self._tool_ga.isChecked(),
+            "card_creator":       self._tool_creator.isChecked(),
         }
 
 
@@ -1145,10 +1268,6 @@ class _QBankTab(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(10)
-
-        self._enabled = QCheckBox("Enable AI QBank")
-        self._enabled.setChecked(bool(qb_cfg.get("enabled", True)))
-        root.addWidget(self._enabled)
 
         self._show_heatmap = QCheckBox("Show heatmap on the deck browser home screen")
         self._show_heatmap.setChecked(bool(qb_cfg.get("show_heatmap", True)))
@@ -1436,7 +1555,6 @@ class _QBankTab(QWidget):
 
     def get_values(self) -> dict:
         return {
-            "enabled":        self._enabled.isChecked(),
             "show_heatmap":   self._show_heatmap.isChecked(),
             "show_weakness":  self._show_weakness.isChecked(),
             "weakness_window_days": self._weak_windows[self._weakness_window.currentIndex()][1],
@@ -1457,87 +1575,170 @@ class _QBankTab(QWidget):
 
 
 class _BrowseTab(QWidget):
-    def __init__(self, br_cfg: dict, parent=None):
+    def __init__(self, br_cfg: dict, cfg: dict | None = None, parent=None):
         super().__init__(parent)
+        self._br_cfg = br_cfg
+        self._native_only = bool(br_cfg.get("native_only", False))
+        self._source_tags = list(br_cfg.get("source_tags") or [])
+        cfg = cfg or {}
+
         layout = _expand_form(QFormLayout(self))
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setVerticalSpacing(10)
 
-        self._enabled = QCheckBox("Enable AI Browse")
-        self._enabled.setChecked(bool(br_cfg.get("enabled", True)))
-        layout.addRow(self._enabled)
+        # On/off + the native-search-only mode now live in Settings → Tools,
+        # since they decide whether this whole tab is even shown.
 
-        # Model lives on the AI tab (Settings → AI → "Search / Browse" model).
-        # There is deliberately no tool-local model picker here any more — the
-        # per-tool matrix is the single source of truth.
+        if self._native_only:
+            note = QLabel(
+                "<small>Only the lightweight in-browser <b>✨ AI Search</b> is "
+                "active — the full AI Browse panel is hidden, so its settings "
+                "are too. Switch modes in <b>Settings → Tools</b>.</small>"
+            )
+            note.setWordWrap(True)
+            note.setTextFormat(Qt.TextFormat.RichText)
+            note.setStyleSheet("color: gray;")
+            layout.addRow(note)
+        else:
+            # Model lives on the AI tab (Settings → AI → "Search / Browse"
+            # model). There is deliberately no tool-local model picker here —
+            # the per-tool matrix is the single source of truth.
 
-        self._last_tag = QLineEdit(br_cfg.get("last_used_tag", ""))
-        self._last_tag.setMinimumWidth(420)
-        self._last_tag.setPlaceholderText("e.g. School::Year3")
-        layout.addRow("Last-used tag:", self._last_tag)
+            self._last_tag = QLineEdit(br_cfg.get("last_used_tag", ""))
+            self._last_tag.setMinimumWidth(420)
+            self._last_tag.setPlaceholderText("e.g. School::Year3")
+            layout.addRow("Last-used tag:", self._last_tag)
 
-        self._max = QSpinBox()
-        self._max.setRange(1, 1000)
-        self._max.setValue(int(br_cfg.get("max_results", 50)))
-        layout.addRow("Max results:", self._max)
+            self._max = QSpinBox()
+            self._max.setRange(1, 1000)
+            self._max.setValue(int(br_cfg.get("max_results", 50)))
+            layout.addRow("Max results:", self._max)
 
-        self._notetype_filter = QLineEdit(br_cfg.get("notetype_filter", ""))
-        self._notetype_filter.setMinimumWidth(420)
-        self._notetype_filter.setPlaceholderText("e.g. Cloze (leave blank to search all)")
-        layout.addRow("Notetype filter:", self._notetype_filter)
+            self._notetype_filter = QLineEdit(br_cfg.get("notetype_filter", ""))
+            self._notetype_filter.setMinimumWidth(420)
+            self._notetype_filter.setPlaceholderText("e.g. Cloze (leave blank to search all)")
+            layout.addRow("Notetype filter:", self._notetype_filter)
 
-        self._front_field = QLineEdit(br_cfg.get("front_field", "Text"))
-        self._front_field.setMinimumWidth(420)
-        layout.addRow("Front field:", self._front_field)
+            self._front_field = QLineEdit(br_cfg.get("front_field", "Text"))
+            self._front_field.setMinimumWidth(420)
+            layout.addRow("Front field:", self._front_field)
 
-        self._audit_tag = QLineEdit(br_cfg.get("audit_tag", ""))
-        self._audit_tag.setMinimumWidth(420)
-        self._audit_tag.setPlaceholderText("e.g. Ankisstant::AI::Browse")
-        layout.addRow("Audit tag:", self._audit_tag)
+            self._audit_tag = QLineEdit(br_cfg.get("audit_tag", ""))
+            self._audit_tag.setMinimumWidth(420)
+            self._audit_tag.setPlaceholderText("e.g. Ankisstant::AI::Browse")
+            layout.addRow("Audit tag:", self._audit_tag)
 
-        # Hierarchical auto-tag: the AI suggests a tag for the searched topic
-        # and pre-fills the "Tag to apply" field. The scheme (base prefix +
-        # type + levels) is the SHARED one configured under Knowledge Gaps —
-        # there's no Browse-specific prefix. A free search is tagged as KG; a
-        # search loaded from a KG uses that KG's type.
-        self._auto_tag = QCheckBox("Auto-suggest a hierarchical tag on topic search")
-        self._auto_tag.setChecked(bool(br_cfg.get("auto_tag", True)))
-        self._auto_tag.setToolTip(
-            "When you search a topic, ask the AI for {system}::{subsystem}::"
-            "{topic} and pre-fill the 'Tag to apply' field using the shared "
-            "auto-tag scheme (set under Knowledge Gaps → Auto-tag). Won't "
-            "overwrite a tag you've already typed or one carried from a KG."
+            # Hierarchical auto-tag: the AI suggests a tag for the searched
+            # topic and pre-fills the "Tag to apply" field. The scheme (base
+            # prefix + type + levels) is the SHARED one configured under
+            # Knowledge Gaps — there's no Browse-specific prefix. A free
+            # search is tagged as KG; a search loaded from a KG uses that
+            # KG's type.
+            self._auto_tag = QCheckBox("Auto-suggest a hierarchical tag on topic search")
+            self._auto_tag.setChecked(bool(br_cfg.get("auto_tag", True)))
+            self._auto_tag.setToolTip(
+                "When you search a topic, ask the AI for {system}::{subsystem}::"
+                "{topic} and pre-fill the 'Tag to apply' field using the shared "
+                "auto-tag scheme (set under Knowledge Gaps → Auto-tag). Won't "
+                "overwrite a tag you've already typed or one carried from a KG."
+            )
+            layout.addRow("Auto-tag:", self._auto_tag)
+            at_hint = QLabel(
+                "<small>Tag scheme &amp; base prefix live in "
+                "<b>Knowledge Gaps → Auto-tag</b>.</small>"
+            )
+            at_hint.setStyleSheet("color: gray;")
+            at_hint.setTextFormat(Qt.TextFormat.RichText)
+            layout.addRow("", at_hint)
+
+            st_hint = QLabel("<small>Source-deck badges are edited in the addon config JSON.</small>")
+            st_hint.setStyleSheet("color: gray;")
+            st_hint.setTextFormat(Qt.TextFormat.RichText)
+            layout.addRow(st_hint)
+
+            # Shared with Create — both flows can apply it, so it's shown
+            # (and kept in sync) in both places. See _link_checkbox/_link_lineedit.
+            mt_box, self._month_tag, self._month_tag_prefix = _month_tag_group(cfg)
+            layout.addRow(mt_box)
+
+        # ── Native browser AI Search — scope filters ─────────────────────────
+        # Restricts what the "✨ AI Search" checkbox in Anki's own Browse window
+        # searches over. The AI-generated terms are AND-ed with these — e.g.
+        # "(term1) OR (term2)" "(deck:"A" OR deck:"B")" "is:suspended".
+        scope = br_cfg.get("native_ai_search_scope") or {}
+        scope_box = QGroupBox("Native browser AI Search — scope")
+        sf = _expand_form(QFormLayout(scope_box))
+        sf.setVerticalSpacing(10)
+
+        scope_hint = QLabel(
+            "<small>Optional — narrows what the search-bar checkbox in Anki's "
+            "own Browse window searches. Leave blank to search everywhere.</small>"
         )
-        layout.addRow("Auto-tag:", self._auto_tag)
-        at_hint = QLabel(
-            "<small>Tag scheme &amp; base prefix live in "
-            "<b>Knowledge Gaps → Auto-tag</b>.</small>"
-        )
-        at_hint.setStyleSheet("color: gray;")
-        at_hint.setTextFormat(Qt.TextFormat.RichText)
-        layout.addRow("", at_hint)
+        scope_hint.setStyleSheet("color: gray;")
+        scope_hint.setTextFormat(Qt.TextFormat.RichText)
+        scope_hint.setWordWrap(True)
+        sf.addRow(scope_hint)
 
-        st_hint = QLabel("<small>Source-deck badges are edited in the addon config JSON.</small>")
-        st_hint.setStyleSheet("color: gray;")
-        st_hint.setTextFormat(Qt.TextFormat.RichText)
-        layout.addRow(st_hint)
+        self._scope_decks = QLineEdit(", ".join(scope.get("decks") or []))
+        self._scope_decks.setMinimumWidth(420)
+        self._scope_decks.setPlaceholderText("e.g. School::Year3, MCAT (comma-separated, blank = all decks)")
+        attach_deck_completer(self._scope_decks, multi=True)
+        sf.addRow("Limit to decks:", self._scope_decks)
 
-        self._source_tags = list(br_cfg.get("source_tags") or [])
+        self._scope_tags = QLineEdit(", ".join(scope.get("tags") or []))
+        self._scope_tags.setMinimumWidth(420)
+        self._scope_tags.setPlaceholderText("e.g. weak, AnKing (comma-separated, blank = all tags)")
+        attach_tag_completer(self._scope_tags, multi=True)
+        sf.addRow("Limit to tags:", self._scope_tags)
+
+        self._scope_suspended = QComboBox()
+        self._scope_suspended.addItem("Any (suspended or not)", "any")
+        self._scope_suspended.addItem("Only suspended cards", "suspended")
+        self._scope_suspended.addItem("Only unsuspended cards", "unsuspended")
+        cur_susp = (scope.get("suspended") or "any").strip().lower()
+        idx = max(0, self._scope_suspended.findData(cur_susp))
+        self._scope_suspended.setCurrentIndex(idx)
+        sf.addRow("Suspended:", self._scope_suspended)
+
+        layout.addRow(scope_box)
 
     def set_model_family(self, family: str, manual: bool = False) -> None:
         # No tool-local model widget: the model resolves from the AI tab matrix.
         return
 
     def get_values(self) -> dict:
+        decks = [d.strip() for d in self._scope_decks.text().split(",") if d.strip()]
+        tags = [t.strip() for t in self._scope_tags.text().split(",") if t.strip()]
+
+        # In native-only mode the full-panel fields aren't built — preserve
+        # whatever was already on disk so toggling modes never loses settings.
+        if self._native_only:
+            full_panel = {
+                "last_used_tag":   self._br_cfg.get("last_used_tag", ""),
+                "max_results":     self._br_cfg.get("max_results", 50),
+                "notetype_filter": self._br_cfg.get("notetype_filter", ""),
+                "front_field":     self._br_cfg.get("front_field", "Text"),
+                "audit_tag":       self._br_cfg.get("audit_tag", ""),
+                "auto_tag":        self._br_cfg.get("auto_tag", True),
+            }
+        else:
+            full_panel = {
+                "last_used_tag":   self._last_tag.text().strip(),
+                "max_results":     int(self._max.value()),
+                "notetype_filter": self._notetype_filter.text().strip(),
+                "front_field":     self._front_field.text().strip() or "Text",
+                "audit_tag":       self._audit_tag.text().strip(),
+                "auto_tag":        self._auto_tag.isChecked(),
+            }
+
         return {
-            "enabled":           self._enabled.isChecked(),
-            "last_used_tag":     self._last_tag.text().strip(),
-            "max_results":       int(self._max.value()),
-            "notetype_filter":   self._notetype_filter.text().strip(),
-            "front_field":       self._front_field.text().strip() or "Text",
-            "audit_tag":         self._audit_tag.text().strip(),
+            **full_panel,
             "source_tags":       self._source_tags,
-            "auto_tag":          self._auto_tag.isChecked(),
+            "native_ai_search_scope": {
+                "decks":     decks,
+                "tags":      tags,
+                "suspended": self._scope_suspended.currentData() or "any",
+            },
         }
 
 
@@ -2035,10 +2236,6 @@ class _KnowledgeGapsTab(QWidget):
         form = _expand_form(QFormLayout())
         form.setVerticalSpacing(8)
 
-        self._enabled = QCheckBox("Enable Knowledge Gaps tab")
-        self._enabled.setChecked(bool(kg_cfg.get("enabled", True)))
-        form.addRow(self._enabled)
-
         self._show_home_button = QCheckBox(
             "Show ＋ KG button on the deck browser home screen"
         )
@@ -2122,10 +2319,6 @@ class _KnowledgeGapsTab(QWidget):
         ab = QFormLayout(analyse_box)
         ab.setContentsMargins(10, 8, 10, 8)
         ab.setVerticalSpacing(8)
-
-        self._ga_enabled = QCheckBox("Enable Analyse KG")
-        self._ga_enabled.setChecked(bool(ga_cfg.get("enabled", True)))
-        ab.addRow(self._ga_enabled)
 
         # Model lives on the AI tab (Settings → AI → "Gap analysis" model).
         # No tool-local picker here — the per-tool matrix is the single source.
@@ -2269,7 +2462,6 @@ class _KnowledgeGapsTab(QWidget):
 
     def get_values(self) -> dict:
         return {
-            "enabled":               self._enabled.isChecked(),
             "show_home_button":      self._show_home_button.isChecked(),
             "confirm_on_delete":     self._confirm_on_delete.isChecked(),
             "default_status_on_add": "open",
@@ -2288,7 +2480,6 @@ class _KnowledgeGapsTab(QWidget):
 
     def get_gap_analyser_values(self) -> dict:
         return {
-            "enabled":         self._ga_enabled.isChecked(),
             "front_field":     self._ga_front_field.text().strip() or "Text",
             "notetype_filter": self._ga_notetype_filter.text().strip(),
             "last_used_tag":   self._ga_last_tag.text().strip(),
@@ -2298,8 +2489,9 @@ class _KnowledgeGapsTab(QWidget):
 
 
 class _CreatorTab(QWidget):
-    def __init__(self, cc_cfg: dict, parent=None):
+    def __init__(self, cc_cfg: dict, cfg: dict | None = None, parent=None):
         super().__init__(parent)
+        cfg = cfg or {}
         # Snapshot the profile list so add/edit/remove dialogs operate on a
         # working copy that we only persist on Save.
         self._profiles: list[dict] = [dict(p) for p in cc_cfg.get("notetypes", [])]
@@ -2315,10 +2507,6 @@ class _CreatorTab(QWidget):
         # ── Basic options (top form) ─────────────────────────────────────────
         top_form = _expand_form(QFormLayout())
         top_form.setVerticalSpacing(10)
-
-        self._enabled = QCheckBox("Enable AI Create")
-        self._enabled.setChecked(bool(cc_cfg.get("enabled", True)))
-        top_form.addRow(self._enabled)
 
         # Model lives on the AI tab (Settings → AI → "Card creation" model).
         # No tool-local picker here — the per-tool matrix is the single source.
@@ -2380,6 +2568,11 @@ class _CreatorTab(QWidget):
         top_form.addRow("Max parallel background jobs:", self._max_parallel)
 
         root.addLayout(top_form)
+
+        # Shared with Browse — both flows can apply it, so it's shown (and
+        # kept in sync) in both places. See _link_checkbox/_link_lineedit.
+        mt_box, self._month_tag, self._month_tag_prefix = _month_tag_group(cfg)
+        root.addWidget(mt_box)
 
         # ── Notetype profiles ────────────────────────────────────────────────
         nt_box = QGroupBox("Notetypes")
@@ -2545,7 +2738,6 @@ class _CreatorTab(QWidget):
         # path) keeps working, but the panel reads from the profile list.
         first = self._profiles[0] if self._profiles else {}
         return {
-            "enabled":          self._enabled.isChecked(),
             "default_deck":     self._deck.currentText().strip(),
             "default_tags":     tags_raw,
             "audit_tag":        self._audit_tag.text().strip(),
@@ -2674,14 +2866,14 @@ class _AboutTab(QWidget):
 # ── main dialog ──────────────────────────────────────────────────────────────
 
 class SettingsDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, initial_tab: str | None = None):
         super().__init__(parent)
         self._original_cfg = load_config()
         self.setWindowTitle("Ankisstant — Settings")
         self.setMinimumSize(820, 680)
-        self._build()
+        self._build(initial_tab)
 
-    def _build(self):
+    def _build(self, initial_tab: str | None = None):
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(8)
@@ -2690,21 +2882,46 @@ class SettingsDialog(QDialog):
         self._ai_tab      = _AITab(self._original_cfg)
         self._global_tab  = _GlobalTab(self._original_cfg)
         self._qbank_tab   = _QBankTab(self._original_cfg.get("tools", {}).get("qbank", {}))
-        self._browse_tab  = _BrowseTab(self._original_cfg.get("tools", {}).get("browse", {}))
+        self._browse_tab  = _BrowseTab(self._original_cfg.get("tools", {}).get("browse", {}), self._original_cfg)
         self._kg_tab      = _KnowledgeGapsTab(
             self._original_cfg.get("tools", {}).get("knowledge_gaps", {}),
             self._original_cfg.get("tools", {}).get("gap_analyser", {}),
         )
-        self._creator_tab = _CreatorTab(self._original_cfg.get("tools", {}).get("card_creator", {}))
+        self._creator_tab = _CreatorTab(self._original_cfg.get("tools", {}).get("card_creator", {}), self._original_cfg)
         self._about_tab   = _AboutTab()
+
+        # Browse and Create both show a "Month tag" group editing the same
+        # shared setting — keep the two copies in sync so either one reflects
+        # what'll actually be saved (read back from the Create tab's copy,
+        # which always exists; Browse's may be absent in native-only mode).
+        if hasattr(self._browse_tab, "_month_tag"):
+            _link_checkbox(self._browse_tab._month_tag, self._creator_tab._month_tag)
+            _link_lineedit(self._browse_tab._month_tag_prefix, self._creator_tab._month_tag_prefix)
+
         tabs.addTab(_wrap_scroll(self._ai_tab),      "AI")
-        tabs.addTab(_wrap_scroll(self._global_tab),  "Global")
-        tabs.addTab(_wrap_scroll(self._qbank_tab),   "AI QBank")
-        tabs.addTab(_wrap_scroll(self._browse_tab),  "AI Browse")
-        tabs.addTab(_wrap_scroll(self._kg_tab),      "Knowledge Gaps")
-        tabs.addTab(_wrap_scroll(self._creator_tab), "AI Create")
+        tabs.addTab(_wrap_scroll(self._global_tab),  "Tools")
+
+        # Tabs for disabled tools are hidden entirely — keeps the dialog from
+        # being a wall of irrelevant settings for users who only want one or
+        # two tools. The tab widgets themselves are still built (above) so
+        # get_values() always has something to read on save, and a tool
+        # re-enabled later picks its settings back up unchanged.
+        self._tab_index_for_key: dict[str, int] = {}
+        if tool_enabled("qbank"):
+            self._tab_index_for_key["qbank"] = tabs.addTab(_wrap_scroll(self._qbank_tab), "AI QBank")
+        if tool_enabled("browse"):
+            self._tab_index_for_key["browse"] = tabs.addTab(_wrap_scroll(self._browse_tab), "AI Browse")
+        if tool_enabled("knowledge_gaps"):
+            self._tab_index_for_key["knowledge_gaps"] = tabs.addTab(_wrap_scroll(self._kg_tab), "Knowledge Gaps")
+        if tool_enabled("card_creator"):
+            self._tab_index_for_key["card_creator"] = tabs.addTab(_wrap_scroll(self._creator_tab), "AI Create")
+
         tabs.addTab(_wrap_scroll(self._about_tab),   "About")
         root.addWidget(tabs)
+        self._tabs = tabs
+
+        if initial_tab and initial_tab in self._tab_index_for_key:
+            tabs.setCurrentIndex(self._tab_index_for_key[initial_tab])
 
         # Keep every tool tab's model pickers in sync with the AI tab's provider.
         self._ai_tab.on_provider_changed = self._sync_tool_models
@@ -2735,13 +2952,29 @@ class SettingsDialog(QDialog):
     def _on_save(self):
         cfg = load_config()
         cfg.update(self._ai_tab.get_values())
-        cfg.update(self._global_tab.get_values())
+        # Month tag — a single shared setting, edited from both the Browse
+        # and Create tabs (kept in sync at construction; the Create tab's
+        # copy always exists, even when Browse is in native-only mode).
+        cfg["month_tag_enabled"] = bool(self._creator_tab._month_tag.isChecked())
+        cfg["month_tag_prefix"]  = self._creator_tab._month_tag_prefix.text().strip()
         cfg.setdefault("tools", {})
         cfg["tools"]["qbank"]        = {**cfg["tools"].get("qbank", {}),        **self._qbank_tab.get_values()}
         cfg["tools"]["browse"]       = {**cfg["tools"].get("browse", {}),       **self._browse_tab.get_values()}
         cfg["tools"]["knowledge_gaps"] = {**cfg["tools"].get("knowledge_gaps", {}), **self._kg_tab.get_values()}
         cfg["tools"]["gap_analyser"]   = {**cfg["tools"].get("gap_analyser", {}),   **self._kg_tab.get_gap_analyser_values()}
         cfg["tools"]["card_creator"]   = {**cfg["tools"].get("card_creator", {}),   **self._creator_tab.get_values()}
+
+        # Tool on/off + Browse's panel mode — single source of truth is the
+        # Tools tab's switchboard (each tool's own tab no longer has
+        # its own "Enable X" checkbox).
+        states = self._global_tab.get_tool_states()
+        cfg["tools"]["qbank"]["enabled"]          = states["qbank"]
+        cfg["tools"]["browse"]["enabled"]         = states["browse"]
+        cfg["tools"]["browse"]["native_only"]     = states["browse_native_only"]
+        cfg["tools"]["knowledge_gaps"]["enabled"] = states["knowledge_gaps"]
+        cfg["tools"]["gap_analyser"]["enabled"]   = states["gap_analyser"]
+        cfg["tools"]["card_creator"]["enabled"]   = states["card_creator"]
+
         save_config(cfg)
         # Re-register the capture shortcut so a changed binding works without
         # an Anki restart.
@@ -2754,6 +2987,8 @@ class SettingsDialog(QDialog):
         self.accept()
 
 
-def open_settings() -> None:
-    dlg = SettingsDialog()
+def open_settings(initial_tab: str | None = None) -> None:
+    """Open Settings, optionally jumping straight to a tool's tab —
+    e.g. open_settings("browse") for the AI Browse tab."""
+    dlg = SettingsDialog(initial_tab=initial_tab)
     dlg.exec()

@@ -473,8 +473,8 @@ def _http_post_json(url: str, headers: dict, body: dict, timeout: int,
             raise ClaudeError(
                 f"{provider_label} rejected this model: your key's free tier has "
                 "no quota for it. Open Ankisstant Settings → AI and switch the "
-                "model to Gemini 2.5 Flash (the only free-tier Gemini model), or "
-                "add billing to your Google AI Studio account for Pro/2.0."
+                "model to Gemini 3.5 Flash (the most reliable free-tier Gemini "
+                "model), or add billing to your Google AI Studio account for Pro/2.0."
             )
         if e.code == 429:
             raise ClaudeError(

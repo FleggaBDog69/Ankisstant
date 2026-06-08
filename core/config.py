@@ -18,7 +18,7 @@ ADDON = __name__.split(".")[0]
 # without a circular dependency.
 PROVIDER_MODELS: dict[str, list[str]] = {
     "anthropic": ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
-    "gemini":    ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"],
+    "gemini":    ["gemini-3.5-flash", "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"],
     "openai":    ["gpt-4o", "gpt-4o-mini", "gpt-4.1-mini"],
     # Ollama runs whatever models the user has pulled locally; these are common
     # suggestions only — the picker stays editable so any pulled model works.
@@ -41,12 +41,12 @@ PROVIDER_OF: dict[str, str] = {
 }
 
 # Per-family defaults for "fast" (search/cheap) and "smart" (generation) roles.
-# gemini defaults to 2.5-flash for BOTH roles: on the free tier neither
-# gemini-2.0-flash nor gemini-2.5-pro has any quota (both return 429 limit:0),
-# so neither can be a safe default. 2.5-flash is the only free-tier-capable
-# Gemini model. Pro stays selectable in the picker for users on a paid plan.
-_FAST_MODELS:  dict[str, str] = {"anthropic": "claude-haiku-4-5-20251001", "gemini": "gemini-2.5-flash", "openai": "gpt-4o-mini", "ollama": "llama3.1"}
-_SMART_MODELS: dict[str, str] = {"anthropic": "claude-sonnet-4-6",          "gemini": "gemini-2.5-flash", "openai": "gpt-4o",      "ollama": "llama3.1"}
+# gemini defaults to 3.5-flash for BOTH roles — 2.5-flash frequently returns
+# quota/availability errors on the free tier, where 3.5-flash has been more
+# reliable. Pro and the older 2.x models stay selectable in the picker for
+# users who prefer them or are on a paid plan.
+_FAST_MODELS:  dict[str, str] = {"anthropic": "claude-haiku-4-5-20251001", "gemini": "gemini-3.5-flash", "openai": "gpt-4o-mini", "ollama": "llama3.1"}
+_SMART_MODELS: dict[str, str] = {"anthropic": "claude-sonnet-4-6",          "gemini": "gemini-3.5-flash", "openai": "gpt-4o",      "ollama": "llama3.1"}
 
 # ── AI tool matrix ──────────────────────────────────────────────────────────────
 # The canonical list of AI "tools" surfaced in the consolidated per-AI matrix on
@@ -58,6 +58,7 @@ _SMART_MODELS: dict[str, str] = {"anthropic": "claude-sonnet-4-6",          "gem
 _AI_TOOLS: list[dict] = [
     {"key": "card_creation", "label": "Card creation",  "skills": True,  "tier": "smart"},
     {"key": "search",        "label": "Search / Browse", "skills": False, "tier": "smart"},
+    {"key": "native_search", "label": "Native browser search", "skills": False, "tier": "smart"},
     {"key": "gap_analysis",  "label": "Gap analysis",    "skills": False, "tier": "smart"},
     {"key": "quality_pass",  "label": "Quality pass",    "skills": True,  "tier": "fast"},
 ]
@@ -164,6 +165,12 @@ DEFAULTS: dict = {
         },
         "browse": {
             "enabled": True,
+            # When true, the dedicated AI Browse panel is hidden from the
+            # Ankisstant window and most of its settings tab is collapsed —
+            # only the lightweight in-browser "✨ AI Search" checkbox (in
+            # Anki's own Browse window) stays active. Set from the setup
+            # wizard's "which tools?" page or Settings → Tools.
+            "native_only": False,
             "model": dict(_SMART_MODELS),
             "last_used_tag": "",
             "max_results": 50,

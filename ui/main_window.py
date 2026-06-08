@@ -31,7 +31,19 @@ TOOLS: list[tuple[str, str, str]] = [
 ]
 
 
-def _disabled_placeholder(label: str) -> QWidget:
+def _tool_visible(key: str) -> bool:
+    """Whether `key` should get a sidebar entry / panel in the Ankisstant
+    window. Browse is special-cased: in "native search only" mode the tool
+    stays enabled (so the in-browser AI search keeps working) but its
+    dedicated panel is hidden — there's nothing useful to show here."""
+    if not tool_enabled(key):
+        return False
+    if key == "browse" and tool_config("browse").get("native_only"):
+        return False
+    return True
+
+
+def _disabled_placeholder(label: str, key: str | None = None) -> QWidget:
     w = QWidget()
     layout = QVBoxLayout(w)
     layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -39,7 +51,15 @@ def _disabled_placeholder(label: str) -> QWidget:
     title.setTextFormat(Qt.TextFormat.RichText)
     title.setAlignment(Qt.AlignmentFlag.AlignCenter)
     layout.addWidget(title)
-    msg = QLabel("Tool disabled — enable in Settings.")
+    if key == "browse" and tool_enabled("browse") and tool_config("browse").get("native_only"):
+        text = (
+            "Native search only — the AI Browse panel is hidden.\n"
+            "The ✨ AI Search checkbox in Anki's own Browse window still works.\n"
+            "Switch modes in Settings → Tools."
+        )
+    else:
+        text = "Tool disabled — enable in Settings → Tools."
+    msg = QLabel(text)
     msg.setStyleSheet("color: gray; font-size: 13px;")
     msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
     layout.addWidget(msg)
@@ -104,6 +124,8 @@ class MainWindow(QDialog):
         side_layout.addWidget(title)
 
         for key, label, _path in TOOLS:
+            if not _tool_visible(key):
+                continue
             btn = QPushButton(label)
             btn.setCheckable(True)
             btn.setAutoExclusive(True)
@@ -115,7 +137,6 @@ class MainWindow(QDialog):
                 "QPushButton:hover:!checked { background: rgba(127,127,127,0.12); border-radius: 6px; }"
                 "QPushButton:disabled { color: rgba(127,127,127,0.6); }"
             )
-            btn.setEnabled(tool_enabled(key))
             btn.clicked.connect(lambda _checked=False, k=key: self._show_tool(k))
             self._nav_buttons[key] = btn
             side_layout.addWidget(btn)
@@ -156,9 +177,9 @@ class MainWindow(QDialog):
         self.stack.addWidget(welcome)
         root.addWidget(self.stack, 1)
 
-        # Auto-select the first enabled tool on open.
+        # Auto-select the first visible tool on open.
         for key, _label, _path in TOOLS:
-            if tool_enabled(key):
+            if key in self._nav_buttons:
                 self._nav_buttons[key].setChecked(True)
                 self._show_tool(key)
                 break
@@ -212,10 +233,10 @@ class MainWindow(QDialog):
         self._show_tool("browse")
 
     def _show_tool(self, key: str) -> None:
-        # Pick a panel: tool's get_panel() if enabled, else a placeholder.
-        if not tool_enabled(key):
+        # Pick a panel: tool's get_panel() if visible, else a placeholder.
+        if not _tool_visible(key):
             placeholder_label = dict((k, l) for k, l, _ in TOOLS).get(key, key)
-            widget = _disabled_placeholder(placeholder_label)
+            widget = _disabled_placeholder(placeholder_label, key=key)
             self.load_panel(widget)
             return
 
@@ -271,9 +292,13 @@ class MainWindow(QDialog):
         from .settings import SettingsDialog
         dlg = SettingsDialog(self)
         if dlg.exec():
-            # Refresh nav-button enabled states; rebuild cached panels next click.
+            # Refresh nav-button enabled states for tools whose sidebar entry
+            # already exists. Newly (in)visible tools need a restart to add
+            # or remove their entry — see the restart hint in Settings.
             for key, _label, _path in TOOLS:
-                self._nav_buttons[key].setEnabled(tool_enabled(key))
+                btn = self._nav_buttons.get(key)
+                if btn is not None:
+                    btn.setEnabled(_tool_visible(key))
             self._panel_cache.clear()
 
     # ── persist geometry on close ─────────────────────────────────────────────
