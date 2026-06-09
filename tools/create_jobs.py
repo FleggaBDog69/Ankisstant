@@ -120,7 +120,7 @@ def _normalise(item: dict) -> dict:
     out.setdefault("error", "")
     # List-shaped fields the UI/worker iterate over.
     for key in ("tags_raw", "kg_image_filenames", "panel_image_filenames",
-                "attachment_paths"):
+                "attachment_paths", "slide_pages"):
         v = out.get(key)
         out[key] = list(v) if isinstance(v, (list, tuple)) else []
     out.setdefault("created_at", _now())

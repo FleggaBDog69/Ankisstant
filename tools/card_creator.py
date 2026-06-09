@@ -19,13 +19,15 @@ from datetime import datetime as _dt
 from aqt import mw, gui_hooks
 from aqt.qt import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QFileDialog, QFrame, QFormLayout, QGroupBox, QHBoxLayout, QIcon, QImage, QLabel,
-    QLineEdit, QListWidget, QListWidgetItem, QPixmap, QPlainTextEdit, QPushButton,
-    QRadioButton, QScrollArea, QSize, QSpinBox, Qt, QTimer, QVBoxLayout, QWidget,
+    QFileDialog, QFrame, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QIcon,
+    QImage, QLabel, QLineEdit, QListWidget, QListWidgetItem, QPixmap,
+    QPlainTextEdit, QPushButton, QRadioButton, QScrollArea, QSize, QSpinBox, Qt,
+    QTimer, QVBoxLayout, QWidget,
 )
 from aqt.utils import askUser, showWarning, tooltip
 
 from . import autotag
+from . import pdf_render
 from . import quality_pass as qp
 from ..grounding import guidelines as grounding
 from ..core import anki_utils, api as core_api, log
@@ -692,6 +694,52 @@ IMAGE_QUERY_INSTRUCTION = (
 )
 
 
+# ── slide decks (PDF) ─────────────────────────────────────────────────────────
+#
+# When the source is a slide-deck PDF, we rasterise each page to an image up
+# front and ask the model to tag every card with the slide it came from. The
+# review screen then auto-attaches that slide image to the card (and lets the
+# user swap it via a slide gallery). Appended to the system prompt only when a
+# single PDF is attached and we managed to render its pages.
+def _slide_index_instruction(n_slides: int) -> str:
+    return (
+        "\n\nSLIDE SOURCE\n"
+        f"The attached PDF is a slide deck with {n_slides} slides (slide 1 is the "
+        "first page). For EACH card, add an integer \"slide\" key = the single "
+        "slide number the card is primarily based on (1-based). If a card draws "
+        "from no particular slide, omit the key or use 0. The slide image is "
+        "attached to the card automatically — do not describe the slide in the "
+        "card content, and never let \"slide\" change the front/extra text."
+    )
+
+
+def _sync_slide_images(card: dict, slide_pages: list) -> None:
+    """Reconcile a card's slide-derived images with its current slide selection.
+
+    `card["_slide_indices"]` is the list of 0-based page indices chosen for this
+    card (seeded from the model's 1-based "slide" the first time). Their resolved
+    temp-PNG paths are kept in `card["_slide_paths"]` and mirrored at the FRONT
+    of `card["_image_paths"]`, so the existing image pipeline imports + injects
+    them with no other change. Non-slide images the user attached are preserved.
+    Idempotent — safe to re-run after a re-render or a gallery edit."""
+    if not slide_pages:
+        return
+    idxs = card.get("_slide_indices")
+    if idxs is None:
+        s = card.get("slide")
+        try:
+            si = int(s)
+        except (TypeError, ValueError):
+            si = 0
+        idxs = [si - 1] if 1 <= si <= len(slide_pages) else []
+        card["_slide_indices"] = idxs
+    new_slide = [slide_pages[i] for i in idxs if 0 <= i < len(slide_pages)]
+    old_slide = card.get("_slide_paths") or []
+    rest = [p for p in (card.get("_image_paths") or []) if p not in old_slide]
+    card["_image_paths"] = new_slide + rest
+    card["_slide_paths"] = new_slide
+
+
 def _auto_image_active(cfg: dict) -> bool:
     """Global default for the per-batch auto-image toggle."""
     return bool((cfg.get("images") or {}).get("auto_find", False))
@@ -771,6 +819,11 @@ def _regenerate_one(old_card: dict, hint: str, profile: dict | None,
         return None
     if old_card.get("_image_paths"):
         new["_image_paths"] = list(old_card["_image_paths"])
+    # Carry the slide attachment across a regeneration — the rewritten card is
+    # the same fact from the same slide.
+    for k in ("slide", "_slide_indices", "_slide_paths"):
+        if old_card.get(k) is not None:
+            new[k] = list(old_card[k]) if isinstance(old_card[k], list) else old_card[k]
     return new
 
 
@@ -1252,6 +1305,11 @@ class CreatorPanel(QWidget):
         attach_row = QHBoxLayout()
         self.attach_btn = QPushButton("📎 Attach PDF / PPTX…")
         self.attach_btn.setAutoDefault(False)
+        self.attach_btn.setToolTip(
+            "Attach a PDF (e.g. a lecture slide deck) or PowerPoint as the source.\n"
+            "Slide-deck PDFs: each card gets its source slide image attached, and "
+            "image-only slides work on any AI (the pages are sent as images)."
+        )
         self.attach_btn.clicked.connect(self._on_attach_files)
         self.attach_clear_btn = QPushButton("Clear")
         self.attach_clear_btn.setAutoDefault(False)
@@ -1398,6 +1456,9 @@ class CreatorPanel(QWidget):
         # approved card's image field at create time. Per-card overrides are
         # added in the review dialog (see _CardRow).
         self._extra_image_paths: list[str] = []
+        # Rendered page-images of an attached slide-deck PDF (set in _on_generate);
+        # initialised here so the Paste path can reference it safely.
+        self._slide_pages: list[str] = []
         img_row = QHBoxLayout()
         self.extra_img_btn = QPushButton("📷 Attach images for Extra…")
         self.extra_img_btn.setAutoDefault(False)
@@ -2167,8 +2228,10 @@ class CreatorPanel(QWidget):
         is_qa = str(profile.get("card_format", "cloze")).lower() == "qa"
         card_word = "question/answer" if is_qa else "high-yield cloze"
 
-        attachments_for_api: list[str] = []  # PDFs go through Claude (CLI Read or API doc)
+        attachments_for_api: list[str] = []  # what's sent to the model (PDF or page-images)
         attachment_labels: list[str] = []    # for the source label
+        pdf_paths: list[str] = []            # original PDF(s), for slide rasterisation
+        self._slide_pages: list[str] = []    # rendered page images of a single slide deck
 
         if mode == "source":
             url = self.url.text().strip()
@@ -2197,7 +2260,9 @@ class CreatorPanel(QWidget):
                 text_body = (text_body + "\n\n" + fetched).strip() if text_body else fetched
 
             # PPTX → in-process text extract (works on any provider).
-            # PDF  → handed to Claude (CLI Read tool, or API document block).
+            # PDF  → rasterised to page-images; the original goes to Claude (CLI
+            #        Read / API doc) while vision providers get the page-images,
+            #        and the pages double as per-card slide attachments.
             if self._attached_paths:
                 pptx_blocks: list[str] = []
                 with loading(self.go_btn, "Reading attachments…"):
@@ -2224,11 +2289,41 @@ class CreatorPanel(QWidget):
                                 return
                             attachment_labels.append(name)
                         elif ext == ".pdf":
-                            attachments_for_api.append(p)
+                            pdf_paths.append(p)
                             attachment_labels.append(name)
                 if pptx_blocks:
                     text_body = (text_body + "\n\n" + "\n".join(pptx_blocks)).strip() \
                         if text_body else "\n".join(pptx_blocks)
+
+            # Resolve the PDF(s): render to page-images and pick what to send the
+            # model based on the provider family. Slide auto-attach + the gallery
+            # need exactly one deck, so they only engage for a single PDF; with
+            # several PDFs we still generate (page-images on vision providers),
+            # just without slide numbering.
+            family = active_family()
+            if pdf_paths:
+                with loading(self.go_btn, "Rendering slides…"):
+                    rendered = {p: pdf_render.render_pdf_to_images(p) for p in pdf_paths}
+                if family == "anthropic":
+                    attachments_for_api.extend(pdf_paths)  # Claude reads the PDF directly
+                else:
+                    pages_flat = [pg for p in pdf_paths for pg in rendered.get(p, [])]
+                    if not pages_flat:
+                        showWarning(
+                            "Couldn't render that PDF to images for this AI provider.\n\n"
+                            "Switch to Claude (which reads PDFs directly), or paste the "
+                            "text instead."
+                        )
+                        return
+                    if len(pages_flat) > 25 and not askUser(
+                        f"This deck has {len(pages_flat)} slides. They'll all be sent to "
+                        "your AI as images, which can be slow and use a lot of tokens.\n\n"
+                        "Generate anyway?"
+                    ):
+                        return
+                    attachments_for_api.extend(pages_flat)
+                if len(pdf_paths) == 1:
+                    self._slide_pages = list(rendered.get(pdf_paths[0], []))
 
             if not text_body and not attachments_for_api:
                 showWarning("Provide pasted text, a URL, or attach a PDF / PPTX.")
@@ -2248,6 +2343,8 @@ class CreatorPanel(QWidget):
                 parts.append(_focus_directive(focus))
             if attachments_for_api:
                 parts.append(
+                    "Attachment(s) provided — use them as the primary source."
+                    if self._slide_pages else
                     "PDF attachment(s) provided — use them as the primary source."
                 )
             if text_body:
@@ -2309,6 +2406,15 @@ class CreatorPanel(QWidget):
                 system_prompt = system_prompt + IMAGE_QUERY_INSTRUCTION
         except Exception as e:
             log.error(f"image-query instruction skipped: {e}")
+
+        # Slide deck: ask the model to tag each card with its source slide so the
+        # review screen can auto-attach that slide's image. Only when a single
+        # PDF rendered to pages. Fail-open.
+        try:
+            if self._slide_pages:
+                system_prompt = system_prompt + _slide_index_instruction(len(self._slide_pages))
+        except Exception as e:
+            log.error(f"slide-index instruction skipped: {e}")
 
         # The MQ knowledge-gap explanation is normally a separate AI call, but
         # with no skill in play we fold it into the SAME request (one object
@@ -2415,7 +2521,7 @@ class CreatorPanel(QWidget):
                 merge_explanation=merge_explanation, merge_grade=merge_grade,
                 user_msg=user_msg, system_prompt=system_prompt, model=model,
                 skill_id=skill_id, skill_invocation=skill_invocation,
-                attachments=attachments_for_api,
+                attachments=attachments_for_api, slide_pages=self._slide_pages,
                 want_auto=want_auto, tag_material=tag_material)
             self.cfg["default_n_cards"] = n
             self.cfg["selected_notetype"] = notetype_name
@@ -2480,7 +2586,7 @@ class CreatorPanel(QWidget):
                 merge_explanation=merge_explanation, merge_grade=merge_grade,
                 user_msg=user_msg, system_prompt=system_prompt, model=model,
                 skill_id=skill_id, skill_invocation=skill_invocation,
-                attachments=attachments_for_api,
+                attachments=attachments_for_api, slide_pages=self._slide_pages,
                 want_auto=want_auto, tag_material=tag_material)
             job = create_jobs.add(**record, status="running")
             # No folded levels (skill array) but auto-tag wanted: classify now so
@@ -2510,6 +2616,7 @@ class CreatorPanel(QWidget):
             cached_tag=cached_tag, want_tag=want_tag, model=model,
             same_call_grades=same_call_grades,
             topic_autotag=topic_autotag, tag_material=tag_material,
+            slide_pages=self._slide_pages,
         )
 
     def _on_paste_cards(self):
@@ -2714,7 +2821,8 @@ class CreatorPanel(QWidget):
     def _finalize_review(self, *, cards, merged_tag_levels, mode, source_label,
                          topic_label, focus, deck_name, notetype_name, tags_raw,
                          profile, gap, type_meta, cached_tag, want_tag, model,
-                         same_call_grades=None, topic_autotag=False, tag_material=""):
+                         same_call_grades=None, topic_autotag=False, tag_material="",
+                         slide_pages=None):
         """Validate the card list, resolve the auto-tag, and open the review
         dialog. Shared by Generate (AI round-trip) and Paste cards (user brings
         their own JSON). Returns False on malformed input (a warning is shown)."""
@@ -2804,6 +2912,7 @@ class CreatorPanel(QWidget):
             kg_explanation=kg_explanation,
             type_meta=type_meta,
             kg_field_values=_gap_field_values(gap),
+            slide_pages=slide_pages,
             parent=self,
         )
         result = dlg.exec()
@@ -2850,7 +2959,8 @@ class CreatorPanel(QWidget):
                          notetype_name, tags_raw, gap, type_meta, cached_tag, want_tag,
                          want_explanation, merge_tag, merge_explanation, merge_grade,
                          user_msg, system_prompt, model, skill_id, skill_invocation,
-                         attachments, want_auto=False, tag_material="") -> dict:
+                         attachments, slide_pages=None, want_auto=False,
+                         tag_material="") -> dict:
         """Snapshot everything a background job needs to generate, grade, and
         later reconstruct its review dialog — independent of live panel state.
         Imports Extra images into media and copies attachments so the record
@@ -2861,6 +2971,10 @@ class CreatorPanel(QWidget):
         panel_fns = [fn for fn in (_import_image_to_media(p) for p in self._extra_image_paths)
                      if fn]
         attach_copied = create_jobs.copy_attachments(job_id, attachments or [])
+        # Slide images live in the job folder (NOT media — they're only imported
+        # if a card is actually created). Ordered filenames (slide_NNNN.png) mean
+        # open_ready_job can restore page order with a plain sort after a restart.
+        slide_copied = create_jobs.copy_attachments(job_id, list(slide_pages or []))
         is_mq = bool(gap and (gap.get("kg_type") or "").lower() == "mq")
         return {
             "id": job_id,
@@ -2876,6 +2990,7 @@ class CreatorPanel(QWidget):
             "kg_explanation": str(gap.get("explanation") or "").strip() if is_mq else "",
             "panel_image_filenames": panel_fns,
             "attachment_paths": attach_copied,
+            "slide_pages": slide_copied,
             "user_msg": user_msg, "system_prompt": system_prompt, "model": model,
             "skill_id": skill_id, "skill_invocation": skill_invocation, "max_tokens": 4096,
             "merge_tag": bool(merge_tag), "merge_explanation": bool(merge_explanation),
@@ -2919,6 +3034,12 @@ class CreatorPanel(QWidget):
             return os.path.join(media_dir, fn) if media_dir and fn else fn
 
         panel_image_paths = [_media_path(fn) for fn in rec.get("panel_image_filenames", [])]
+        # Slide pages were copied into the job folder with page-ordered names;
+        # sort by basename to restore order and drop any that went missing.
+        slide_pages = sorted(
+            (p for p in rec.get("slide_pages", []) if p and os.path.exists(p)),
+            key=lambda p: os.path.basename(p),
+        )
         cards = [dict(c) for c in (rec.get("cards") or [])]
         verdicts = rec.get("verdicts") or []
         for i, c in enumerate(cards):
@@ -2946,6 +3067,7 @@ class CreatorPanel(QWidget):
             kg_explanation=rec.get("kg_explanation", ""),
             type_meta=rec.get("type_meta") if isinstance(rec.get("type_meta"), dict) else None,
             kg_field_values=_gap_field_values(rec.get("gap") if isinstance(rec.get("gap"), dict) else None),
+            slide_pages=slide_pages,
             parent=self,
         )
         result = dlg.exec()
@@ -2977,7 +3099,7 @@ class _CardRow(QFrame):
 
     def __init__(self, idx: int, card: dict, dup_msg: str | None,
                  on_state_change, on_regenerate, on_split, on_one_by_one,
-                 parent=None):
+                 slide_pages=None, parent=None):
         super().__init__(parent)
         self.idx = idx
         self.card = card
@@ -2986,6 +3108,7 @@ class _CardRow(QFrame):
         self._on_regenerate = on_regenerate
         self._on_split = on_split
         self._on_one_by_one = on_one_by_one
+        self.slide_pages: list[str] = list(slide_pages or [])
 
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setStyleSheet("QFrame { border: 1px solid #ccc; border-radius: 4px; padding: 6px; }")
@@ -3026,7 +3149,15 @@ class _CardRow(QFrame):
             "it to JUST this card."
         )
         self.img_browse_btn.clicked.connect(self._on_browse_image)
-        for b in (self.img_btn, self.img_find_btn, self.img_browse_btn,
+        # Slide picker — only when the source was a slide-deck PDF. Lets the user
+        # change which slide image is attached to this card.
+        self.slide_btn = QPushButton("🖼 Slide")
+        self.slide_btn.setToolTip(
+            "Choose which slide image(s) from the source deck attach to this card."
+        )
+        self.slide_btn.clicked.connect(self._on_pick_slides)
+        self.slide_btn.setVisible(bool(self.slide_pages))
+        for b in (self.slide_btn, self.img_btn, self.img_find_btn, self.img_browse_btn,
                   self.reject_btn, self.split_btn, self.obo_btn):
             header.addWidget(b)
         v.addLayout(header)
@@ -3225,9 +3356,13 @@ class _CardRow(QFrame):
         if isinstance(vd, qp.Verdict):
             suffix += f"  · {vd.chip()}"
             self.setToolTip(vd.reason or "")
+        n_slides = len(self.card.get("_slide_paths") or [])
         n_imgs = len(self.card.get("_image_paths") or [])
-        if n_imgs:
-            suffix += f"  · 📷 {n_imgs}"
+        if n_slides:
+            suffix += f"  · 🖼 slide {', '.join(str(i + 1) for i in (self.card.get('_slide_indices') or []))}"
+        n_other = n_imgs - n_slides
+        if n_other > 0:
+            suffix += f"  · 📷 {n_other}"
         if self.state == self.REJECTED:
             self.header_label.setText(f"Card {self.idx + 1} — ✗ rejected{suffix}")
             self.reject_btn.setText("↺ Re-include")
@@ -3314,6 +3449,75 @@ class _CardRow(QFrame):
         if paths:
             self._add_card_images(paths)
 
+    def _on_pick_slides(self):
+        """Open the slide gallery and update which slide image(s) attach here."""
+        if not self.slide_pages:
+            return
+        current = list(self.card.get("_slide_indices") or [])
+        dlg = _SlideGalleryDialog(self.slide_pages, current, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.card["_slide_indices"] = dlg.selected_indices()
+        _sync_slide_images(self.card, self.slide_pages)
+        self._refresh_header()
+
+
+class _SlideGalleryDialog(QDialog):
+    """A thumbnail grid of a slide deck's pages; the user ticks the slide(s) to
+    attach to a card. Slides are local PNGs already rendered from the PDF, so
+    thumbnails load synchronously (no network)."""
+
+    def __init__(self, slide_pages: list, selected: list, parent=None):
+        super().__init__(parent)
+        self.slide_pages = list(slide_pages or [])
+        self._buttons: list = []
+        self.setWindowTitle("Choose slide images")
+        self.setMinimumSize(720, 560)
+        self._build(set(selected or []))
+
+    def _build(self, selected: set):
+        root = QVBoxLayout(self)
+        cap = QLabel(
+            "Click slides to attach them to this card. Click again to remove. "
+            f"({len(self.slide_pages)} slides)"
+        )
+        cap.setStyleSheet("color: gray; font-size: 11px;")
+        cap.setWordWrap(True)
+        root.addWidget(cap)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        grid = QGridLayout(inner)
+        grid.setSpacing(8)
+        cols = 4
+        for i, path in enumerate(self.slide_pages):
+            btn = QPushButton(f"Slide {i + 1}")
+            btn.setCheckable(True)
+            btn.setChecked(i in selected)
+            btn.setMinimumSize(QSize(150, 120))
+            btn.setIconSize(QSize(140, 96))
+            try:
+                pix = QPixmap(path)
+                if not pix.isNull():
+                    btn.setIcon(QIcon(pix))
+            except Exception:
+                pass
+            grid.addWidget(btn, i // cols, i % cols)
+            self._buttons.append(btn)
+        scroll.setWidget(inner)
+        root.addWidget(scroll, 1)
+
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        root.addWidget(bb)
+
+    def selected_indices(self) -> list:
+        return [i for i, b in enumerate(self._buttons) if b.isChecked()]
+
 
 class ReviewDialog(QDialog):
     def __init__(self, cards, mode, source_label, topic_label, focus,
@@ -3322,6 +3526,7 @@ class ReviewDialog(QDialog):
                  kg_stem_html="", kg_notes="",
                  kg_concept="", kg_explanation="",
                  type_meta=None, kg_field_values=None,
+                 slide_pages=None,
                  parent=None):
         super().__init__(parent)
         self.cfg = tool_config("card_creator")
@@ -3362,6 +3567,13 @@ class ReviewDialog(QDialog):
         # stays in _kg_content_html; this only adds custom field→field targets.
         self.type_meta: dict | None = type_meta if isinstance(type_meta, dict) else None
         self.kg_field_values: dict = dict(kg_field_values or {})
+        # Rendered page-images of the source slide deck (if a single PDF was the
+        # source). Each card's model-chosen `slide` is resolved to its page image
+        # here and the user can swap it via the per-card slide gallery.
+        self.slide_pages: list[str] = list(slide_pages or [])
+        if self.slide_pages:
+            for c in self.cards_in:
+                _sync_slide_images(c, self.slide_pages)
         self.rows: list[_CardRow] = []
         self.setWindowTitle("Review proposed cards")
         self.setMinimumSize(800, 700)
@@ -3391,7 +3603,8 @@ class ReviewDialog(QDialog):
             dup = self._dup_check(card)
             row = _CardRow(i, card, dup, self._on_state_change,
                            self._on_regenerate, self._on_split,
-                           self._on_one_by_one)
+                           self._on_one_by_one,
+                           slide_pages=self.slide_pages)
             self.rows.append(row)
             self.inner_layout.addWidget(row)
         self.inner_layout.addStretch(1)
@@ -3527,7 +3740,12 @@ class ReviewDialog(QDialog):
         row.deleteLater()
         self.rows.pop(idx_in_rows)
 
+        # Split children inherit the parent card's slide attachment.
+        parent_slide_idxs = list(row.card.get("_slide_indices") or [])
         for offset, card in enumerate(new_cards):
+            if self.slide_pages and parent_slide_idxs:
+                card["_slide_indices"] = list(parent_slide_idxs)
+                _sync_slide_images(card, self.slide_pages)
             dup = self._dup_check(card)
             new_row = _CardRow(
                 idx=0, card=card, dup_msg=dup,
@@ -3535,6 +3753,7 @@ class ReviewDialog(QDialog):
                 on_regenerate=self._on_regenerate,
                 on_split=self._on_split,
                 on_one_by_one=self._on_one_by_one,
+                slide_pages=self.slide_pages,
             )
             self.inner_layout.insertWidget(idx_in_layout + offset, new_row)
             self.rows.insert(idx_in_rows + offset, new_row)

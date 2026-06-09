@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.10.0
+
+### Added
+- **Slide-deck PDFs for AI Create.** Attach a PowerPoint-exported PDF and the
+  add-on now rasterises each page to an image. For every card it generates, the
+  **source slide is automatically attached** to the card's image field — and a new
+  **slide gallery** ("🖼 Slide" on each card in the review screen) lets you pick or
+  swap exactly which slide(s) go on a card.
+- **PDF reading on any AI provider.** Previously only Claude could read attached
+  PDFs. Because the pages are now rendered to images, slide-deck PDFs work on
+  **Gemini, OpenAI and Ollama** too — and **image-only slides** (diagrams,
+  scanned pages) are read as images rather than skipped. Claude still reads the
+  PDF directly for the best text fidelity; other providers receive the page
+  images. A confirmation appears before sending a large deck so you stay in
+  control of token use.
+- Built entirely on Anki's bundled Qt PDF support — **no new dependencies** and
+  nothing to install.
+
 ## 1.9.1
 
 ### Added
