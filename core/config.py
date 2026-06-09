@@ -435,7 +435,6 @@ def ensure_config() -> None:
     merged = _deep_merge(DEFAULTS, raw)
     _migrate_auto_tag_scheme(merged)
     _migrate_dead_gemini_models(merged)
-    _migrate_force_wizard(merged)
     if merged != raw:
         mw.addonManager.writeConfig(ADDON, merged)
 
@@ -645,21 +644,12 @@ def _migrate_auto_tag_scheme(cfg: dict) -> None:
 
 
 # Bump this to re-show the setup wizard once on the next upgrade (e.g. when a
-# release adds a wizard page worth re-running). The stamp is persisted so each
-# version forces the wizard at most once; deliberately NOT in DEFAULTS so an
-# existing config (which lacks it) is detected as "not yet forced".
-_FORCE_WIZARD_VERSION = "1.9.1"
-
-
-def _migrate_force_wizard(cfg: dict) -> bool:
-    """One-time per-version wizard re-trigger. Returns True if it changed cfg.
-    Sets first_run_seen=False so the welcome wizard reopens (now with the
-    guideline-region picker), then stamps the version so it never repeats."""
-    if cfg.get("forced_wizard_version") == _FORCE_WIZARD_VERSION:
-        return False
-    cfg["first_run_seen"] = False
-    cfg["forced_wizard_version"] = _FORCE_WIZARD_VERSION
-    return True
+# release adds a wizard page worth re-running). The launch gate in __init__.py
+# compares it against the persisted `forced_wizard_version` stamp and opens the
+# wizard once — stamping at open time, so skipping still counts as "shown" and it
+# never nags again. Deliberately NOT in DEFAULTS so an existing config (which
+# lacks the stamp) is detected as "not yet shown for this version".
+FORCE_WIZARD_VERSION = "1.9.1"
 
 
 def save_config(cfg: dict) -> None:

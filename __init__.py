@@ -141,9 +141,18 @@ def _on_profile_loaded() -> None:
     _setup_capture_shortcut()
 
     # First-run welcome — defer so the main window is up and ready to be
-    # focused after the dialog closes.
+    # focused after the dialog closes. Also re-shown once after an upgrade that
+    # bumps FORCE_WIZARD_VERSION (e.g. a new wizard page). We stamp the version
+    # at open time, so a user who skips the wizard isn't nagged again.
     try:
-        if not load_config().get("first_run_seen", False):
+        from .core.config import FORCE_WIZARD_VERSION, save_config
+        cfg = load_config()
+        first_run = not cfg.get("first_run_seen", False)
+        forced = (not first_run
+                  and cfg.get("forced_wizard_version") != FORCE_WIZARD_VERSION)
+        if first_run or forced:
+            cfg["forced_wizard_version"] = FORCE_WIZARD_VERSION
+            save_config(cfg)
             QTimer.singleShot(500, open_welcome)
     except Exception as e:
         log.error(f"welcome scheduling failed: {e}")

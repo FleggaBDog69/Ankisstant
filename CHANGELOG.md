@@ -13,7 +13,8 @@
 - **Region picker in the setup wizard.** The Create page now asks which guideline
   region to use (or "None" to turn grounding off), so a fresh install is grounded
   correctly for where you practise. The wizard **re-opens once on this upgrade** so
-  existing users can pick their region too (it won't nag again afterwards).
+  existing users can see what's new and pick their region — shown a single time,
+  whether you complete it or skip it.
 - **Manage your own preset.** "Manage sources…" can now **load any region's
   built-in set as a starting point**, then you add/remove your favourite sources;
   saving an edited list makes it your reusable **Custom** set.
