@@ -894,6 +894,28 @@ class _PageDefaults(QWidget):
         self._notetype.currentTextChanged.connect(self._check_notetype)
         self._check_notetype(self._notetype.currentText())
 
+        root.addSpacing(8)
+
+        # Guideline region for AI Create source grounding.
+        reg_lbl = QLabel("Clinical guideline region (AI Create):")
+        self._region = QComboBox()
+        self._region.addItem("Australia & WA", "au_wa")
+        self._region.addItem("United States", "usa")
+        self._region.addItem("International", "intl")
+        self._region.addItem("None — don't ground cards", "off")
+        self._region.setMinimumWidth(420)
+        self._region.setToolTip(
+            "Grounding makes AI Create cite real guideline URLs from this region "
+            "instead of inventing them. You can switch region or fine-tune the "
+            "source list later in Settings → Create."
+        )
+        _g = (self._wizard.cfg.get("tools", {})
+              .get("card_creator", {}).get("grounding", {}) or {})
+        _seed_region = "off" if _g.get("enabled") is False else str(_g.get("region") or "au_wa")
+        self._region.setCurrentIndex(max(0, self._region.findData(_seed_region)))
+        root.addWidget(reg_lbl)
+        root.addWidget(self._region)
+
         root.addStretch(1)
 
     def _populate_decks(self):
@@ -968,6 +990,10 @@ class _PageDefaults(QWidget):
 
     def selected_notetype(self) -> str:
         return self._notetype.currentText().strip()
+
+    def selected_region(self) -> str:
+        """Guideline region key: 'au_wa' | 'usa' | 'intl' | 'off'."""
+        return self._region.currentData()
 
     def validate(self) -> bool:
         if not self.selected_deck():
@@ -1549,6 +1575,17 @@ class SetupWizard(QDialog):
             cc["default_deck"] = deck
         if notetype:
             cc["default_notetype"] = notetype
+
+        # Guideline region for source grounding (Create only). "off" disables
+        # grounding; a region key enables it and selects that preset.
+        if sel["card_creator"] and _P_DEFAULTS in self._flow:
+            region = self.page_defaults.selected_region()
+            gr = cc.setdefault("grounding", {})
+            if region == "off":
+                gr["enabled"] = False
+            elif region:
+                gr["enabled"] = True
+                gr["region"] = region
 
         qb = tools.setdefault("qbank", {})
         if deck and not qb.get("card_deck"):

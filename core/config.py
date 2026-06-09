@@ -121,11 +121,13 @@ DEFAULTS: dict = {
     "tools": {
         "qbank": {
             "enabled": True,
-            "show_heatmap": True,
+            # Off by default — the heatmap is a niche extra; users who want it
+            # turn it on in Settings → QBank.
+            "show_heatmap": False,
             # Weakness dashboard — aggregates captured missed questions (the MQ
             # KGs in kg_queue.json) by System/Subsystem/Topic inside the QBank
-            # panel. weakness_window_days: 0 = all time.
-            "show_weakness": True,
+            # panel. weakness_window_days: 0 = all time. Off by default (opt-in).
+            "show_weakness": False,
             "weakness_window_days": 30,
             "weakness_top_n": 8,
             "platforms": [
@@ -366,13 +368,18 @@ DEFAULTS: dict = {
                 # text into the prompt. Off by default — keeps generation snappy;
                 # the allow-list alone already stops invented URLs.
                 "fetch_live": False,
-                # Shown in the injected citation-block header. Editable so the
-                # registry is transferable across regions (e.g. "UK & NICE").
+                # Which shipped guideline preset to cite: "au_wa" | "usa" | "intl"
+                # (see grounding/guidelines.REGION_PRESETS), or "custom" when the
+                # user has supplied their own `sources` list below. The setup
+                # wizard and Settings → Create both let the user pick.
+                "region": "au_wa",
+                # Citation-header label. For a preset it's derived from the preset;
+                # only meaningful when region == "custom".
                 "region_label": "Australian & WA",
-                # Editable guideline registry. Empty → the built-in AU/WA defaults
-                # in grounding/guidelines.py (BUILTIN_GUIDELINES) are used. Once the
-                # user edits sources in Settings, the full list is stored here. Each
-                # entry: {name, url, fetchable, specialties:[...]}.
+                # Editable guideline registry. Empty → the selected region preset's
+                # sources are used. A non-empty list means region == "custom" and
+                # these sources are cited verbatim. Each entry:
+                # {name, url, fetchable, specialties:[...]}.
                 "sources": [],
             },
             # Online image search for the review screen. Auto-find fetches
@@ -401,7 +408,8 @@ DEFAULTS: dict = {
         # guidelines as new copies (originals untouched). Reuses the AI Create
         # notetype profiles + card-creation model; only its own tags live here.
         "update_by_tag": {
-            "enabled": True,
+            # Power feature — off by default; enable in Settings → Tools.
+            "enabled": False,
             "audit_tag": "Ankisstant::AI::Updated",
             "review_tag": "Ankisstant::AI::UpdateReview",
         },

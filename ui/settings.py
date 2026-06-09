@@ -511,7 +511,7 @@ class _NotetypeProfileDialog(QDialog):
         form.addRow("Quality pass:", self._qp_override)
 
         # ── Source grounding override (per-notetype) ─────────────────────
-        # Grounding injects an Australian/WA guideline citation allow-list in
+        # Grounding injects the selected region's guideline citation allow-list in
         # topic-mode generation. Global default in Settings → Create; this lets
         # a profile force it on/off. 'Inherit' (default) follows the global.
         self._grounding_override = QComboBox()
@@ -521,8 +521,8 @@ class _NotetypeProfileDialog(QDialog):
                 str(e.get("grounding_override", "inherit")).lower(), 0)
         )
         self._grounding_override.setToolTip(
-            "Whether topic-mode cards for this notetype are grounded in the "
-            "Australian/WA guideline allow-list. 'Inherit' follows Settings → Create."
+            "Whether topic-mode cards for this notetype are grounded in your "
+            "selected region's guideline allow-list. 'Inherit' follows Settings → Create."
         )
         form.addRow("Grounding:", self._grounding_override)
 
@@ -2708,9 +2708,9 @@ class _CreatorTab(QWidget):
         gr_box = QGroupBox("Source grounding")
         gr_layout = QVBoxLayout(gr_box)
         gr_hint = QLabel(
-            "Injects a curated Australian/WA clinical-guideline citation "
-            "allow-list into <b>topic-based</b> generation, so cards cite real "
-            "URLs instead of invented ones. In source mode your pasted material "
+            "Injects a curated clinical-guideline citation allow-list (for your "
+            "chosen <b>region</b>) into <b>topic-based</b> generation, so cards cite "
+            "real URLs instead of invented ones. In source mode your pasted material "
             "is the source, so grounding is skipped. Per-notetype overrides live "
             "in each notetype's editor; a per-batch checkbox sits on the Create panel."
         )
@@ -2719,7 +2719,7 @@ class _CreatorTab(QWidget):
         gr_hint.setStyleSheet("color: gray; font-size: 11px;")
         gr_layout.addWidget(gr_hint)
 
-        self._ground_enabled = QCheckBox("Ground topic-based cards in AU/WA guidelines by default")
+        self._ground_enabled = QCheckBox("Ground topic-based cards in clinical guidelines by default")
         self._ground_enabled.setChecked(bool(self._grounding_seed.get("enabled", True)))
         gr_layout.addWidget(self._ground_enabled)
 
@@ -2734,15 +2734,32 @@ class _CreatorTab(QWidget):
         )
         gr_layout.addWidget(self._ground_fetch_live)
 
-        # Region label + editable source registry (transferable across regions).
+        # Region preset + editable source registry (transferable across regions).
+        from ..grounding.guidelines import preset_keys, preset_label
         self._grounding_sources = list(self._grounding_seed.get("sources") or [])
         gr_form = _expand_form(QFormLayout())
-        self._ground_region = QLineEdit(
-            str(self._grounding_seed.get("region_label") or "Australian & WA"))
+        self._ground_region = QComboBox()
+        for _k in preset_keys():
+            self._ground_region.addItem(preset_label(_k), _k)
+        self._ground_region.addItem("Custom (edit sources below)", "custom")
+        _seed_region = str(self._grounding_seed.get("region") or "au_wa").lower()
+        if _seed_region not in ("au_wa", "usa", "intl", "custom"):
+            _seed_region = "au_wa"
+        # Back-compat: an old config with edited sources but no region key is custom.
+        if self._grounding_sources and not self._grounding_seed.get("region"):
+            _seed_region = "custom"
+        self._ground_region.setCurrentIndex(max(0, self._ground_region.findData(_seed_region)))
         self._ground_region.setToolTip(
-            "Shown in the injected citation-block header (e.g. 'UK & NICE'). "
-            "Purely cosmetic — it labels which guideline set the model is citing.")
-        gr_form.addRow("Region label:", self._ground_region)
+            "Which shipped guideline set to cite. 'Custom' uses the sources you "
+            "manage below; switching to a region uses its built-in set.")
+        self._ground_region.currentIndexChanged.connect(self._on_ground_region_changed)
+        gr_form.addRow("Guideline region:", self._ground_region)
+
+        self._ground_region_label = QLineEdit(str(self._grounding_seed.get("region_label") or ""))
+        self._ground_region_label.setPlaceholderText("Label for your custom set (e.g. 'UK & NICE')")
+        self._ground_region_label.setToolTip(
+            "Shown in the citation-block header. Only used for the Custom region.")
+        gr_form.addRow("Custom label:", self._ground_region_label)
         gr_layout.addLayout(gr_form)
 
         src_row = QHBoxLayout()
@@ -2753,7 +2770,7 @@ class _CreatorTab(QWidget):
         manage_btn.clicked.connect(self._manage_grounding_sources)
         src_row.addWidget(manage_btn)
         gr_layout.addLayout(src_row)
-        self._refresh_ground_src_summary()
+        self._on_ground_region_changed()
 
         root.addWidget(gr_box)
 
@@ -2823,21 +2840,46 @@ class _CreatorTab(QWidget):
 
     # ── grounding source editor ──────────────────────────────────────────────
 
+    def _on_ground_region_changed(self, *_):
+        is_custom = self._ground_region.currentData() == "custom"
+        self._ground_region_label.setEnabled(is_custom)
+        self._refresh_ground_src_summary()
+
     def _refresh_ground_src_summary(self):
-        n = len(self._grounding_sources)
-        if n:
-            self._ground_src_summary.setText(f"{n} custom guideline source(s) configured.")
-        else:
+        from ..grounding.guidelines import region_preset
+        region = self._ground_region.currentData()
+        if region == "custom":
+            n = len(self._grounding_sources)
             self._ground_src_summary.setText(
-                "Using the built-in Australian/WA guideline set (default).")
+                f"{n} custom guideline source(s) configured."
+                if n else "No custom sources yet — add some via Manage sources…")
+        else:
+            n = len(region_preset(region)["sources"])
+            self._ground_src_summary.setText(
+                f"Using the built-in {self._ground_region.currentText()} set "
+                f"({n} sources). Edit them to switch to Custom.")
 
     def _manage_grounding_sources(self):
-        from ..grounding.guidelines import BUILTIN_GUIDELINES
-        current = self._grounding_sources or [dict(g) for g in BUILTIN_GUIDELINES]
-        dlg = _GroundingSourcesDialog(current, self)
+        from ..grounding.guidelines import region_preset
+        region = self._ground_region.currentData()
+        # Seed the editor from the custom list when on Custom, else from the
+        # selected region's preset (a starting point the user can tweak).
+        if region == "custom" and self._grounding_sources:
+            current = self._grounding_sources
+        else:
+            current = [dict(g) for g in region_preset(region)["sources"]]
+        # When the Create-tab combo is on a preset, seed the dialog from that
+        # region; otherwise (custom) default the dialog's preset picker to au_wa.
+        dlg_region = region if region in ("au_wa", "usa", "intl") else "au_wa"
+        dlg = _GroundingSourcesDialog(current, dlg_region, self)
         if dlg.exec():
             self._grounding_sources = dlg.result_sources()
-            self._refresh_ground_src_summary()
+            # A non-empty list means we're now Custom; an empty result (reset to a
+            # preset) snaps the region combo back to that preset.
+            target = "custom" if self._grounding_sources else dlg.result_region()
+            self._ground_region.setCurrentIndex(
+                max(0, self._ground_region.findData(target)))
+            self._on_ground_region_changed()
 
     # ── notetype profile list ────────────────────────────────────────────────
 
@@ -2953,13 +2995,14 @@ class _CreatorTab(QWidget):
                 # stale per-tool override so it can't shadow the matrix choice.
                 "grader_model_override": False,
             },
-            "grounding": {
-                **self._grounding_seed,
-                "enabled":      self._ground_enabled.isChecked(),
-                "fetch_live":   self._ground_fetch_live.isChecked(),
-                "region_label": self._ground_region.text().strip() or "Australian & WA",
-                "sources":      list(self._grounding_sources),
-            },
+            "grounding": _grounding_values(
+                self._grounding_seed,
+                self._ground_enabled.isChecked(),
+                self._ground_fetch_live.isChecked(),
+                self._ground_region.currentData(),
+                self._ground_region_label.text().strip(),
+                self._grounding_sources,
+            ),
             "images": {
                 **self._images_seed,
                 "auto_find": self._img_auto.isChecked(),
@@ -2977,45 +3020,89 @@ class _CreatorTab(QWidget):
         }
 
 
+def _grounding_values(seed: dict, enabled: bool, fetch_live: bool, region: str,
+                      custom_label: str, custom_sources: list) -> dict:
+    """Build the card_creator.grounding config dict. For a region preset we store
+    region=<key> with sources=[] (resolved live from the preset) and a derived
+    label; for 'custom' we store the edited sources + the user's label."""
+    from ..grounding.guidelines import preset_label
+    out = dict(seed)
+    out["enabled"] = enabled
+    out["fetch_live"] = fetch_live
+    if region == "custom":
+        out["region"] = "custom"
+        out["sources"] = list(custom_sources)
+        out["region_label"] = custom_label or "Custom"
+    else:
+        out["region"] = region
+        out["sources"] = []
+        out["region_label"] = preset_label(region)
+    return out
+
+
 class _GroundingSourcesDialog(QDialog):
     """Editable list of guideline sources (name / URL / fetchable / specialties),
-    so the citation allow-list is transferable across regions. 'Use built-in
-    defaults' clears the custom list (the built-in AU/WA set is then used)."""
+    so the citation allow-list is transferable across regions. A preset loader
+    populates the list from a shipped region set; 'Reset to … preset' discards
+    edits and falls back to that region's built-in set."""
 
-    def __init__(self, sources: list, parent=None):
+    def __init__(self, sources: list, region: str = "au_wa", parent=None):
         super().__init__(parent)
         self.setWindowTitle("Manage guideline sources")
-        self.setMinimumSize(640, 480)
+        self.setMinimumSize(880, 600)
         self._sources = [dict(s) for s in (sources or [])]
+        self._region = region if region in ("au_wa", "usa", "intl") else "au_wa"
         self._cleared = False
         self._build()
 
     def _build(self):
+        from ..grounding.guidelines import preset_keys, preset_label
         root = QVBoxLayout(self)
         hint = QLabel(
             "These URLs form the citation allow-list injected into topic-based "
             "generation — the model may cite only these. <b>Specialties</b> are "
             "comma-separated keywords matched against the topic/tags ( * = always). "
-            "Edit them for your region; URLs must be real."
+            "Editing this list makes it your <b>Custom</b> set; URLs must be real."
         )
         hint.setTextFormat(Qt.TextFormat.RichText)
         hint.setWordWrap(True)
         hint.setStyleSheet("color: gray; font-size: 11px;")
         root.addWidget(hint)
 
-        body = QHBoxLayout()
-        self._list = QListWidget()
-        self._list.currentRowChanged.connect(self._on_row)
-        body.addWidget(self._list, 1)
+        # Preset loader — populate the list from a shipped region set.
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel("Start from preset:"))
+        self._preset_combo = QComboBox()
+        for _k in preset_keys():
+            self._preset_combo.addItem(preset_label(_k), _k)
+        self._preset_combo.setCurrentIndex(max(0, self._preset_combo.findData(self._region)))
+        preset_row.addWidget(self._preset_combo, 1)
+        load_btn = QPushButton("Load preset")
+        load_btn.setToolTip("Replace the list below with this region's built-in sources "
+                            "(you can then tweak them).")
+        load_btn.clicked.connect(self._load_preset)
+        preset_row.addWidget(load_btn)
+        root.addLayout(preset_row)
 
-        form = QFormLayout()
+        body = QHBoxLayout()
+        body.setSpacing(16)
+        self._list = QListWidget()
+        self._list.setMinimumWidth(300)
+        self._list.currentRowChanged.connect(self._on_row)
+        body.addWidget(self._list, 2)
+
+        form = _expand_form(QFormLayout())
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         self._f_name = QLineEdit()
         self._f_url = QLineEdit()
         self._f_specs = QLineEdit()
         self._f_specs.setPlaceholderText("cardiology, arrhythmia, *")
-        self._f_fetchable = QCheckBox("Publicly fetchable (no login)")
         for w in (self._f_name, self._f_url, self._f_specs):
+            w.setMinimumWidth(380)
+            w.setClearButtonEnabled(True)
             w.textChanged.connect(self._on_field_edit)
+        self._f_url.setPlaceholderText("https://… (must be a real page)")
+        self._f_fetchable = QCheckBox("Publicly fetchable (no login)")
         self._f_fetchable.toggled.connect(self._on_field_edit)
         form.addRow("Name:", self._f_name)
         form.addRow("URL:", self._f_url)
@@ -3023,7 +3110,7 @@ class _GroundingSourcesDialog(QDialog):
         form.addRow("", self._f_fetchable)
         fw = QWidget()
         fw.setLayout(form)
-        body.addWidget(fw, 2)
+        body.addWidget(fw, 3)
         root.addLayout(body, 1)
 
         btns = QHBoxLayout()
@@ -3031,14 +3118,14 @@ class _GroundingSourcesDialog(QDialog):
         add.clicked.connect(self._add)
         rem = QPushButton("− Remove")
         rem.clicked.connect(self._remove)
-        defaults = QPushButton("Use built-in defaults")
-        defaults.setToolTip("Discard the custom list and fall back to the bundled "
-                            "Australian/WA guideline set.")
-        defaults.clicked.connect(self._use_defaults)
+        self._defaults_btn = QPushButton(f"Reset to {preset_label(self._region)} preset")
+        self._defaults_btn.setToolTip("Discard edits and fall back to the selected "
+                                      "region's built-in guideline set.")
+        self._defaults_btn.clicked.connect(self._use_defaults)
         btns.addWidget(add)
         btns.addWidget(rem)
         btns.addStretch(1)
-        btns.addWidget(defaults)
+        btns.addWidget(self._defaults_btn)
         root.addLayout(btns)
 
         bb = QDialogButtonBox(
@@ -3048,6 +3135,21 @@ class _GroundingSourcesDialog(QDialog):
         root.addWidget(bb)
 
         self._loading = False
+        self._reload_list()
+        if self._sources:
+            self._list.setCurrentRow(0)
+
+    def _load_preset(self):
+        from ..grounding.guidelines import region_preset, preset_label
+        from aqt.utils import askUser
+        key = self._preset_combo.currentData()
+        if self._sources and not askUser(
+            f"Replace the current list with the built-in {preset_label(key)} set?",
+            parent=self):
+            return
+        self._region = key
+        self._sources = [dict(g) for g in region_preset(key)["sources"]]
+        self._defaults_btn.setText(f"Reset to {preset_label(key)} preset")
         self._reload_list()
         if self._sources:
             self._list.setCurrentRow(0)
@@ -3107,15 +3209,23 @@ class _GroundingSourcesDialog(QDialog):
             self._list.setCurrentRow(min(row, len(self._sources) - 1))
 
     def _use_defaults(self):
+        # Reset to the currently selected region's preset (the dialog's _region,
+        # which tracks the last loaded preset). The caller switches the Create-tab
+        # region combo to result_region() when the result list is empty.
+        self._region = self._preset_combo.currentData() or self._region
         self._cleared = True
         self.accept()
 
     def result_sources(self) -> list:
-        """The edited list, or [] when 'Use built-in defaults' was chosen
-        (empty → guidelines.py falls back to the bundled AU/WA set)."""
+        """The edited list, or [] when 'Reset to … preset' was chosen (empty →
+        the caller falls back to result_region()'s built-in set)."""
         if self._cleared:
             return []
         return [s for s in self._sources if s.get("url") and s.get("name")]
+
+    def result_region(self) -> str:
+        """The region whose preset should be used when result_sources() is empty."""
+        return self._region
 
 
 # ── about tab ────────────────────────────────────────────────────────────────

@@ -202,6 +202,297 @@ BUILTIN_GUIDELINES = [
     },
 ]
 
+
+# ── United States ───────────────────────────────────────────────────────────
+# Reputable US bodies. Mostly allow-list only (fetchable False) — society and
+# agency guideline indexes aren't useful to scrape; the URL is still a valid
+# citation. Open patient/reference sites are marked fetchable.
+
+USA_GUIDELINES = [
+    {
+        "name": "UpToDate – Clinical Decision Support",
+        "url": "https://www.uptodate.com",
+        "fetchable": False,
+        "specialties": ["*"],
+    },
+    {
+        "name": "CDC – Clinical Guidance",
+        "url": "https://www.cdc.gov",
+        "fetchable": False,
+        "specialties": ["infectious", "infectious_diseases", "antimicrobial",
+                        "vaccination", "immunology", "epidemiology", "preventive",
+                        "public_health", "travel"],
+    },
+    {
+        "name": "USPSTF – Preventive Services Recommendations",
+        "url": "https://www.uspreventiveservicestaskforce.org/uspstf/recommendation-topics",
+        "fetchable": True,
+        "specialties": ["preventive", "screening", "general_practice", "general"],
+    },
+    {
+        "name": "AHA/ACC – Cardiovascular Clinical Guidelines",
+        "url": "https://www.acc.org/guidelines",
+        "fetchable": False,
+        "specialties": ["cardiology", "arrhythmia", "heart_failure", "coronary",
+                        "cardiovascular", "hypertension"],
+    },
+    {
+        "name": "IDSA – Infectious Diseases Practice Guidelines",
+        "url": "https://www.idsociety.org/practice-guideline/practice-guidelines/",
+        "fetchable": False,
+        "specialties": ["infectious", "infectious_diseases", "antimicrobial",
+                        "antibiotic", "hiv"],
+    },
+    {
+        "name": "ADA – Standards of Care in Diabetes",
+        "url": "https://professional.diabetes.org/standards-of-care",
+        "fetchable": False,
+        "specialties": ["endocrinology", "diabetes"],
+    },
+    {
+        "name": "ACOG – Clinical Guidance (Obstetrics & Gynecology)",
+        "url": "https://www.acog.org/clinical/clinical-guidance",
+        "fetchable": False,
+        "specialties": ["obstetric", "obstetrics", "gynaecology", "gynecology",
+                        "maternal", "antenatal"],
+    },
+    {
+        "name": "NCCN – Oncology Clinical Practice Guidelines",
+        "url": "https://www.nccn.org/guidelines/category_1",
+        "fetchable": False,
+        "specialties": ["oncology", "cancer", "haematology_oncology"],
+    },
+    {
+        "name": "AAP – Pediatric Clinical Practice Guidelines",
+        "url": "https://www.aap.org/en/practice-management/aap-clinical-practice-guidelines/",
+        "fetchable": False,
+        "specialties": ["paediatric", "paediatrics", "pediatric", "pediatrics",
+                        "neonatal", "neonatology"],
+    },
+    {
+        "name": "ACR – Rheumatology Clinical Practice Guidelines",
+        "url": "https://rheumatology.org/clinical-practice-guidelines",
+        "fetchable": False,
+        "specialties": ["rheumatology", "arthritis", "lupus", "vasculitis", "gout"],
+    },
+    {
+        "name": "KDIGO – Kidney Disease Guidelines",
+        "url": "https://kdigo.org/guidelines/",
+        "fetchable": False,
+        "specialties": ["nephrology", "renal", "dialysis", "transplant"],
+    },
+    {
+        "name": "AGA – Gastroenterology Clinical Guidelines",
+        "url": "https://gastro.org/guidelines/",
+        "fetchable": False,
+        "specialties": ["gastroenterology", "liver", "hepatology",
+                        "inflammatory_bowel", "pancreas"],
+    },
+    {
+        "name": "AAN – Neurology Clinical Practice Guidelines",
+        "url": "https://www.aan.com/practice/guidelines",
+        "fetchable": False,
+        "specialties": ["neurology", "stroke", "epilepsy", "headache"],
+    },
+    {
+        "name": "APA – Psychiatry Clinical Practice Guidelines",
+        "url": "https://www.psychiatry.org/psychiatrists/practice/clinical-practice-guidelines",
+        "fetchable": False,
+        "specialties": ["psychiatry", "mental_health", "substance", "addiction"],
+    },
+    {
+        "name": "GOLD – Global Initiative for Chronic Obstructive Lung Disease",
+        "url": "https://goldcopd.org/",
+        "fetchable": False,
+        "specialties": ["respiratory", "copd", "lung"],
+    },
+    {
+        "name": "GINA – Global Initiative for Asthma",
+        "url": "https://ginasthma.org/",
+        "fetchable": False,
+        "specialties": ["asthma", "respiratory"],
+    },
+    {
+        "name": "MedlinePlus (NIH) – Health Reference",
+        "url": "https://medlineplus.gov",
+        "fetchable": True,
+        "specialties": ["general", "general_practice"],
+    },
+    {
+        "name": "Radiopaedia – Radiology Reference",
+        "url": "https://radiopaedia.org",
+        "fetchable": False,
+        "specialties": ["radiology", "imaging", "neurology", "respiratory",
+                        "orthopaedics", "emergency"],
+    },
+    {
+        "name": "LITFL – Life in the Fast Lane",
+        "url": "https://litfl.com",
+        "fetchable": False,
+        "specialties": ["emergency", "intensive_care", "cardiology", "toxicology",
+                        "pharmacology", "ecg"],
+    },
+    {
+        "name": "DermNet – Dermatology Reference",
+        "url": "https://dermnetnz.org",
+        "fetchable": False,
+        "specialties": ["dermatology", "skin", "melanoma", "psoriasis"],
+    },
+]
+
+
+# ── International ───────────────────────────────────────────────────────────
+# Region-neutral, globally respected sources for a broad audience.
+
+INTL_GUIDELINES = [
+    {
+        "name": "UpToDate – Clinical Decision Support",
+        "url": "https://www.uptodate.com",
+        "fetchable": False,
+        "specialties": ["*"],
+    },
+    {
+        "name": "BMJ Best Practice",
+        "url": "https://bestpractice.bmj.com",
+        "fetchable": False,
+        "specialties": ["*"],
+    },
+    {
+        "name": "Cochrane Library – Systematic Reviews",
+        "url": "https://www.cochranelibrary.com",
+        "fetchable": False,
+        "specialties": ["general", "general_practice", "preventive", "pharmacology",
+                        "evidence"],
+    },
+    {
+        "name": "WHO – Clinical Guidelines",
+        "url": "https://www.who.int/publications/who-guidelines",
+        "fetchable": False,
+        "specialties": ["infectious", "infectious_diseases", "public_health",
+                        "vaccination", "tropical", "epidemiology", "general"],
+    },
+    {
+        "name": "NICE – Clinical Guidance (UK)",
+        "url": "https://www.nice.org.uk/guidance",
+        "fetchable": False,
+        "specialties": ["general_practice", "cardiovascular", "cardiology",
+                        "respiratory", "mental_health", "diabetes", "endocrinology",
+                        "cancer", "oncology", "neurology", "preventive"],
+    },
+    {
+        "name": "ESC – European Society of Cardiology Guidelines",
+        "url": "https://www.escardio.org/Guidelines",
+        "fetchable": False,
+        "specialties": ["cardiology", "arrhythmia", "heart_failure", "coronary",
+                        "cardiovascular"],
+    },
+    {
+        "name": "ERS – European Respiratory Society Guidelines",
+        "url": "https://www.ersnet.org/science-and-research/clinical-practice-guidelines/",
+        "fetchable": False,
+        "specialties": ["respiratory", "lung", "copd", "asthma", "pneumonia"],
+    },
+    {
+        "name": "EASL – Liver Disease Clinical Practice Guidelines",
+        "url": "https://easl.eu/publication-category/clinical-practice-guidelines/",
+        "fetchable": False,
+        "specialties": ["liver", "hepatology", "gastroenterology"],
+    },
+    {
+        "name": "ESMO – European Society for Medical Oncology Guidelines",
+        "url": "https://www.esmo.org/guidelines",
+        "fetchable": False,
+        "specialties": ["oncology", "cancer", "haematology_oncology"],
+    },
+    {
+        "name": "KDIGO – Kidney Disease Guidelines",
+        "url": "https://kdigo.org/guidelines/",
+        "fetchable": False,
+        "specialties": ["nephrology", "renal", "dialysis", "transplant"],
+    },
+    {
+        "name": "GOLD – Global Initiative for Chronic Obstructive Lung Disease",
+        "url": "https://goldcopd.org/",
+        "fetchable": False,
+        "specialties": ["respiratory", "copd", "lung"],
+    },
+    {
+        "name": "GINA – Global Initiative for Asthma",
+        "url": "https://ginasthma.org/",
+        "fetchable": False,
+        "specialties": ["asthma", "respiratory"],
+    },
+    {
+        "name": "WHO – Model List of Essential Medicines",
+        "url": "https://www.who.int/groups/expert-committee-on-selection-and-use-of-essential-medicines",
+        "fetchable": False,
+        "specialties": ["pharmacology", "therapeutics"],
+    },
+    {
+        "name": "PubMed – Biomedical Literature",
+        "url": "https://pubmed.ncbi.nlm.nih.gov",
+        "fetchable": False,
+        "specialties": ["*"],
+    },
+    {
+        "name": "MedlinePlus (NIH) – Health Reference",
+        "url": "https://medlineplus.gov",
+        "fetchable": True,
+        "specialties": ["general", "general_practice"],
+    },
+    {
+        "name": "Radiopaedia – Radiology Reference",
+        "url": "https://radiopaedia.org",
+        "fetchable": False,
+        "specialties": ["radiology", "imaging", "neurology", "respiratory",
+                        "orthopaedics", "emergency"],
+    },
+    {
+        "name": "LITFL – Life in the Fast Lane",
+        "url": "https://litfl.com",
+        "fetchable": False,
+        "specialties": ["emergency", "intensive_care", "cardiology", "toxicology",
+                        "pharmacology", "ecg"],
+    },
+    {
+        "name": "DermNet – Dermatology Reference",
+        "url": "https://dermnetnz.org",
+        "fetchable": False,
+        "specialties": ["dermatology", "skin", "melanoma", "psoriasis"],
+    },
+]
+
+
+# ── Region presets ──────────────────────────────────────────────────────────
+# The shipped source sets a user can pick between. `region` in config selects
+# one (key); an edited `sources` list overrides the preset ("custom" region).
+
+AU_WA_GUIDELINES = BUILTIN_GUIDELINES   # readable alias for the default set
+
+REGION_PRESETS = {
+    "au_wa": {"label": "Australian & WA", "sources": AU_WA_GUIDELINES},
+    "usa":   {"label": "United States",   "sources": USA_GUIDELINES},
+    "intl":  {"label": "International",    "sources": INTL_GUIDELINES},
+}
+
+DEFAULT_REGION = "au_wa"
+
+
+def preset_keys() -> list:
+    """Region keys in display order."""
+    return ["au_wa", "usa", "intl"]
+
+
+def region_preset(key: str) -> dict:
+    """The preset dict ({label, sources}) for a region key, falling back to the
+    default region for unknown keys."""
+    return REGION_PRESETS.get(key) or REGION_PRESETS[DEFAULT_REGION]
+
+
+def preset_label(key: str) -> str:
+    return region_preset(key)["label"]
+
+
 # Back-compat alias: older code referenced GUIDELINES directly. The live
 # registry is now resolved per-call from config (see _load_sources).
 GUIDELINES = BUILTIN_GUIDELINES
@@ -218,21 +509,34 @@ def _grounding_cfg() -> dict:
         return {}
 
 
+def _active_region() -> str:
+    """Selected region key from config (default DEFAULT_REGION)."""
+    return str(_grounding_cfg().get("region") or DEFAULT_REGION).strip().lower()
+
+
 def _load_sources() -> list:
-    """The active guideline registry: the user's edited `sources` list from
-    config if non-empty, else the built-in AU/WA defaults. Each entry must be a
-    dict with at least name/url/specialties; malformed entries are dropped."""
+    """The active guideline registry, resolved in priority order:
+      1. the user's edited `sources` list (a "custom" region) if non-empty;
+      2. the selected region preset's sources;
+      3. the default AU/WA set.
+    Each entry must be a dict with at least name/url; malformed entries dropped."""
     src = _grounding_cfg().get("sources")
     if isinstance(src, list) and src:
         clean = [g for g in src
                  if isinstance(g, dict) and g.get("url") and g.get("name")]
         if clean:
             return clean
-    return BUILTIN_GUIDELINES
+    return region_preset(_active_region())["sources"]
 
 
 def _region_label() -> str:
-    return str(_grounding_cfg().get("region_label") or "Australian & WA").strip()
+    """Citation-header label: the user's free-text label when they've supplied a
+    custom source list, otherwise the selected preset's label."""
+    cfg = _grounding_cfg()
+    src = cfg.get("sources")
+    if isinstance(src, list) and src:
+        return str(cfg.get("region_label") or preset_label(_active_region())).strip()
+    return preset_label(_active_region())
 
 
 # ── Specialty matching ─────────────────────────────────────────────────────────

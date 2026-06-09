@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.9.1
+
+### Added
+- **Guideline regions for AI Create.** Source grounding now ships three curated,
+  reputable guideline sets — **Australia & WA**, **United States**, and
+  **International** — and you pick which region's citations the AI is allowed to
+  use. The US set spans CDC / USPSTF / AHA-ACC / IDSA / ADA / ACOG / NCCN / AAP /
+  ACR / KDIGO / AGA / AAN / APA / GOLD / GINA / Radiopaedia and more; the
+  International set spans WHO / Cochrane / BMJ Best Practice / NICE / UpToDate /
+  ESC / ERS / EASL / ESMO / PubMed and more.
+- **Region picker in the setup wizard.** The Create page now asks which guideline
+  region to use (or "None" to turn grounding off), so a fresh install is grounded
+  correctly for where you practise.
+- **Manage your own preset.** "Manage sources…" can now **load any region's
+  built-in set as a starting point**, then you add/remove your favourite sources;
+  saving an edited list makes it your reusable **Custom** set.
+
+### Changed
+- **Rebuilt the "Manage guideline sources" dialog.** Wider window with fields that
+  fill the row (Name / URL / Specialties were being clipped), a preset loader at
+  the top, and a clearer "Reset to <region> preset" button.
+- **Leaner defaults for fresh installs.** The QBank **heatmap**, the **weakness/
+  stats dashboard**, and the **Update-by-Tag** tool now start **off** — turn them
+  on in Settings when you want them. (Images and grounding stay on. Existing users
+  keep whatever they already had.)
+
 ## 1.9.0
 
 ### Added
