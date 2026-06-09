@@ -182,9 +182,17 @@ When unsure, write the processing-cue version and let the scorer flag it if need
 
 ## Card quantity
 
-- Default: one card per concept unless the student requests more
-- Fewer high-yield cards over more low-yield cards
-- If a topic is low-yield, say so and offer 1 card maximum
+When a specific number of cards is requested, **scale the depth and breadth of the set to that number** — the same topic should produce a very different set at 1 card versus 50.
+
+- **1–2 cards** — the single highest-yield, most exam-critical fact: a quick, broad-strokes card, the one thing worth testing if you could test only one.
+- **A handful (≤8)** — the core high-yield facts a student must know first; skip secondary detail.
+- **A medium set (≤20)** — the main concepts across the topic with moderate depth: mechanisms, presentations, management, not just headline facts.
+- **A large set (20+)** — comprehensive. Fan out across the topic's subtopics (epidemiology, pathophysiology, diagnosis, the relevant organ systems, management, complications, monitoring) AND go deeper into mechanisms, distinctions, and less-common but testable detail. When working from a supplied source rather than a topic, breadth is bounded by the source — exhaustively extract its testable facts instead of ranging over the whole subject.
+
+Quality still governs quantity: **never pad with low-yield filler to hit a number.** If the topic genuinely can't support the requested count at high yield, make fewer excellent cards and say so.
+
+- Default (no number given): one card per concept; fewer high-yield cards over more low-yield ones.
+- If a topic is low-yield, say so and offer 1 card maximum.
 
 ## Examples
 

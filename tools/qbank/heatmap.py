@@ -264,6 +264,24 @@ def build_card_html(platforms: list, cfg: dict) -> str:
         f'<button class="ec-btn ec-nav-btn" onclick="pycmd(\'qbank:heatmap:next\')" title="Next month">›</button>'
     )
 
+    # "Q" shortcut — opens the first platform (matches the <kbd>Q</kbd> hint on
+    # its launch button). Bound on the deck-browser document so it works whenever
+    # the home screen has focus; ignored while typing in a field, and only when
+    # no modifier is held so it never collides with Anki's own shortcuts.
+    first_platform_key = platforms[0]["key"] if platforms else ""
+    qkey_script = (
+        "<script>(function(){"
+        "if(window.__ankisstantQKey)return;window.__ankisstantQKey=true;"
+        "document.addEventListener('keydown',function(e){"
+        "if(e.key!=='q'&&e.key!=='Q')return;"
+        "if(e.ctrlKey||e.metaKey||e.altKey)return;"
+        "var t=e.target;"
+        "if(t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.isContentEditable))return;"
+        "e.preventDefault();"
+        f"pycmd('qbank:open:{first_platform_key}');"
+        "});})();</script>"
+    ) if first_platform_key else ""
+
     return f"""
 <div style="display:flex;justify-content:center;width:100%;">
 <style>
@@ -376,5 +394,6 @@ def build_card_html(platforms: list, cfg: dict) -> str:
   </div>
   <div class="ec-nav-row">{nav_buttons}</div>
 </div>
+{qkey_script}
 </div>
 """

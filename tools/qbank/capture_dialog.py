@@ -10,7 +10,7 @@ from aqt import mw
 from aqt.qt import (
     QBuffer, QDialog, QHBoxLayout, QImage, QIODevice, QKeySequence, QLabel,
     QLineEdit, QPlainTextEdit, QPushButton, QShortcut, Qt, QTextEdit, QUrl,
-    QVBoxLayout,
+    QVBoxLayout, QWidget,
 )
 
 from ...core.config import tool_config, save_tool_config
@@ -224,10 +224,25 @@ class CaptureDialog(QDialog):
         self._has_stem = False
         first_input = None
         specs = engine.capture_fields(type_meta, "mq_capture")
+
+        # The system/subsystem/topic levels are optional here — auto-tag fills
+        # them in when you make the card. Tuck them behind a collapsed toggle so
+        # the popup is just stem + concept by default, but a tag can still be
+        # pre-set when wanted.
+        _LEVEL_KEYS = ("system", "subsystem", "topic")
+        levels_box = QWidget()
+        levels_layout = QVBoxLayout(levels_box)
+        levels_layout.setContentsMargins(0, 0, 0, 0)
+        levels_layout.setSpacing(6)
+        levels_box.setVisible(False)
+        has_levels = False
+        self._levels_box = levels_box
+
         for spec in specs:
             key = spec["key"]
             label = spec.get("label") or key
             w, getter, _setter = _capture_widget(spec, prefill)
+            target = levels_layout if key in _LEVEL_KEYS else layout
             if spec["kind"] == "html":
                 row = QHBoxLayout()
                 row.addWidget(QLabel(f"<b>{label}</b>"))
@@ -235,26 +250,34 @@ class CaptureDialog(QDialog):
                 pbtn = QPushButton("Paste from clipboard")
                 pbtn.setStyleSheet("font-size: 11px; padding: 2px 8px;")
                 pbtn.clicked.connect(lambda _c=False, ww=w: (ww.setFocus(), ww.paste()))
-                row.addWidget(pbtn)
-                layout.addLayout(row)
-                layout.addWidget(w)
+                target.addLayout(row)
+                target.addWidget(w)
                 self._has_stem = True
             else:
-                layout.addWidget(QLabel(f"<b>{label}</b>"))
-                layout.addWidget(w)
+                target.addWidget(QLabel(f"<b>{label}</b>"))
+                target.addWidget(w)
             self._field_getters[key] = getter
-            if first_input is None:
+            if key in _LEVEL_KEYS:
+                has_levels = True
+            elif first_input is None:
                 first_input = w
 
-        levels_hint = QLabel(
-            "<span style='color:gray;font-size:10px'>"
-            "Saved with the missed question — system/subsystem/topic build the tag "
-            "later when you make a card. Screenshots in the stem are saved to Anki's "
-            "media folder automatically.</span>"
-        )
-        levels_hint.setTextFormat(Qt.TextFormat.RichText)
-        levels_hint.setWordWrap(True)
-        layout.addWidget(levels_hint)
+        if has_levels:
+            toggle = QPushButton("▸ Optional: pre-set tag")
+            toggle.setFlat(True)
+            toggle.setStyleSheet(
+                "text-align:left; color:gray; font-size:11px; border:none; padding:2px 0;")
+            toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+
+            def _toggle_levels(_c=False, btn=toggle, box=levels_box):
+                show = not box.isVisible()
+                box.setVisible(show)
+                btn.setText(("▾ " if show else "▸ ") + "Optional: pre-set tag")
+
+            toggle.clicked.connect(_toggle_levels)
+            layout.addWidget(toggle)
+            layout.addWidget(levels_box)
+
         self._first_input = first_input
 
         btn_row = QHBoxLayout()
@@ -388,6 +411,23 @@ class CaptureDialog(QDialog):
         self.accept()
 
 
+def _inferred_platform() -> tuple[str, str]:
+    """(key, name) of the QBank to credit a capture to when none was supplied
+    and no embedded window is open: the last one the user opened, else their
+    only configured platform. ('', '') when it genuinely can't be inferred."""
+    cfg = tool_config("qbank")
+    platforms = cfg.get("platforms", []) or []
+    last_key = cfg.get("last_platform_key", "")
+    if last_key:
+        for p in platforms:
+            if p.get("key") == last_key:
+                return p.get("key", ""), p.get("name", "")
+    if len(platforms) == 1:
+        p = platforms[0]
+        return p.get("key", ""), p.get("name", "")
+    return "", ""
+
+
 def _is_live(dlg) -> bool:
     if dlg is None:
         return False
@@ -403,6 +443,23 @@ def open_capture(platform_key: str = "", platform_name: str = "") -> None:
         _current.raise_()
         _current.activateWindow()
         return
+    # Global triggers (app shortcut, panel button, JS bridge) pass a blank
+    # platform — figure out which QBank is open instead of leaving the source
+    # blank. The in-browser button already passes its own platform.
+    if not platform_key:
+        try:
+            from .browser import active_platform
+            platform_key, platform_name = active_platform()
+        except Exception:
+            pass
+    # Still blank — no embedded QBank window is live (the user is likely
+    # reviewing in their own browser). Infer the source rather than making them
+    # tell us: the QBank they last opened, or their only configured one.
+    if not platform_key:
+        try:
+            platform_key, platform_name = _inferred_platform()
+        except Exception:
+            pass
     _current = CaptureDialog(platform_key, platform_name)
     _current.show()
     _current.raise_()

@@ -215,7 +215,7 @@ DEFAULTS: dict = {
             #   {system}/{subsystem}/{topic} — the extracted levels
             # Cards from Create or Browse therefore sit together under
             # <base>::MQ / <base>::KG, distinguished by type, not by tool.
-            "auto_tag_base": "!!Fleg",
+            "auto_tag_base": "!Ankisstant",
             "tag_scheme_template": "{base}::{type}::{system}::{subsystem}::{topic}",
             # Configurable list of KG types. Each item:
             #   key         — stable id (slug); used by KG entries
@@ -333,6 +333,12 @@ DEFAULTS: dict = {
                 #   silently regenerate failures (re-grading each attempt) up to
                 #   auto_regen_max_retries before surfacing the best attempt flagged.
                 "verdict_action": "flag_only",
+                # Atomicity sensitivity: the max number of independent cloze
+                # deletions allowed on one note before the pass flags it (D2).
+                # 2 = a clean 2-cloze note passes; only 3+ independent facts flag.
+                # Threaded into the deterministic prefilter, the LLM grader prompt
+                # and the generator guidance so all three agree.
+                "atomicity_max_clozes": 2,
                 "auto_regen_max_retries": 2,
                 # Auto-regen is suppressed for the manual/paste provider unless this
                 # is on, since each retry is another copy/paste round-trip.
@@ -348,6 +354,56 @@ DEFAULTS: dict = {
                 # this defaults to the cheaper "fast" models.
                 "grader_model": dict(_FAST_MODELS),
             },
+            # Source grounding: inject a curated Australian/WA clinical-guideline
+            # citation allow-list into the generation prompt so cards cite real
+            # URLs instead of hallucinated slugs. Topic-mode only (in source mode
+            # the user's pasted material is the source). Resolution mirrors the
+            # quality pass: global `enabled` here, an optional per-notetype
+            # `grounding_override` (inherit/on/off), and a per-batch checkbox.
+            "grounding": {
+                "enabled": True,        # global default
+                # Live fetch does blocking network I/O to pull guideline page
+                # text into the prompt. Off by default — keeps generation snappy;
+                # the allow-list alone already stops invented URLs.
+                "fetch_live": False,
+                # Shown in the injected citation-block header. Editable so the
+                # registry is transferable across regions (e.g. "UK & NICE").
+                "region_label": "Australian & WA",
+                # Editable guideline registry. Empty → the built-in AU/WA defaults
+                # in grounding/guidelines.py (BUILTIN_GUIDELINES) are used. Once the
+                # user edits sources in Settings, the full list is stored here. Each
+                # entry: {name, url, fetchable, specialties:[...]}.
+                "sources": [],
+            },
+            # Online image search for the review screen. Auto-find fetches
+            # candidate images only for cards the model flagged as visual (it
+            # emits an `image_query`); manual per-card search/browse always work.
+            "images": {
+                "auto_find": False,        # per-batch "🖼️ Auto-image" default
+                "max_per_card": 4,         # candidate thumbnails per visual card
+                "sources": {
+                    "wikipedia": True,
+                    "openi": True,
+                    "dermnet": True,
+                    "radiopaedia": True,
+                    "bing": False,         # only used when bing_api_key is set
+                },
+                # Azure "Bing Image Search" resource key. Blank → Bing stays off
+                # even if its source toggle is on (it's a key-gated API, no scrape).
+                "bing_api_key": "",
+                # In-Anki visual browser: which image search the embedded webview
+                # loads. "custom" uses browse_custom_url with {q} as the query slot.
+                "browse_engine": "duckduckgo",   # duckduckgo | bing | google | custom
+                "browse_custom_url": "",
+            },
+        },
+        # Update by Tag: bulk-reprocess existing notes to the current format /
+        # guidelines as new copies (originals untouched). Reuses the AI Create
+        # notetype profiles + card-creation model; only its own tags live here.
+        "update_by_tag": {
+            "enabled": True,
+            "audit_tag": "Ankisstant::AI::Updated",
+            "review_tag": "Ankisstant::AI::UpdateReview",
         },
     },
 }
@@ -576,7 +632,7 @@ def _migrate_auto_tag_scheme(cfg: dict) -> None:
     if (kg.get("tag_scheme_template") or "").strip() == legacy_tmpl:
         kg["tag_scheme_template"] = _DEFAULT_TAG_TEMPLATE
     if not (kg.get("auto_tag_base") or "").strip():
-        kg["auto_tag_base"] = "!!Fleg"
+        kg["auto_tag_base"] = "!Ankisstant"
 
 
 def save_config(cfg: dict) -> None:

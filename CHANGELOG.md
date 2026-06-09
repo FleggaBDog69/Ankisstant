@@ -1,5 +1,94 @@
 # Changelog
 
+## 1.9.0
+
+### Added
+- **Image previews in the Create review screen.** Each card that needs a picture
+  now shows a strip of candidate thumbnails — **click one to attach it** to that
+  card. Visual cards are auto-detected (the model flags them with an
+  `image_query`), and manual per-card search/browse still works on any card.
+- **In-Anki visual image browser + more image sources.** Settings now let you
+  pick the search engine the embedded image browser loads (DuckDuckGo / Google /
+  Bing / a custom `{q}` URL), set how many candidate thumbnails to fetch per card,
+  and plug in an Azure "Bing Image Search" key for the key-gated Bing source.
+  "🖼️ Auto-image" is a per-batch toggle.
+- **Update by Tag.** Bulk-reprocess existing notes to your current format and
+  guidelines as **new copies** (originals untouched), routed through the selected
+  AI-Create notetype profile, the shared card-gen contract, and source grounding.
+- **Bundled Malleus Q&A notetype.** Ships a self-contained Front / Back / Source
+  notetype and seeds a matching AI-Create profile so question/answer generation
+  works out of the box. Idempotent and fail-open — safe on every profile load.
+- **Source grounding for generated cards.** Optionally inject a curated
+  Australian/WA clinical-guideline citation allow-list into the generation prompt
+  so cards cite **real URLs instead of hallucinated slugs** (topic mode only).
+  Global on/off with a per-notetype override and a per-batch checkbox; the
+  guideline registry and region label are editable in Settings, and an optional
+  live-fetch mode pulls guideline page text into the prompt.
+- **Atomicity control in the quality pass.** Set the maximum number of independent
+  cloze deletions allowed on one note before it's flagged (default 2). The setting
+  is threaded through the deterministic prefilter, the LLM grader, and the
+  generator guidance so all three agree.
+
+### Changed
+- **Auto-tagging snaps to your own tag tree.** Auto-tag now reuses the
+  system/subsystem/topic branches already under your auto-tag base instead of
+  inventing fresh synonyms each time (no more Cardio vs Cardiology, AFib vs Afib).
+- **Better AI Browse search terms.** The search-term prompt was overhauled so the
+  terms actually match cards: it now knows Anki **ANDs** space-separated words (so
+  it favours a ~2-word anchor + discriminator over 3–4-word phrases that return
+  nothing), uses the deck's own vocabulary — cytokines, drugs, eponyms — over
+  textbook prose, **expands shorthand** like `Th1` → `T helper` while keeping both
+  forms, and treats relational inputs (`X = Y`, "causes", "associated with") as
+  associations to decompose. The same anchor-plus-keyword guidance was added to
+  Broaden/Narrow.
+
+### Fixed
+- **Image downloads work again.** Wikimedia was returning 403 to the addon's terse
+  user-agent, so thumbnails and downloads silently failed. Requests now use a
+  browser-shaped user-agent with a Wikipedia `Referer` and a retry, and all image
+  fetches go through one shared 3-worker pool — no more per-card thread storms or
+  a frozen review screen, and suggestion buttons show a "(no preview)" placeholder
+  instead of going blank.
+- **Handled errors no longer look like crashes.** All logging now writes to a
+  rotating log file in `user_files/` instead of stderr (any stderr write pops
+  Anki's full "An error occurred" dialog). Recoverable failures — e.g. a transient
+  Gemini 503 that's already turned into a tooltip — stay quiet; set
+  `debug_logging` in the add-on config to mirror to the console on purpose.
+
+## 1.8.1
+
+- Internal version bump; no functional changes.
+
+## 1.8.0
+
+### Added
+- **Per-tool switchboard (Settings → Tools).** Single place to enable/disable
+  each tool; disabled tools' tabs and sidebar entries disappear entirely. AI
+  Browse gets a 3-way mode: Off / Native search only / Full panel — native-only
+  collapses its settings tab and hides the panel, and the browser's "Ankisstant
+  Settings…" menu opens straight to the AI Browse tab.
+- **"Which tools do you want?" setup-wizard page**, asked before AI-provider
+  selection so the rest of setup adapts (picking only Browse skips Defaults/QBanks
+  pages). The credentials page now includes quick-start API-key guides
+  (Anthropic / Gemini / OpenAI), noting Gemini needs no billing setup.
+- **Background card-generation jobs.** Create queues AI generation as background
+  jobs with persistent state, quality-pass grading, and a review queue, so
+  generation no longer blocks the UI.
+- **QBank weakness analysis** module.
+
+### Changed
+- **Shared autotag engine** used by both Create and Browse, so the hierarchical
+  tag scheme can't drift between them.
+- **Retrieval-cue card-gen prompt** rewrite (retrieval-force / processing-cue
+  design) replacing the older rules-based prompt, for higher-yield clozes.
+- The per-tool model rows on the AI tab grey out for unselected tools, and the
+  shared "Month tag" setting moved out of the Tools tab into Browse and Create
+  settings (kept in sync).
+- Default Gemini model bumped to **gemini-3.5-flash** (2.5-flash frequently hit
+  free-tier quota errors).
+- Bundled skills (anki-browse, anki-cards, anki-card-scorer) and Claude Project
+  instructions now ship with the addon.
+
 ## 1.7.2
 
 ### Changed

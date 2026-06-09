@@ -310,6 +310,59 @@ def run_claude_json(button, label: str, **kwargs):
     )
 
 
+def run_claude_json_async(button, on_done, **kwargs):
+    """Non-blocking ask_claude_json. Runs the call on a background thread with
+    NO modal progress dialog, so the rest of the UI stays usable while the AI
+    thinks — `on_done(result)` is then invoked on the main thread (result is
+    None on failure / no provider). `button`, if given, is disabled for the
+    duration so a second click can't pile on a duplicate request.
+
+    kwargs are forwarded to ask_claude_json (prompt, system, max_tokens, model).
+    The manual provider is interactive (copy/paste dialog) so it runs inline on
+    the main thread; on_done is still called with its result."""
+    from . import api as core_api
+
+    if is_manual_provider():
+        on_done(core_api.ask_claude_json(**kwargs))
+        return
+
+    if not provider_configured():
+        tooltip("Set up an AI provider in Ankisstant Settings first.", period=4000)
+        on_done(None)
+        return
+
+    if button is not None:
+        try:
+            button.setEnabled(False)
+        except RuntimeError:
+            pass
+
+    def _bg():
+        return core_api.ask_claude_json(show_errors=False, **kwargs)
+
+    def _finish(fut):
+        if button is not None:
+            try:
+                button.setEnabled(True)
+            except RuntimeError:
+                pass
+        result = None
+        try:
+            result = fut.result()
+        except Exception as e:
+            log.error(f"Claude call failed: {e}")
+            tooltip("Claude call failed — see console for details.", period=4000)
+        if result is None:
+            # ask_claude already logged the cause (show_errors=False).
+            tooltip("Claude call failed — see console for details.", period=4000)
+        try:
+            on_done(result)
+        except Exception as e:  # pragma: no cover - defensive
+            log.error(f"run_claude_json_async on_done failed: {e}")
+
+    mw.taskman.run_in_background(_bg, _finish)
+
+
 def run_claude_text(button, label: str, **kwargs):
     """Cancellable ask_claude (text reply)."""
     from . import api as core_api

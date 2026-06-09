@@ -24,7 +24,8 @@ from ..core.config import (
 )
 from ..core.qt_utils import (
     attach_tag_completer, is_manual_provider, loading, make_help_button,
-    make_setup_banner, provider_configured, run_claude_json, set_ai_buttons_enabled,
+    make_setup_banner, provider_configured, run_claude_json_async,
+    set_ai_buttons_enabled,
 )
 from . import autotag
 from .kg import engine
@@ -37,33 +38,51 @@ NAME = "AI Browse"
 
 SEARCH_TERMS_SYSTEM = (
     "You generate Anki search terms for a medical student's deck. Given a topic, "
-    "return a JSON array of 3 to 8 HIGHLY SPECIFIC search strings that surface "
-    "cards genuinely about that topic — not cards that just mention it in passing.\n\n"
-    "DECOMPOSITION (critical):\n"
-    "If the input combines MORE THAN ONE distinct clinical concept — joined by "
-    "'and', commas, semicolons, or expressed as a chain of reasoning failures "
-    "('failed to recognise X, missed Y, didn't act on Z') — first SPLIT it into "
-    "the underlying atomic concepts, then generate search terms for each. Don't "
-    "try to find a single card matching the whole compound statement: the user's "
-    "deck almost certainly has the pieces scattered across separate cards.\n\n"
-    "Examples of decomposition:\n"
-    "- Input: 'MRI is first line for HA with neuro deficit, failed to recognise "
-    "red flags' → search for {headache red flags} AND {imaging for headache "
-    "with focal neuro deficits} as separate concept groups.\n"
-    "- Input: 'aortic stenosis murmur and indications for valve replacement' → "
-    "{aortic stenosis murmur characteristics} AND {AVR indications}.\n"
-    "- Input: single concept like 'McDonald criteria' → no decomposition, just "
-    "generate variants on that one concept.\n\n"
+    "return a JSON array of 3 to 8 search strings that surface cards genuinely "
+    "about that topic — not cards that just mention it in passing.\n\n"
+    "HOW ANKI SEARCH WORKS (critical — most failures come from ignoring this):\n"
+    "Words separated by spaces are ANDed — EVERY word must appear on the same "
+    "card. So a 3–4 word term like 'psoriasis cell-mediated immunity' almost "
+    "always returns ZERO, because no single card contains all those words. Keep "
+    "most terms to the topic anchor PLUS ONE discriminating keyword — usually two "
+    "words (e.g. 'psoriasis IL-17', 'psoriasis Th17'). Use a three-word term only "
+    "when those exact words plausibly co-occur on one card.\n\n"
+    "USE THE DECK'S VOCABULARY, NOT TEXTBOOK PROSE:\n"
+    "Cards are written in terse exam shorthand, not prose. Approach the concept "
+    "through the angles the deck actually uses — the key cytokine/mediator, the "
+    "classic drug, the named sign, the tightly-linked condition — so terms match "
+    "how cards are phrased. For 'psoriasis Th1/Th17 pathogenesis', strong terms "
+    "are 'psoriasis IL-17', 'psoriasis Th17', 'psoriasis secukinumab', "
+    "'psoriasis IL-23' — far more likely to hit than 'cell-mediated immunity' or "
+    "'pathogenesis T cells', which are prose, not card text.\n\n"
+    "EXPAND SHORTHAND — AND KEEP BOTH FORMS:\n"
+    "If the input uses loose or informal shorthand, map it to the formal/canonical "
+    "term AND keep the short form too, since the deck may use either (e.g. 'Th1' → "
+    "also 'T helper', plus the relevant cytokines; 'EM' → 'erythema multiforme'). "
+    "Translate the user's casual wording into the precise terminology a deck uses.\n\n"
+    "DECOMPOSITION:\n"
+    "If the input combines MORE THAN ONE distinct concept — joined by 'and', "
+    "commas, semicolons, '=', 'causes', 'associated with', or a chain of reasoning "
+    "failures ('failed to recognise X, missed Y') — SPLIT it into the underlying "
+    "atomic concepts and generate terms for each. A relational input such as "
+    "'psoriasis = Th1 cells' is an ASSOCIATION: produce terms pairing the two "
+    "entities AND terms for each entity on its own. Don't hunt for one card "
+    "matching the whole compound statement — the pieces are scattered across "
+    "separate cards.\n"
+    "Examples: 'MRI first line for HA with neuro deficit, missed red flags' → "
+    "{headache red flags} and {headache focal neuro imaging} as separate groups; "
+    "'aortic stenosis murmur and indications for valve replacement' → "
+    "{aortic stenosis murmur} and {AVR indications}.\n\n"
     "RULES:\n"
-    "- Prefer multi-word phrases and eponyms over single common words.\n"
-    "- Avoid generic 1–3 letter abbreviations on their own (e.g. 'MS', 'DM', 'IV') — "
-    "they collide with too many unrelated cards. Disambiguate them: 'multiple sclerosis', "
-    "'McDonald criteria', not 'MS'.\n"
-    "- Include classic exam-relevant entities: pathognomonic signs, key drugs, "
-    "diagnostic criteria, eponyms — but ONLY if tightly bound to the topic.\n"
-    "- For narrow single-concept topics, return 3–4 terms. For decomposed "
-    "multi-concept inputs, return 2–3 terms per concept (up to 8 total). "
-    "Quality over quantity.\n\n"
+    "- The anchor + one-discriminator (≈2-word) term is the workhorse. Favour "
+    "eponyms, drugs, cytokines, and named signs over generic words like "
+    "'pathogenesis', 'mechanism', or 'immunity', which rarely appear on cards.\n"
+    "- Avoid generic 1–3 letter abbreviations ALONE (e.g. 'MS', 'DM', 'IV') — "
+    "disambiguate to 'multiple sclerosis'. But DO keep meaningful domain shorthand "
+    "the deck itself uses (IL-17, Th17, TNF, HLA-B27).\n"
+    "- For narrow single-concept topics, return 3–4 terms. For decomposed or "
+    "relational inputs, 2–3 terms per concept (up to 8 total). Quality over "
+    "quantity.\n\n"
     "Return ONLY the JSON array of strings. No prose, no quotes around the array."
 )
 
@@ -76,6 +95,9 @@ RESCOPE_SYSTEM = (
     "NARROWER: drill in. Use more specific sub-entities, drug names, exact "
     "diagnostic criteria, named signs, specific complications. Replace umbrella "
     "categories with their highest-yield sub-entries.\n\n"
+    "Anki ANDs space-separated words (every word must be on the card), so keep "
+    "each term to an anchor + one keyword (≈2 words); long phrases return nothing. "
+    "Use the deck's shorthand (cytokines, drugs, eponyms), not textbook prose.\n\n"
     "Same JSON-array-of-strings format as before. 3–6 items. No prose."
 )
 
@@ -676,9 +698,17 @@ class BrowsePanel(QWidget):
     def _on_search(self):
         if not anki_utils.require_col():
             return
+        # A search is already running in the background (the button is disabled
+        # for its duration) — ignore a second Enter-press so we don't stack
+        # concurrent calls now that the call no longer blocks the UI.
+        if not self.search_btn.isEnabled():
+            return
         topic = self.topic.text().strip()
         if not topic:
             return
+        # Warm the existing-tag vocabulary on the UI thread so the folded auto-tag
+        # reuses the user's own tag branches (see autotag.refresh_vocab_cache).
+        autotag.refresh_vocab_cache()
         self._last_topic = topic
         if self._mode == "tags":
             self._search_tags(topic)
@@ -692,6 +722,8 @@ class BrowsePanel(QWidget):
     def _rescope(self, direction: str):
         if not self._last_topic or not self._last_terms:
             return
+        if not self.search_btn.isEnabled():
+            return  # a search is already running
         user_msg = (
             f"Topic: {self._last_topic}\n"
             f"Previous terms: {self._last_terms}\n"
@@ -751,15 +783,22 @@ class BrowsePanel(QWidget):
                 concept = (self._linked_kg_concept or self.topic.text()).strip()
                 user_prompt += "\n\nCONTEXT for the AI-written fields:\nconcept: " + concept
 
+        # Run the AI call in the background (no modal dialog) so the panel and
+        # the rest of Anki stay usable while it thinks. _after_reply finishes on
+        # the main thread once the terms come back.
         model = tool_model_for("search")
-        reply = run_claude_json(
-            self.search_btn, "Asking AI…",
+        run_claude_json_async(
+            self.search_btn,
+            lambda reply: self._after_search_reply(
+                reply, plan, merge_tag, merge_explanation, kg_type_key),
             prompt=user_prompt,
             system=system_prompt,
             max_tokens=512,
             model=model,
         )
 
+    def _after_search_reply(self, reply, plan, merge_tag, merge_explanation,
+                            kg_type_key):
         # Route the reply with the engine: an object {tags, explanation, terms}
         # when extras were folded in, else a bare terms array.
         routed = engine.route(reply, plan)
@@ -812,13 +851,16 @@ class BrowsePanel(QWidget):
         self.status.setText("Asking AI for tag keywords…")
 
         model = tool_model_for("search")
-        entries = run_claude_json(
-            self.search_btn, "Asking AI…",
+        run_claude_json_async(
+            self.search_btn,
+            self._after_tag_reply,
             prompt=f"Topic: {topic}",
             system=TAG_SEARCH_SYSTEM,
             max_tokens=768,
             model=model,
         )
+
+    def _after_tag_reply(self, entries):
         if not isinstance(entries, list):
             self.status.setText("")
             return

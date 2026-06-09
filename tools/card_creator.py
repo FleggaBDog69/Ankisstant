@@ -9,6 +9,7 @@ import html
 import json
 import os
 import re
+import tempfile
 import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
@@ -18,14 +19,15 @@ from datetime import datetime as _dt
 from aqt import mw, gui_hooks
 from aqt.qt import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QFileDialog, QFrame, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QPlainTextEdit, QPushButton, QRadioButton,
-    QScrollArea, QSpinBox, Qt, QTimer, QVBoxLayout, QWidget,
+    QFileDialog, QFrame, QFormLayout, QGroupBox, QHBoxLayout, QIcon, QImage, QLabel,
+    QLineEdit, QListWidget, QListWidgetItem, QPixmap, QPlainTextEdit, QPushButton,
+    QRadioButton, QScrollArea, QSize, QSpinBox, Qt, QTimer, QVBoxLayout, QWidget,
 )
 from aqt.utils import askUser, showWarning, tooltip
 
 from . import autotag
 from . import quality_pass as qp
+from ..grounding import guidelines as grounding
 from ..core import anki_utils, api as core_api, log
 from ..core.config import (
     active_family, auto_tag_base, kg_type_info,
@@ -134,16 +136,30 @@ no other HTML.
 
 DO NOT include any prose outside the JSON array. No markdown fences. Just the JSON array."""
 
-SINGLE_REGEN_SYSTEM = (
-    "Regenerate ONE Anki cloze card on the same subject as the card supplied. "
-    "Return a JSON object with keys 'front' and 'extra' only. "
-    "RETRIEVAL FORCE is the priority: the cue (visible text) must force the student to "
-    "RECALL the answer via a mechanism, presentation, contrast, cause, or consequence — "
-    "never restate the answer's label or let the answer be read off the cue. Run the "
-    "substring check (the cloze answer must not appear as a substring or shared word-stem "
-    "of the visible cue). One atomic fact; short cloze answers (1–4 words). Standard "
-    "{{c1::...}} syntax, <b>/<u> only, no markdown fences, no prose."
-)
+
+QA_GEN_SYSTEM = """You generate high-yield question/answer Anki cards for a Year 3 Australian medical student, in the Malleus Clinical Medicine submission style.
+
+OUTPUT FORMAT
+Return ONLY a JSON array. Each element:
+  {"front": "<a single, specific question>",
+   "extra": "<the complete answer — the text shown on the back>",
+   "source": "<one acceptable Australian source with a URL, or '' if none>"}
+No cloze deletions. No prose outside the JSON array. No markdown fences.
+
+THE ONE THING THAT MATTERS: a clean question that forces recall.
+- The FRONT is one focused question the student must answer from memory — not a
+  recognition prompt, not a list of sub-parts. One question, one idea.
+- The EXTRA (back) is the full answer: direct, clinically relevant, complete enough
+  to stand alone. Use <b>/<u> and <br> sparingly; bullet lists with <br> where it aids
+  clarity. Do not restate the question.
+- Australian guidelines and spelling throughout. Clinically relevant, exam-useful.
+- SOURCE: cite one acceptable source with a real URL. NEVER invent a URL — if you have
+  no verifiable source, use an empty string. When a citation allow-list is provided
+  below, cite only from it and carry through its [LIVE]/[TRAINING DATA] label.
+- Repeat nothing verbatim from the source material; rephrase into a clean Q/A.
+
+DO NOT include any prose outside the JSON array. No markdown fences. Just the JSON array."""
+
 
 SPLIT_SYSTEM = (
     "Split the supplied Anki card into multiple ATOMIC single-cloze cards. Each output card "
@@ -532,6 +548,155 @@ def _quality_pass_active(cfg: dict, profile: dict | None) -> bool:
     return bool(qpc.get("enabled", False))
 
 
+def _atomicity_max(cfg: dict) -> int:
+    """User-configured atomicity sensitivity: the maximum number of independent
+    clozes allowed on one note before the quality pass flags it (D2). Defaults to
+    2 (a clean 2-cloze note passes; 3+ independent facts flag). Shared by the
+    deterministic prefilter, the LLM grader prompt, and the generator guidance so
+    all three agree. See tools/quality_pass.py."""
+    qpc = cfg.get("quality_pass") or {}
+    try:
+        n = int(qpc.get("atomicity_max_clozes", 2))
+    except (TypeError, ValueError):
+        n = 2
+    return n if n >= 1 else 1
+
+
+def _gen_atomicity_note(max_clozes: int) -> str:
+    """Generation-side counterpart to qp.atomicity_directive: tells the cloze
+    generator how many coupled clozes the user tolerates, so the scorer doesn't
+    flag cards it was instructed to produce. Appended to CARD_GEN_SYSTEM."""
+    n = max(1, int(max_clozes))
+    return (
+        f"\n\nATOMICITY BUDGET: you may place up to {n} cloze deletion(s) on one "
+        f"note when the facts are genuinely coupled (e.g. one multi-component fact "
+        f"split across clozes that share a core). Prefer fewer. Only exceed {n} "
+        f"for fixed sequences or mnemonics that lose meaning if split — never for "
+        f"an enumeration of independent facts (split those into separate cards)."
+    )
+
+
+def _topic_directive(topic: str, n: int) -> str:
+    """Extra instruction folded into the TOPIC user message so a topic phrased as
+    a specific factual ASSERTION ("TB meningitis presents with hydrocephalus")
+    yields a card testing exactly that stated fact — instead of the model
+    treating it as a broad subject and drifting to adjacent facts. Generic: no
+    fragile 'is this a sentence' detection, the model decides. Tightens further
+    when only a few cards are requested."""
+    lines = [
+        "If this TOPIC is phrased as a specific factual statement or assertion, "
+        "the FIRST card MUST test exactly that stated fact directly, before any "
+        "further cards expand to closely-related high-yield facts. Do not drift "
+        "to adjacent topics at the expense of the stated fact.",
+    ]
+    if n <= 2:
+        lines.append(
+            "Few cards were requested — stay tightly on the literal stated fact; "
+            "do not pad with loosely-related material."
+        )
+    return " ".join(lines)
+
+
+def _breadth_directive(n: int, mode: str) -> str:
+    """Scale card depth and breadth to the requested count. The same topic yields
+    very different card sets at N=1 vs N=50: one card should be the single
+    highest-yield fact (a quick, broad-strokes card); fifty should fan out across
+    the topic's subtopics AND drill into mechanism and detail. Folded into every
+    generation request. `mode` is 'topic' or 'source' — in source mode breadth is
+    bounded by the supplied material (extract more/deeper from it) rather than
+    ranging over the whole subject."""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        n = 1
+    source_bound = (mode == "source")
+    where = "the source" if source_bound else "this topic"
+    if n <= 2:
+        scope = (
+            f"only {n} card(s) requested — make the SINGLE highest-yield, most "
+            f"exam-critical card on {where}: the one thing you would test if you "
+            "could test only one. Broad strokes, no minutiae or secondary detail."
+        )
+    elif n <= 8:
+        scope = (
+            f"a small set — cover the core high-yield facts of {where} that a "
+            "student must know first. Stay on the essentials; skip secondary detail."
+        )
+    elif n <= 20:
+        scope = (
+            f"a medium set — cover the main concepts across {where} with moderate "
+            "depth: key mechanisms, presentations, and management, not just "
+            "headline facts."
+        )
+    else:
+        if source_bound:
+            scope = (
+                "a large set — be comprehensive: exhaustively extract the testable "
+                "facts in the source, including secondary detail and mechanism, "
+                "not just the headline points."
+            )
+        else:
+            scope = (
+                "a large set — be comprehensive: fan out across ALL the topic's "
+                "subtopics (epidemiology, pathophysiology, diagnosis, the relevant "
+                "organ systems, management, complications, monitoring) AND go "
+                "deeper into mechanisms, distinctions, and less-common but testable "
+                "detail."
+            )
+    cards_word = "card" if n == 1 else "cards"
+    return (
+        "CARD COUNT & SCOPE: " + scope +
+        " Match depth and breadth to the count; never pad with low-yield filler to "
+        f"hit the number — if {where} genuinely can't support {n} strong "
+        f"{cards_word}, make fewer excellent ones."
+    )
+
+
+def _grounding_active(cfg: dict, profile: dict | None, mode: str) -> bool:
+    """Whether to inject the guideline citation allow-list for this creation.
+    Topic-mode only — in source mode the user's pasted material IS the source.
+    A per-notetype override ('on'/'off') beats the global `grounding.enabled`
+    toggle; 'inherit' (default) defers to it. Mirrors _quality_pass_active."""
+    if mode != "topic":
+        return False
+    ov = str((profile or {}).get("grounding_override", "inherit")).lower()
+    if ov == "on":
+        return True
+    if ov == "off":
+        return False
+    gc = cfg.get("grounding") or {}
+    return bool(gc.get("enabled", True))
+
+
+def _grounding_fetch_live(cfg: dict) -> bool:
+    gc = cfg.get("grounding") or {}
+    return bool(gc.get("fetch_live", False))
+
+
+# ── auto-image (model-flagged visual relevance) ───────────────────────────────
+
+# Appended to the system prompt when the "🖼️ Auto-image" toggle is on. The
+# model emits an `image_query` ONLY for cards a real image would materially help
+# (derm, radiology, anatomy, histology, ECG, gross pathology); the review screen
+# then auto-fetches candidate thumbnails for exactly those cards.
+IMAGE_QUERY_INSTRUCTION = (
+    "\n\nIMAGE RELEVANCE\n"
+    "For any card where a real medical image would materially aid learning "
+    "(e.g. dermatology lesions/rashes, radiology X-ray/CT/MRI, anatomy, "
+    "histology, ECG tracings, gross pathology, clinical signs), add an "
+    "\"image_query\" key to that card's JSON object: a short, specific image "
+    "search phrase (e.g. \"erythema multiforme target lesions\", "
+    "\"tension pneumothorax chest x-ray\"). OMIT the key entirely for purely "
+    "conceptual/definitional cards where an image adds nothing. Do not change "
+    "any other key. Never let image_query alter the front/extra content."
+)
+
+
+def _auto_image_active(cfg: dict) -> bool:
+    """Global default for the per-batch auto-image toggle."""
+    return bool((cfg.get("images") or {}).get("auto_find", False))
+
+
 def _grader_model(cfg: dict) -> str | None:
     """The grader model for the active family — the dedicated quality_pass model
     if set, else the generator model, else the family default (resolved later)."""
@@ -564,29 +729,44 @@ def _regenerate_one(old_card: dict, hint: str, profile: dict | None,
     """Regenerate ONE card on the same subject, honouring an optional hint and
     focus. Returns a new {front, extra} dict (preserving per-card images) or None
     on failure. Shared by the review dialog's Regenerate button and the
-    quality-pass auto-regenerate loop."""
+    quality-pass auto-regenerate loop.
+
+    Routes through the SAME creator system prompt + skill used for fresh
+    generation (not a stripped-down regen prompt), so the rewritten card keeps
+    the full style/formatting conventions (e.g. <b>/<u>, Extra layout) and any
+    notetype guidance. A quality-pass FAIL reason / user feedback rides along as
+    improvement notes — the card is re-created with that fix, not regenerated
+    from a thin prompt."""
+    is_qa = str((profile or {}).get("card_format", "cloze")).lower() == "qa"
     if hint:
         instruction = (
-            f"Regenerate ONE card on the same subject, applying this user "
-            f"feedback: {hint}"
+            "This card needs improvement. Rewrite it as a single, better card that "
+            "tests the SAME fact, fixing the following: " + hint
         )
     else:
         instruction = (
-            "Regenerate ONE card on the same subject — different angle or wording."
+            "Rewrite this card as a single, better card on the same fact — a "
+            "stronger cue or wording while keeping the same retrieval target."
         )
     prompt = (
-        "Original card front:\n" + old_card.get("front", "") + "\n\n"
-        "Original card extra:\n" + old_card.get("extra", "") + "\n\n"
-        + instruction + " "
-        + (f"Focus: {focus}" if focus else "")
+        "Existing card to improve.\n"
+        "Front:\n" + old_card.get("front", "") + "\n\n"
+        "Extra:\n" + old_card.get("extra", "") + "\n\n"
+        + instruction + "\n"
+        + (f"Focus: {focus}\n" if focus else "")
+        + "Return a JSON array containing EXACTLY ONE card object."
     )
     skill_invocation, skill_id = _resolve_skill(profile)
+    base_system = QA_GEN_SYSTEM if is_qa else CARD_GEN_SYSTEM
     new = core_api.ask_claude_json(
         prompt=prompt,
-        system=_augment_system(SINGLE_REGEN_SYSTEM, profile),
+        system=_augment_system(base_system, profile),
         max_tokens=1024, model=model,
         skill_id=skill_id, skill_invocation=skill_invocation,
     )
+    # The creator system prompt + skill emit an array; accept a bare object too.
+    if isinstance(new, list):
+        new = next((c for c in new if isinstance(c, dict)), None)
     if not isinstance(new, dict) or "front" not in new or "extra" not in new:
         return None
     if old_card.get("_image_paths"):
@@ -618,7 +798,9 @@ def grade_cards_sync(cards: list, profile: dict | None, cfg: dict,
             else:
                 skill_inv, skill_id = _grader_skill(cfg, profile)
                 use_skill = bool(skill_inv or skill_id)
-                system = qp.SKILL_BATCH_SYSTEM if use_skill else qp.RUBRIC_BATCH_SYSTEM
+                max_clozes = _atomicity_max(cfg)
+                system = (qp.skill_batch_system(max_clozes) if use_skill
+                          else qp.rubric_batch_system(max_clozes))
                 raw = core_api.ask_claude_json(
                     prompt=qp.batch_prompt(cards), system=system,
                     max_tokens=2048, model=_grader_model(cfg),
@@ -630,7 +812,7 @@ def grade_cards_sync(cards: list, profile: dict | None, cfg: dict,
         except Exception as e:
             print(f"[ankisstant] background quality pass grade skipped: {e}")
             llm_verdicts = None
-        verdicts = qp.apply_prefilters_then(llm_verdicts, cards)
+        verdicts = qp.apply_prefilters_then(llm_verdicts, cards, _atomicity_max(cfg))
         graded = llm_verdicts is not None
         # Mirror the panel rule: when ungraded, only surface deterministic
         # pre-filter findings (don't paint everything PASS).
@@ -641,11 +823,62 @@ def grade_cards_sync(cards: list, profile: dict | None, cfg: dict,
         return None
 
 
+# Cards built here are loaded straight into Anki's native editor webview
+# (`ac.set_note`). A full-resolution clinical image (Radiopaedia / search-engine
+# results are routinely 5000px+ and tens of MB) decoded in that webview can
+# exhaust memory and beach-ball the whole app. Downscale + re-encode anything
+# oversized BEFORE it enters the media collection.
+_IMG_MAX_DIM = 1600          # px on the longest side
+_IMG_REENCODE_BYTES = 1_500_000  # files larger than this get re-encoded even if small-dim
+
+
+def _normalize_image_file(path: str) -> str:
+    """Return a path to a web-safe (downscaled, re-encoded) copy of `path` when
+    it is oversized; otherwise return `path` unchanged. Never raises — on any
+    problem the original path is returned so attachment still works."""
+    try:
+        if not path or not os.path.exists(path):
+            return path
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = 0
+        img = QImage(path)
+        if img.isNull():
+            return path  # not a raster Qt understands (e.g. SVG) — leave as-is
+        w, h = img.width(), img.height()
+        longest = max(w, h)
+        if longest <= _IMG_MAX_DIM and size <= _IMG_REENCODE_BYTES:
+            return path  # already small enough; keep original bytes/quality
+        if longest > _IMG_MAX_DIM:
+            img = img.scaled(
+                _IMG_MAX_DIM, _IMG_MAX_DIM,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        has_alpha = img.hasAlphaChannel()
+        ext = ".png" if has_alpha else ".jpg"
+        fd, out = tempfile.mkstemp(prefix="ankisstant_img_norm_", suffix=ext)
+        os.close(fd)
+        ok = img.save(out, "PNG" if has_alpha else "JPG", -1 if has_alpha else 85)
+        if ok and os.path.getsize(out) > 0:
+            return out
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+        return path
+    except Exception as e:
+        print(f"[ankisstant] image normalize failed for {path}: {e}")
+        return path
+
+
 def _import_image_to_media(path: str) -> str | None:
     """Copy an image into Anki's media folder; return the stored filename
-    (which may differ from the original basename if there's a collision)."""
+    (which may differ from the original basename if there's a collision).
+    Oversized images are downscaled first to keep the editor responsive."""
     try:
-        return mw.col.media.add_file(path)
+        return mw.col.media.add_file(_normalize_image_file(path))
     except Exception as e:
         print(f"[ankisstant] media.add_file failed for {path}: {e}")
         return None
@@ -1112,6 +1345,29 @@ class CreatorPanel(QWidget):
         )
         self.cb_autotag.toggled.connect(self._on_autotag_toggled)
         tags_row.addWidget(self.cb_autotag)
+        # Grounding checkbox — reflects the global + per-notetype resolution; only
+        # meaningful in topic mode (disabled in source mode, where the pasted
+        # material is the source). State is (re)set by _sync_mode / _sync_grounding.
+        self.cb_ground = QCheckBox("📚 Ground")
+        self.cb_ground.setToolTip(
+            "Inject the Australian/WA clinical-guideline citation allow-list so "
+            "topic-based cards cite real URLs instead of invented ones.\n"
+            "Topic mode only — in source mode your pasted material is the source.\n"
+            "Default follows Settings → Create and the notetype's Grounding override."
+        )
+        tags_row.addWidget(self.cb_ground)
+        # Auto-image — when on, generation asks the model to flag visual cards
+        # (image_query) and the review screen auto-fetches candidate thumbnails
+        # for exactly those. Default follows Settings → Create.
+        self.cb_autoimg = QCheckBox("🖼️ Auto-image")
+        self.cb_autoimg.setChecked(_auto_image_active(self.cfg))
+        self.cb_autoimg.setToolTip(
+            "Let the AI flag cards that would benefit from a real medical image "
+            "(derm, radiology, anatomy, histology, ECG…). The review screen then "
+            "suggests images for just those cards — pick one to attach.\n"
+            "Default follows Settings → Create → Images."
+        )
+        tags_row.addWidget(self.cb_autoimg)
         f.addRow("Tags (comma-sep):", tags_row)
         audit_tag = self.cfg.get("audit_tag", "")
         if audit_tag:
@@ -1155,7 +1411,23 @@ class CreatorPanel(QWidget):
         self.extra_img_clear_btn.setAutoDefault(False)
         self.extra_img_clear_btn.clicked.connect(self._on_clear_extra_images)
         self.extra_img_clear_btn.setVisible(False)
+        self.extra_img_find_btn = QPushButton("🔍 Find image online…")
+        self.extra_img_find_btn.setAutoDefault(False)
+        self.extra_img_find_btn.setToolTip(
+            "Search Wikipedia and NLM Open-i for a medical image and add it to the "
+            "Extra field of every card in this batch."
+        )
+        self.extra_img_find_btn.clicked.connect(self._on_find_image_online)
+        self.extra_img_browse_btn = QPushButton("🌐 Browse…")
+        self.extra_img_browse_btn.setAutoDefault(False)
+        self.extra_img_browse_btn.setToolTip(
+            "Open an image search inside Anki; right-click any image → Attach to "
+            "add it to the Extra field of every card in this batch."
+        )
+        self.extra_img_browse_btn.clicked.connect(self._on_browse_image_online)
         img_row.addWidget(self.extra_img_btn)
+        img_row.addWidget(self.extra_img_find_btn)
+        img_row.addWidget(self.extra_img_browse_btn)
         img_row.addWidget(self.extra_img_clear_btn)
         img_row.addStretch(1)
         f.addRow("Extra images:", img_row)
@@ -1258,6 +1530,28 @@ class CreatorPanel(QWidget):
     def _sync_mode(self):
         self.source_box.setVisible(self.rb_source.isChecked())
         self.topic_box.setVisible(self.rb_topic.isChecked())
+        self._sync_grounding()
+
+    def _sync_grounding(self) -> None:
+        """Reflect the grounding resolution on the checkbox: in topic mode,
+        enabled and checked to the resolved default (global + per-notetype
+        override); in source mode, disabled + unchecked (the pasted material is
+        the source). Fail-open — never block the panel."""
+        try:
+            cb = getattr(self, "cb_ground", None)
+            if cb is None:
+                return
+            if not self.rb_topic.isChecked():
+                cb.setChecked(False)
+                cb.setEnabled(False)
+                return
+            cb.setEnabled(True)
+            name = self._current_notetype_name()
+            profile = (_resolved_profile(self.cfg, name)
+                       if name and not name.startswith("(") else None)
+            cb.setChecked(_grounding_active(self.cfg, profile, "topic"))
+        except Exception as e:
+            print(f"[ankisstant] grounding sync failed: {e}")
 
     def _on_autotag_toggled(self, checked: bool) -> None:
         self.cfg["auto_tag"] = bool(checked)
@@ -1283,6 +1577,10 @@ class CreatorPanel(QWidget):
                                       else None)
         except Exception as e:
             print(f"[ankisstant] autotag state refresh failed: {e}")
+        try:
+            self._sync_grounding()
+        except Exception as e:
+            print(f"[ankisstant] grounding state refresh failed: {e}")
 
     # ── notetype dropdown ────────────────────────────────────────────────────
 
@@ -1332,6 +1630,7 @@ class CreatorPanel(QWidget):
             return
         self.cfg["selected_notetype"] = name
         save_tool_config("card_creator", self.cfg)
+        self._sync_grounding()
 
     def _on_open_notetype_settings(self) -> None:
         try:
@@ -1365,6 +1664,55 @@ class CreatorPanel(QWidget):
             added += 1
         if added:
             self._refresh_extra_image_list()
+
+    def _on_find_image_online(self):
+        # Seed the search with the topic (topic mode) or the focus text.
+        seed = ""
+        try:
+            if self.rb_topic.isChecked():
+                seed = self.topic.text().strip()
+            if not seed:
+                seed = self.focus.text().strip()
+        except Exception:
+            seed = ""
+        try:
+            from . import images
+            paths = images.pick_images(self, seed)
+        except Exception as e:
+            showWarning(f"Image search failed: {e}")
+            return
+        added = 0
+        for p in paths:
+            if p and p not in self._extra_image_paths:
+                self._extra_image_paths.append(p)
+                added += 1
+        if added:
+            self._refresh_extra_image_list()
+            tooltip(f"Added {added} image{'s' if added != 1 else ''} to Extra.")
+
+    def _on_browse_image_online(self):
+        seed = ""
+        try:
+            if self.rb_topic.isChecked():
+                seed = self.topic.text().strip()
+            if not seed:
+                seed = self.focus.text().strip()
+        except Exception:
+            seed = ""
+        try:
+            from . import images
+            paths = images.browse_for_images(self, seed)
+        except Exception as e:
+            showWarning(f"Image browse failed: {e}")
+            return
+        added = 0
+        for p in paths:
+            if p and p not in self._extra_image_paths:
+                self._extra_image_paths.append(p)
+                added += 1
+        if added:
+            self._refresh_extra_image_list()
+            tooltip(f"Added {added} image{'s' if added != 1 else ''} to Extra.")
 
     def _on_clear_extra_images(self):
         self._extra_image_paths.clear()
@@ -1786,6 +2134,10 @@ class CreatorPanel(QWidget):
     def _on_generate(self):
         if not anki_utils.require_col():
             return
+        # Warm the existing-tag vocabulary on the UI thread so the (possibly
+        # background) generation + auto-tag classify reuse the user's own tag
+        # branches instead of inventing synonyms.
+        autotag.refresh_vocab_cache()
         mode = "source" if self.rb_source.isChecked() else "topic"
         n = self.n_cards.value()
         deck_name = self.deck.currentText().strip()
@@ -1808,6 +2160,12 @@ class CreatorPanel(QWidget):
             )
             return
         profile = _resolved_profile(self.cfg, notetype_name)
+
+        # Card format drives both the request wording and the base system prompt:
+        # cloze → CARD_GEN_SYSTEM; Q&A (e.g. the bundled Malleus Q&A notetype) →
+        # QA_GEN_SYSTEM (front=question, extra=answer, no cloze).
+        is_qa = str(profile.get("card_format", "cloze")).lower() == "qa"
+        card_word = "question/answer" if is_qa else "high-yield cloze"
 
         attachments_for_api: list[str] = []  # PDFs go through Claude (CLI Read or API doc)
         attachment_labels: list[str] = []    # for the source label
@@ -1884,7 +2242,8 @@ class CreatorPanel(QWidget):
             else:
                 source_label = "(pasted text)"
 
-            parts = [f"Generate {n} high-yield cloze cards from the SOURCE below."]
+            parts = [f"Generate {n} {card_word} cards from the SOURCE below."]
+            parts.append(_breadth_directive(n, "source"))
             if focus:
                 parts.append(_focus_directive(focus))
             if attachments_for_api:
@@ -1902,7 +2261,9 @@ class CreatorPanel(QWidget):
                 return
             source_label = None
             user_msg = (
-                f"Generate {n} high-yield cloze cards on the TOPIC: {topic_label}\n"
+                f"Generate {n} {card_word} cards on the TOPIC: {topic_label}\n"
+                + _topic_directive(topic_label, n) + "\n"
+                + _breadth_directive(n, "topic") + "\n"
                 + (_focus_directive(focus) + "\n" if focus else "")
             )
 
@@ -1912,7 +2273,42 @@ class CreatorPanel(QWidget):
             else "Asking AI…"
         )
         skill_invocation, skill_id = _resolve_skill(profile)
-        system_prompt = _augment_system(CARD_GEN_SYSTEM, profile)
+        base_system = QA_GEN_SYSTEM if is_qa else CARD_GEN_SYSTEM
+        system_prompt = _augment_system(base_system, profile)
+        # Keep generation in sync with the quality pass's atomicity sensitivity
+        # (cloze only): tell the generator how many coupled clozes are acceptable
+        # so it isn't penalised by the scorer for cards it was told to write.
+        if not is_qa:
+            system_prompt = system_prompt + _gen_atomicity_note(_atomicity_max(self.cfg))
+
+        # Source grounding (topic mode only): append the Australian/WA guideline
+        # citation allow-list so the model cites real URLs. Gated by the per-batch
+        # checkbox (which itself reflects the global + per-notetype resolution).
+        # Fail-open — a grounding failure must never block card creation.
+        try:
+            want_ground = (
+                _grounding_active(self.cfg, profile, mode)
+                and getattr(self, "cb_ground", None) is not None
+                and self.cb_ground.isChecked()
+            )
+            if want_ground and topic_label:
+                block = grounding.build_guidelines_block(
+                    topic_label, tags_raw,
+                    fetch_content=_grounding_fetch_live(self.cfg),
+                )
+                if block:
+                    system_prompt = system_prompt + "\n\n" + block
+        except Exception as e:
+            log.error(f"grounding injection skipped: {e}")
+
+        # Auto-image: when the per-batch toggle is on, ask the model to flag
+        # visual cards with an `image_query`. The review screen auto-fetches
+        # candidate thumbnails for exactly those cards. Fail-open.
+        try:
+            if getattr(self, "cb_autoimg", None) is not None and self.cb_autoimg.isChecked():
+                system_prompt = system_prompt + IMAGE_QUERY_INSTRUCTION
+        except Exception as e:
+            log.error(f"image-query instruction skipped: {e}")
 
         # The MQ knowledge-gap explanation is normally a separate AI call, but
         # with no skill in play we fold it into the SAME request (one object
@@ -1968,7 +2364,7 @@ class CreatorPanel(QWidget):
             plan, req_fields = engine.plan_for(
                 type_meta, "create", want_cards=True, want_terms=False,
                 want_tag=merge_tag, want_grade=merge_grade, exclude=exclude)
-            grade_instr = qp.merged_grade_instructions() if merge_grade else ""
+            grade_instr = qp.merged_grade_instructions(_atomicity_max(self.cfg)) if merge_grade else ""
             obj = engine.build_object_instructions(plan, req_fields, grade_instructions=grade_instr)
             if obj:
                 system_prompt += obj
@@ -2216,7 +2612,9 @@ class CreatorPanel(QWidget):
         )
 
     def _grader_system(self, use_skill: bool) -> str:
-        return qp.SKILL_BATCH_SYSTEM if use_skill else qp.RUBRIC_BATCH_SYSTEM
+        max_clozes = _atomicity_max(self.cfg)
+        return (qp.skill_batch_system(max_clozes) if use_skill
+                else qp.rubric_batch_system(max_clozes))
 
     def _grade_one_sync(self, card: dict, profile: dict | None) -> "qp.Verdict":
         """Grade a single card synchronously (used by the auto-regen loop, which
@@ -2230,7 +2628,7 @@ class CreatorPanel(QWidget):
             skill_id=skill_id, skill_invocation=skill_inv, show_errors=False,
         )
         verdicts = qp.parse_batch_verdicts(raw, [card]) if raw is not None else None
-        return qp.apply_prefilters_then(verdicts, [card])[0]
+        return qp.apply_prefilters_then(verdicts, [card], _atomicity_max(self.cfg))[0]
 
     def _auto_regenerate_failures(self, cards: list, profile: dict | None,
                                   qpc: dict) -> None:
@@ -2302,7 +2700,7 @@ class CreatorPanel(QWidget):
         # we still surface free pre-filter findings, but don't paint every card
         # PASS — un-flagged cards simply get no chip.
         try:
-            verdicts = qp.apply_prefilters_then(llm_verdicts, cards)
+            verdicts = qp.apply_prefilters_then(llm_verdicts, cards, _atomicity_max(self.cfg))
         except Exception as e:
             print(f"[ankisstant] quality pass merge skipped: {e}")
             return
@@ -2617,9 +3015,32 @@ class _CardRow(QFrame):
             "Panel-level images are still applied to every card."
         )
         self.img_btn.clicked.connect(self._on_attach_image)
-        for b in (self.img_btn, self.reject_btn, self.split_btn, self.obo_btn):
+        self.img_find_btn = QPushButton("🔍")
+        self.img_find_btn.setToolTip(
+            "Search medical image sources and attach a result to JUST this card."
+        )
+        self.img_find_btn.clicked.connect(self._on_find_image)
+        self.img_browse_btn = QPushButton("🌐")
+        self.img_browse_btn.setToolTip(
+            "Browse for an image inside Anki; right-click any image → Attach to add "
+            "it to JUST this card."
+        )
+        self.img_browse_btn.clicked.connect(self._on_browse_image)
+        for b in (self.img_btn, self.img_find_btn, self.img_browse_btn,
+                  self.reject_btn, self.split_btn, self.obo_btn):
             header.addWidget(b)
         v.addLayout(header)
+
+        # Auto-image suggestion strip — populated asynchronously when the model
+        # flagged this card with an `image_query`. Hidden until candidates load.
+        self.img_strip = QWidget()
+        self.img_strip_layout = QHBoxLayout(self.img_strip)
+        self.img_strip_layout.setContentsMargins(0, 0, 0, 0)
+        self.img_strip_layout.setSpacing(4)
+        self.img_strip.setVisible(False)
+        v.addWidget(self.img_strip)
+        self._auto_thumbs_started = False
+        self._candidate_buttons: list = []
 
         if dup_msg:
             dup = QLabel(f"⚠ {dup_msg}")
@@ -2666,6 +3087,123 @@ class _CardRow(QFrame):
                 and vd.reason and not self.hint_input.text()):
             self.hint_input.setText(vd.reason)
 
+        self._refresh_header()
+        self._maybe_start_auto_image()
+
+    # ── auto-image suggestions ────────────────────────────────────────────────
+
+    def _maybe_start_auto_image(self):
+        """If the model flagged this card with an `image_query`, fetch candidate
+        thumbnails in the background and show them as a clickable strip."""
+        if self._auto_thumbs_started:
+            return
+        query = str(self.card.get("image_query") or "").strip()
+        if not query:
+            return
+        self._auto_thumbs_started = True
+        from . import images
+        try:
+            cfg = tool_config("card_creator")
+            limit = int((cfg.get("images") or {}).get("max_per_card", 4))
+        except Exception:
+            cfg, limit = None, 4
+        lbl = QLabel("🖼 finding images…")
+        lbl.setStyleSheet("color: gray; font-size: 11px;")
+        self.img_strip_layout.addWidget(lbl)
+        self._strip_status = lbl
+        self.img_strip.setVisible(True)
+
+        def _run():
+            try:
+                res = images.search_images(query, cfg=cfg, limit_per_source=2)
+            except Exception:
+                res = []
+            res = res[:max(limit, 1)]
+            mw.taskman.run_on_main(lambda: self._on_candidates(res))
+
+        # Throttled shared pool — concurrent card rows won't all fire at once.
+        images.submit(_run)
+
+    def _on_candidates(self, res: list):
+        try:
+            self._strip_status.setParent(None)
+        except Exception:
+            pass
+        if not res:
+            self.img_strip.setVisible(False)
+            return
+        cap = QLabel("🖼 Suggested — click a preview to attach it to this card:")
+        cap.setStyleSheet("color: gray; font-size: 11px;")
+        self.img_strip_layout.addWidget(cap)
+        from . import images
+        for r in res:
+            btn = QPushButton(f"{r.get('source', '?')}\n…")
+            btn.setCheckable(True)
+            btn.setMinimumSize(QSize(104, 104))
+            btn.setIconSize(QSize(96, 96))
+            btn.setToolTip((r.get("title", "") or "")
+                           + "\nClick to attach this image to the card.")
+            btn.clicked.connect(lambda _c=False, rr=r, bb=btn: self._attach_candidate(rr, bb))
+            self.img_strip_layout.addWidget(btn)
+            self._candidate_buttons.append((r, btn))
+        self.img_strip_layout.addStretch(1)
+
+        def _thumbs():
+            for r, btn in list(self._candidate_buttons):
+                data = None
+                # Try the thumbnail; fall back to the full-size URL if the
+                # thumb host rejects us, so a preview still shows.
+                for u in (r.get("thumb_url"), r.get("url")):
+                    if not u:
+                        continue
+                    try:
+                        data = images._get(u, timeout=8)
+                    except Exception:
+                        data = None
+                    if data:
+                        break
+                mw.taskman.run_on_main(
+                    lambda d=data, b=btn, rr=r: self._set_candidate_thumb(b, d, rr))
+        images.submit(_thumbs)
+
+    def _set_candidate_thumb(self, btn, data, r=None):
+        try:
+            if data:
+                pix = QPixmap()
+                if pix.loadFromData(data):
+                    btn.setIcon(QIcon(pix))
+                    btn.setText("")
+                    return
+        except Exception:
+            pass
+        # No preview available (couldn't render) — keep it attachable with a
+        # clear label so the suggestion is never a blank button.
+        src = (r or {}).get("source", "image")
+        btn.setText(f"📎 {src}\n(no preview)")
+
+    def _attach_candidate(self, r: dict, btn):
+        """Download the chosen candidate and attach it to this card."""
+        from . import images
+        btn.setEnabled(False)
+        url = r.get("url", "")
+
+        def _run():
+            path = images.download_to_temp(url)
+            mw.taskman.run_on_main(lambda: self._on_candidate_attached(path, btn))
+        images.submit(_run)
+
+    def _on_candidate_attached(self, path, btn):
+        btn.setEnabled(True)
+        if not path:
+            tooltip("Couldn't download that image.")
+            btn.setChecked(False)
+            return
+        imgs = list(self.card.get("_image_paths") or [])
+        if path not in imgs:
+            imgs.append(path)
+        self.card["_image_paths"] = imgs
+        btn.setChecked(True)
+        btn.setToolTip("Attached ✓")
         self._refresh_header()
 
     def _toggle_extra(self):
@@ -2740,6 +3278,41 @@ class _CardRow(QFrame):
                 imgs.append(p)
         self.card["_image_paths"] = imgs
         self._refresh_header()
+
+    def _image_seed(self) -> str:
+        seed = str(self.card.get("image_query") or "").strip()
+        if seed:
+            return seed[:80]
+        seed = re.sub(r"<[^>]+>|\{\{[^}]+\}\}", " ", self.card.get("front", "") or "")
+        return re.sub(r"\s+", " ", seed).strip()[:80]
+
+    def _add_card_images(self, paths: list) -> None:
+        imgs = list(self.card.get("_image_paths") or [])
+        for p in paths:
+            if p and p not in imgs:
+                imgs.append(p)
+        self.card["_image_paths"] = imgs
+        self._refresh_header()
+
+    def _on_find_image(self):
+        try:
+            from . import images
+            paths = images.pick_images(self, self._image_seed())
+        except Exception as e:
+            showWarning(f"Image search failed: {e}")
+            return
+        if paths:
+            self._add_card_images(paths)
+
+    def _on_browse_image(self):
+        try:
+            from . import images
+            paths = images.browse_for_images(self, self._image_seed())
+        except Exception as e:
+            showWarning(f"Image browse failed: {e}")
+            return
+        if paths:
+            self._add_card_images(paths)
 
 
 class ReviewDialog(QDialog):

@@ -179,12 +179,10 @@ def build_object_instructions(plan: RequestPlan, fields: list[dict],
     out = ["\n\nReturn your ENTIRE answer as a single JSON OBJECT (not a bare array) "
            "with these keys:", "  {" + ", ".join(keys) + "}"]
     if plan.want_tag:
-        out.append(
-            "Tag rules: system = top-level body system/domain (Cardio, Neuro, Endo, "
-            "GI, Resp, Renal, Heme, MSK, Derm, Repro, Psych, ID, Onc, Pharm, Stats, "
-            "Genetics, Biochem, Immuno; single best fit). subsystem = more specific "
-            "category. topic = most specific entity/drug/sign. PascalCase or "
-            "snake_case; no spaces, '::' or slashes; '' for any unclear level.")
+        # Shared with autotag.classify() so the folded and dedicated tag prompts
+        # stay in lockstep — and so both show the user's existing tag branches.
+        from ..autotag import tag_rules_text
+        out.append("Tag rules: " + tag_rules_text())
     for k in (plan.note_fields + plan.card_fields):
         prompt = (spec_by_key.get(k) or {}).get("ai_prompt", "")
         if prompt:

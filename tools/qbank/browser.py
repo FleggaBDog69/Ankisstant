@@ -383,7 +383,48 @@ class BrowserWindow(QDialog):
         event.accept()
 
 
+def active_platform() -> tuple[str, str]:
+    """(platform_key, platform_name) of the QBank browser the user is looking at,
+    so a global capture trigger doesn't have to be told which QBank is open.
+    Prefers the active/focused window, then the single open one; ('', '') if none."""
+    wins = [w for w in _windows.values() if _win_visible(w)]
+    if not wins:
+        return "", ""
+    if len(wins) > 1:
+        try:
+            active = mw.app.activeWindow()
+        except Exception:
+            active = None
+        for w in wins:
+            try:
+                if w is active or w.isActiveWindow():
+                    return w._platform_key, w._platform_name
+            except Exception:
+                pass
+    w = wins[0]
+    return w._platform_key, w._platform_name
+
+
+def _win_visible(w) -> bool:
+    try:
+        return w.isVisible()
+    except Exception:
+        return False
+
+
 def open_platform(platform_key: str, platform_name: str, url: str) -> None:
+    # Remember the QBank the user last opened so a capture triggered when no
+    # embedded window is live (e.g. they're reviewing in their own browser) can
+    # still fill in the source instead of leaving it blank — see open_capture.
+    try:
+        cfg = tool_config("qbank")
+        if cfg.get("last_platform_key") != platform_key:
+            cfg["last_platform_key"] = platform_key
+            cfg["last_platform_name"] = platform_name
+            save_tool_config("qbank", cfg)
+    except Exception as e:
+        print(f"[ankisstant] persist last_platform failed: {e}")
+
     win = _windows.get(platform_key)
     if win is not None and win.isVisible():
         win.raise_()

@@ -112,14 +112,17 @@ def _is_subsequence(needle: list[str], haystack: list[str]) -> bool:
 
 # ── deterministic pre-filters (no LLM, run on every provider) ───────────────
 
-def prefilter_card(card: dict) -> Verdict | None:
+def prefilter_card(card: dict, max_clozes: int = 1) -> Verdict | None:
     """Cheap deterministic checks. Returns a Verdict when a rule trips, or None
     ('no opinion — let the LLM decide'). Never raises.
 
     - answer-in-prompt  → FAIL / D1: a cloze answer is echoed verbatim in the
       visible surrounding text, so the prompt gives the answer away.
-    - cloze count        → FLAG / D2: two or more DISTINCT cloze groups on one
-      note (repeated same-group clozes are one fact, not flagged).
+    - cloze count        → FLAG / D2: MORE than `max_clozes` DISTINCT cloze
+      groups on one note (repeated same-group clozes are one fact, not flagged).
+      `max_clozes` is the user-configured atomicity sensitivity
+      (quality_pass.atomicity_max_clozes) — e.g. 2 means a clean 2-cloze note
+      passes and only 3+ independent clozes flag.
 
     answer-in-prompt (FAIL) takes precedence over cloze-count (FLAG).
     """
@@ -150,11 +153,18 @@ def prefilter_card(card: dict) -> Verdict | None:
         # cleanest mitigation is the cloze-count FLAG below nudging toward atomic
         # single-cloze notes.
         distinct_groups = {grp for grp, _ in specs}
-        if len(distinct_groups) >= 2:
+        try:
+            limit = int(max_clozes)
+        except (TypeError, ValueError):
+            limit = 1
+        if limit < 1:
+            limit = 1
+        if len(distinct_groups) > limit:
             return Verdict(
                 FLAG, "D2",
-                "multiple independent clozes on one note — consider splitting into "
-                "separate atomic cards (or use hint syntax to make it one retrieval).",
+                f"more than {limit} independent clozes on one note — consider "
+                "splitting into separate atomic cards (or use hint syntax to make "
+                "it one retrieval).",
                 source="prefilter",
             )
     except Exception as e:  # pragma: no cover - defensive
@@ -225,17 +235,43 @@ input card, in the same order:
 Use "fail" for cards that need regeneration and "flag" for inherent-label cards. Keep \
 each reason to one actionable line naming the failure mode."""
 
-RUBRIC_BATCH_SYSTEM = RUBRIC_TEXT + "\n\n" + _BATCH_OUTPUT
+def atomicity_directive(max_clozes: int = 1) -> str:
+    """A one-line D2 sensitivity override appended to every grader prompt so the
+    LLM grader (and the bundled anki-card-scorer skill) match the user's
+    configured atomicity tolerance and the deterministic prefilter. With
+    max_clozes=2 a clean 2-cloze note is acceptable and only 3+ independent
+    facts should drop D2 to 0."""
+    try:
+        n = int(max_clozes)
+    except (TypeError, ValueError):
+        n = 1
+    if n < 1:
+        n = 1
+    return (
+        f"\n\nATOMICITY SENSITIVITY (overrides D2 wording above): the user accepts "
+        f"up to {n} independent cloze deletion(s) on one note. Do NOT score D2 = 0 "
+        f"or flag for atomicity unless the note bundles MORE than {n} genuinely "
+        f"independent facts. A note with {n} or fewer coupled clozes is acceptable."
+    )
 
-# Used when the anki-card-scorer skill is invoked (Anthropic only): the skill
-# carries the rubric server-side / on-demand, so we only need to pin the output
-# shape and save the inline-rubric tokens.
-SKILL_BATCH_SYSTEM = (
-    "Score these Anki cloze cards using the anki-card-scorer rubric.\n\n" + _BATCH_OUTPUT
-)
+
+def rubric_batch_system(max_clozes: int = 1) -> str:
+    """Full inline-rubric grader system prompt (every provider)."""
+    return RUBRIC_TEXT + atomicity_directive(max_clozes) + "\n\n" + _BATCH_OUTPUT
 
 
-def merged_grade_instructions() -> str:
+def skill_batch_system(max_clozes: int = 1) -> str:
+    """Grader system prompt when the anki-card-scorer skill is invoked
+    (Anthropic only): the skill carries the rubric server-side / on-demand, so we
+    only pin the output shape and the atomicity override and save the inline
+    rubric tokens."""
+    return (
+        "Score these Anki cloze cards using the anki-card-scorer rubric."
+        + atomicity_directive(max_clozes) + "\n\n" + _BATCH_OUTPUT
+    )
+
+
+def merged_grade_instructions(max_clozes: int = 1) -> str:
     """Fold-in block appended to the GENERATION system prompt for same_call mode,
     so the model returns its own grades alongside the cards in one round-trip.
     The caller wraps the reply as a JSON object with a "grades" key (passed to
@@ -245,7 +281,7 @@ def merged_grade_instructions() -> str:
         '"grades" array (one object per card, same order) shaped '
         '{"index":0,"verdict":"pass|flag|fail","worst_dim":"D1","reason":"one line",'
         '"percent":85}. Be a strict grader — do not inflate your own cards.\n\n'
-        + RUBRIC_TEXT
+        + RUBRIC_TEXT + atomicity_directive(max_clozes)
     )
 
 
@@ -333,7 +369,8 @@ def parse_same_call_grades(grades, cards: list[dict]) -> list[Verdict]:
 
 # ── merge LLM verdicts with deterministic pre-filters ───────────────────────
 
-def apply_prefilters_then(verdicts: list[Verdict] | None, cards: list[dict]) -> list[Verdict]:
+def apply_prefilters_then(verdicts: list[Verdict] | None, cards: list[dict],
+                          max_clozes: int = 1) -> list[Verdict]:
     """Combine deterministic pre-filters with the LLM verdicts:
       - a prefilter FAIL always wins (deterministic give-away beats a lenient
         self-grade);
@@ -349,7 +386,7 @@ def apply_prefilters_then(verdicts: list[Verdict] | None, cards: list[dict]) -> 
     out: list[Verdict] = []
     for i in range(n):
         llm = base[i] if isinstance(base[i], Verdict) else _passed()
-        pre = prefilter_card(cards[i]) if isinstance(cards[i], dict) else None
+        pre = prefilter_card(cards[i], max_clozes) if isinstance(cards[i], dict) else None
         if pre is None:
             out.append(llm)
         elif pre.verdict == FAIL:

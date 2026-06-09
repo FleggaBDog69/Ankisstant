@@ -40,6 +40,8 @@ zip -rXq "$out" . \
   --exclude '.git/*' \
   --exclude '.gitignore' \
   --exclude 'package.sh' \
-  --exclude '*.ankiaddon'
+  --exclude '*.ankiaddon' \
+  --exclude '_phaseA_backup_*' \
+  --exclude '_phaseA_backup_*/*'
 
 echo "wrote $out"

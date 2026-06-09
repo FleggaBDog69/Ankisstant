@@ -510,6 +510,37 @@ class _NotetypeProfileDialog(QDialog):
         )
         form.addRow("Quality pass:", self._qp_override)
 
+        # ── Source grounding override (per-notetype) ─────────────────────
+        # Grounding injects an Australian/WA guideline citation allow-list in
+        # topic-mode generation. Global default in Settings → Create; this lets
+        # a profile force it on/off. 'Inherit' (default) follows the global.
+        self._grounding_override = QComboBox()
+        self._grounding_override.addItems(["Inherit global", "Force ON", "Force OFF"])
+        self._grounding_override.setCurrentIndex(
+            {"inherit": 0, "on": 1, "off": 2}.get(
+                str(e.get("grounding_override", "inherit")).lower(), 0)
+        )
+        self._grounding_override.setToolTip(
+            "Whether topic-mode cards for this notetype are grounded in the "
+            "Australian/WA guideline allow-list. 'Inherit' follows Settings → Create."
+        )
+        form.addRow("Grounding:", self._grounding_override)
+
+        # ── Card format ──────────────────────────────────────────────────
+        # 'cloze' uses the cloze generator + scorer; 'qa' uses the Q&A prompt
+        # (front=question, extra=answer) — e.g. the bundled Malleus Q&A notetype.
+        self._card_format = QComboBox()
+        self._card_format.addItems(["Cloze deletion", "Q&A (front / back)"])
+        self._card_format.setCurrentIndex(
+            1 if str(e.get("card_format", "cloze")).lower() == "qa" else 0
+        )
+        self._card_format.setToolTip(
+            "Cloze: standard {{c1::…}} cards graded by the cloze rubric.\n"
+            "Q&A: a question on the front and the answer on the back (no cloze). "
+            "Pair with 'Quality pass: Force OFF' — the rubric is cloze-only."
+        )
+        form.addRow("Card format:", self._card_format)
+
         root.addLayout(form)
 
         skill_hint = QLabel(
@@ -611,6 +642,8 @@ class _NotetypeProfileDialog(QDialog):
             "card_creation_skill_invocation": self._skill_invocation.text().strip(),
             "card_creation_skill_id":         self._skill_id.text().strip(),
             "quality_pass_override": ["inherit", "on", "off"][self._qp_override.currentIndex()],
+            "grounding_override": ["inherit", "on", "off"][self._grounding_override.currentIndex()],
+            "card_format": "qa" if self._card_format.currentIndex() == 1 else "cloze",
             "extra_instructions": self._instructions.toPlainText().strip(),
         }
 
@@ -1242,6 +1275,10 @@ class _GlobalTab(QWidget):
         self._tool_creator.setChecked(bool(tools_cfg.get("card_creator", {}).get("enabled", True)))
         tb.addWidget(self._tool_creator)
 
+        self._tool_update = QCheckBox("Update by Tag")
+        self._tool_update.setChecked(bool(tools_cfg.get("update_by_tag", {}).get("enabled", True)))
+        tb.addWidget(self._tool_update)
+
         layout.addRow(tools_box)
 
     def get_tool_states(self) -> dict:
@@ -1255,6 +1292,7 @@ class _GlobalTab(QWidget):
             "knowledge_gaps":     self._tool_kg.isChecked(),
             "gap_analyser":       self._tool_ga.isChecked(),
             "card_creator":       self._tool_creator.isChecked(),
+            "update_by_tag":      self._tool_update.isChecked(),
         }
 
 
@@ -2633,6 +2671,17 @@ class _CreatorTab(QWidget):
             1 if self._qp_seed.get("verdict_action") == "auto_regenerate" else 0)
         qp_form.addRow("On failure:", self._qp_action)
 
+        self._qp_atomicity = QSpinBox()
+        self._qp_atomicity.setRange(1, 6)
+        self._qp_atomicity.setValue(int(self._qp_seed.get("atomicity_max_clozes", 2)))
+        self._qp_atomicity.setToolTip(
+            "How sensitive the atomicity check is. A note with this many "
+            "independent clozes (or fewer) passes; only MORE than this is flagged "
+            "for splitting. 2 means a clean 2-cloze card is fine. Also tells the "
+            "generator how many coupled clozes it may use, so creation and "
+            "scoring agree.")
+        qp_form.addRow("Flag cards with more than N clozes:", self._qp_atomicity)
+
         self._qp_retries = QSpinBox()
         self._qp_retries.setRange(0, 3)
         self._qp_retries.setValue(int(self._qp_seed.get("auto_regen_max_retries", 2)))
@@ -2654,7 +2703,141 @@ class _CreatorTab(QWidget):
 
         root.addWidget(qp_box)
 
+        # ── Source grounding ─────────────────────────────────────────────────
+        self._grounding_seed = dict(cc_cfg.get("grounding", {}) or {})
+        gr_box = QGroupBox("Source grounding")
+        gr_layout = QVBoxLayout(gr_box)
+        gr_hint = QLabel(
+            "Injects a curated Australian/WA clinical-guideline citation "
+            "allow-list into <b>topic-based</b> generation, so cards cite real "
+            "URLs instead of invented ones. In source mode your pasted material "
+            "is the source, so grounding is skipped. Per-notetype overrides live "
+            "in each notetype's editor; a per-batch checkbox sits on the Create panel."
+        )
+        gr_hint.setTextFormat(Qt.TextFormat.RichText)
+        gr_hint.setWordWrap(True)
+        gr_hint.setStyleSheet("color: gray; font-size: 11px;")
+        gr_layout.addWidget(gr_hint)
+
+        self._ground_enabled = QCheckBox("Ground topic-based cards in AU/WA guidelines by default")
+        self._ground_enabled.setChecked(bool(self._grounding_seed.get("enabled", True)))
+        gr_layout.addWidget(self._ground_enabled)
+
+        self._ground_fetch_live = QCheckBox(
+            "Fetch live guideline text into the prompt (slower; blocking network I/O)")
+        self._ground_fetch_live.setChecked(bool(self._grounding_seed.get("fetch_live", False)))
+        self._ground_fetch_live.setToolTip(
+            "When on, the add-on downloads the allow-listed guideline pages and "
+            "feeds their text to the model. Off (default) just supplies the URL "
+            "allow-list, which already stops invented citations and keeps "
+            "generation fast. With a CLI provider the model can fetch URLs itself."
+        )
+        gr_layout.addWidget(self._ground_fetch_live)
+
+        # Region label + editable source registry (transferable across regions).
+        self._grounding_sources = list(self._grounding_seed.get("sources") or [])
+        gr_form = _expand_form(QFormLayout())
+        self._ground_region = QLineEdit(
+            str(self._grounding_seed.get("region_label") or "Australian & WA"))
+        self._ground_region.setToolTip(
+            "Shown in the injected citation-block header (e.g. 'UK & NICE'). "
+            "Purely cosmetic — it labels which guideline set the model is citing.")
+        gr_form.addRow("Region label:", self._ground_region)
+        gr_layout.addLayout(gr_form)
+
+        src_row = QHBoxLayout()
+        self._ground_src_summary = QLabel("")
+        self._ground_src_summary.setStyleSheet("color: gray; font-size: 11px;")
+        src_row.addWidget(self._ground_src_summary, 1)
+        manage_btn = QPushButton("Manage sources…")
+        manage_btn.clicked.connect(self._manage_grounding_sources)
+        src_row.addWidget(manage_btn)
+        gr_layout.addLayout(src_row)
+        self._refresh_ground_src_summary()
+
+        root.addWidget(gr_box)
+
+        # ── Online images ────────────────────────────────────────────────────
+        self._images_seed = dict(cc_cfg.get("images", {}) or {})
+        img_box = QGroupBox("Online images")
+        img_layout = QVBoxLayout(img_box)
+        img_hint = QLabel(
+            "Find images for cards from the review screen. <b>Auto-image</b> lets "
+            "the AI flag cards that need a visual and fetches candidates for just "
+            "those; per-card 🔍 search and 🌐 browse always work. Scraped sources "
+            "(DermNet, Radiopaedia) are best-effort and may break; Bing needs an "
+            "API key."
+        )
+        img_hint.setTextFormat(Qt.TextFormat.RichText)
+        img_hint.setWordWrap(True)
+        img_hint.setStyleSheet("color: gray; font-size: 11px;")
+        img_layout.addWidget(img_hint)
+
+        self._img_auto = QCheckBox("Auto-find images for visual cards by default")
+        self._img_auto.setChecked(bool(self._images_seed.get("auto_find", False)))
+        img_layout.addWidget(self._img_auto)
+
+        srcs = self._images_seed.get("sources") or {}
+        src_box = QHBoxLayout()
+        src_box.addWidget(QLabel("Sources:"))
+        self._img_src_wikipedia = QCheckBox("Wikipedia")
+        self._img_src_wikipedia.setChecked(bool(srcs.get("wikipedia", True)))
+        self._img_src_openi = QCheckBox("Open-i")
+        self._img_src_openi.setChecked(bool(srcs.get("openi", True)))
+        self._img_src_dermnet = QCheckBox("DermNet")
+        self._img_src_dermnet.setChecked(bool(srcs.get("dermnet", True)))
+        self._img_src_radiopaedia = QCheckBox("Radiopaedia")
+        self._img_src_radiopaedia.setChecked(bool(srcs.get("radiopaedia", True)))
+        self._img_src_bing = QCheckBox("Bing")
+        self._img_src_bing.setChecked(bool(srcs.get("bing", False)))
+        for w in (self._img_src_wikipedia, self._img_src_openi, self._img_src_dermnet,
+                  self._img_src_radiopaedia, self._img_src_bing):
+            src_box.addWidget(w)
+        src_box.addStretch(1)
+        img_layout.addLayout(src_box)
+
+        img_form = _expand_form(QFormLayout())
+        self._img_bing_key = QLineEdit(str(self._images_seed.get("bing_api_key") or ""))
+        self._img_bing_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self._img_bing_key.setPlaceholderText("Azure Bing Image Search key (blank → Bing off)")
+        img_form.addRow("Bing API key:", self._img_bing_key)
+
+        self._img_browse_engine = QComboBox()
+        self._img_browse_engine.addItem("DuckDuckGo (embeds cleanly)", "duckduckgo")
+        self._img_browse_engine.addItem("Bing Images", "bing")
+        self._img_browse_engine.addItem("Google Images", "google")
+        self._img_browse_engine.addItem("Custom URL…", "custom")
+        _eng = str(self._images_seed.get("browse_engine") or "duckduckgo")
+        _ei = max(0, self._img_browse_engine.findData(_eng))
+        self._img_browse_engine.setCurrentIndex(_ei)
+        img_form.addRow("Browse engine:", self._img_browse_engine)
+
+        self._img_browse_custom = QLineEdit(str(self._images_seed.get("browse_custom_url") or ""))
+        self._img_browse_custom.setPlaceholderText("https://example.com/search?q={q}  ({q} = query)")
+        img_form.addRow("Custom browse URL:", self._img_browse_custom)
+        img_layout.addLayout(img_form)
+
+        root.addWidget(img_box)
+
         root.addStretch(1)
+
+    # ── grounding source editor ──────────────────────────────────────────────
+
+    def _refresh_ground_src_summary(self):
+        n = len(self._grounding_sources)
+        if n:
+            self._ground_src_summary.setText(f"{n} custom guideline source(s) configured.")
+        else:
+            self._ground_src_summary.setText(
+                "Using the built-in Australian/WA guideline set (default).")
+
+    def _manage_grounding_sources(self):
+        from ..grounding.guidelines import BUILTIN_GUIDELINES
+        current = self._grounding_sources or [dict(g) for g in BUILTIN_GUIDELINES]
+        dlg = _GroundingSourcesDialog(current, self)
+        if dlg.exec():
+            self._grounding_sources = dlg.result_sources()
+            self._refresh_ground_src_summary()
 
     # ── notetype profile list ────────────────────────────────────────────────
 
@@ -2684,13 +2867,17 @@ class _CreatorTab(QWidget):
                 sources_marker = f" · src=<code>{p['sources_field']}</code>"
             qp_ov = str(p.get("quality_pass_override", "inherit")).lower()
             qp_marker = f" · QP:{qp_ov}" if qp_ov in ("on", "off") else ""
+            gr_ov = str(p.get("grounding_override", "inherit")).lower()
+            gr_marker = f" · ground:{gr_ov}" if gr_ov in ("on", "off") else ""
+            fmt = str(p.get("card_format", "cloze")).lower()
+            fmt_marker = " · Q&A" if fmt == "qa" else ""
             lbl = QLabel(
                 f"<b>{p['name']}</b>"
                 f"  <span style='color:gray;font-size:11px'>"
                 f"front=<code>{p.get('front_field', 'Text')}</code> · "
                 f"extra=<code>{p.get('extra_field', 'Extra')}</code> · "
                 f"image=<code>{p.get('image_field', p.get('extra_field', 'Extra'))}</code>"
-                f"{sources_marker}{skill_marker}{qp_marker}{instr_marker}</span>"
+                f"{sources_marker}{skill_marker}{qp_marker}{gr_marker}{fmt_marker}{instr_marker}</span>"
             )
             lbl.setTextFormat(Qt.TextFormat.RichText)
             row.addWidget(lbl, stretch=1)
@@ -2758,6 +2945,7 @@ class _CreatorTab(QWidget):
                 "enabled":              self._qp_enabled.isChecked(),
                 "grading_mode":         self._qp_mode.currentData(),
                 "verdict_action":       self._qp_action.currentData(),
+                "atomicity_max_clozes": int(self._qp_atomicity.value()),
                 "auto_regen_max_retries": int(self._qp_retries.value()),
                 "auto_regen_in_manual": self._qp_regen_manual.isChecked(),
                 "prefer_skill":         self._qp_prefer_skill.isChecked(),
@@ -2765,7 +2953,169 @@ class _CreatorTab(QWidget):
                 # stale per-tool override so it can't shadow the matrix choice.
                 "grader_model_override": False,
             },
+            "grounding": {
+                **self._grounding_seed,
+                "enabled":      self._ground_enabled.isChecked(),
+                "fetch_live":   self._ground_fetch_live.isChecked(),
+                "region_label": self._ground_region.text().strip() or "Australian & WA",
+                "sources":      list(self._grounding_sources),
+            },
+            "images": {
+                **self._images_seed,
+                "auto_find": self._img_auto.isChecked(),
+                "sources": {
+                    "wikipedia":   self._img_src_wikipedia.isChecked(),
+                    "openi":       self._img_src_openi.isChecked(),
+                    "dermnet":     self._img_src_dermnet.isChecked(),
+                    "radiopaedia": self._img_src_radiopaedia.isChecked(),
+                    "bing":        self._img_src_bing.isChecked(),
+                },
+                "bing_api_key":      self._img_bing_key.text().strip(),
+                "browse_engine":     self._img_browse_engine.currentData(),
+                "browse_custom_url": self._img_browse_custom.text().strip(),
+            },
         }
+
+
+class _GroundingSourcesDialog(QDialog):
+    """Editable list of guideline sources (name / URL / fetchable / specialties),
+    so the citation allow-list is transferable across regions. 'Use built-in
+    defaults' clears the custom list (the built-in AU/WA set is then used)."""
+
+    def __init__(self, sources: list, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Manage guideline sources")
+        self.setMinimumSize(640, 480)
+        self._sources = [dict(s) for s in (sources or [])]
+        self._cleared = False
+        self._build()
+
+    def _build(self):
+        root = QVBoxLayout(self)
+        hint = QLabel(
+            "These URLs form the citation allow-list injected into topic-based "
+            "generation — the model may cite only these. <b>Specialties</b> are "
+            "comma-separated keywords matched against the topic/tags ( * = always). "
+            "Edit them for your region; URLs must be real."
+        )
+        hint.setTextFormat(Qt.TextFormat.RichText)
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: gray; font-size: 11px;")
+        root.addWidget(hint)
+
+        body = QHBoxLayout()
+        self._list = QListWidget()
+        self._list.currentRowChanged.connect(self._on_row)
+        body.addWidget(self._list, 1)
+
+        form = QFormLayout()
+        self._f_name = QLineEdit()
+        self._f_url = QLineEdit()
+        self._f_specs = QLineEdit()
+        self._f_specs.setPlaceholderText("cardiology, arrhythmia, *")
+        self._f_fetchable = QCheckBox("Publicly fetchable (no login)")
+        for w in (self._f_name, self._f_url, self._f_specs):
+            w.textChanged.connect(self._on_field_edit)
+        self._f_fetchable.toggled.connect(self._on_field_edit)
+        form.addRow("Name:", self._f_name)
+        form.addRow("URL:", self._f_url)
+        form.addRow("Specialties:", self._f_specs)
+        form.addRow("", self._f_fetchable)
+        fw = QWidget()
+        fw.setLayout(form)
+        body.addWidget(fw, 2)
+        root.addLayout(body, 1)
+
+        btns = QHBoxLayout()
+        add = QPushButton("+ Add")
+        add.clicked.connect(self._add)
+        rem = QPushButton("− Remove")
+        rem.clicked.connect(self._remove)
+        defaults = QPushButton("Use built-in defaults")
+        defaults.setToolTip("Discard the custom list and fall back to the bundled "
+                            "Australian/WA guideline set.")
+        defaults.clicked.connect(self._use_defaults)
+        btns.addWidget(add)
+        btns.addWidget(rem)
+        btns.addStretch(1)
+        btns.addWidget(defaults)
+        root.addLayout(btns)
+
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        root.addWidget(bb)
+
+        self._loading = False
+        self._reload_list()
+        if self._sources:
+            self._list.setCurrentRow(0)
+
+    def _reload_list(self):
+        self._loading = True
+        self._list.clear()
+        for s in self._sources:
+            self._list.addItem(QListWidgetItem(s.get("name") or s.get("url") or "(unnamed)"))
+        self._loading = False
+
+    def _on_row(self, row: int):
+        self._loading = True
+        if 0 <= row < len(self._sources):
+            s = self._sources[row]
+            self._f_name.setText(str(s.get("name") or ""))
+            self._f_url.setText(str(s.get("url") or ""))
+            self._f_specs.setText(", ".join(s.get("specialties") or []))
+            self._f_fetchable.setChecked(bool(s.get("fetchable")))
+        else:
+            self._f_name.clear()
+            self._f_url.clear()
+            self._f_specs.clear()
+            self._f_fetchable.setChecked(False)
+        self._loading = False
+
+    def _on_field_edit(self, *_):
+        if self._loading:
+            return
+        row = self._list.currentRow()
+        if not (0 <= row < len(self._sources)):
+            return
+        specs = [p.strip() for p in self._f_specs.text().split(",") if p.strip()]
+        self._sources[row] = {
+            "name": self._f_name.text().strip(),
+            "url": self._f_url.text().strip(),
+            "fetchable": self._f_fetchable.isChecked(),
+            "specialties": specs,
+        }
+        item = self._list.item(row)
+        if item:
+            item.setText(self._f_name.text().strip() or self._f_url.text().strip() or "(unnamed)")
+
+    def _add(self):
+        self._sources.append({"name": "New source", "url": "", "fetchable": False,
+                              "specialties": []})
+        self._reload_list()
+        self._list.setCurrentRow(len(self._sources) - 1)
+        self._f_name.setFocus()
+        self._f_name.selectAll()
+
+    def _remove(self):
+        row = self._list.currentRow()
+        if 0 <= row < len(self._sources):
+            del self._sources[row]
+            self._reload_list()
+            self._list.setCurrentRow(min(row, len(self._sources) - 1))
+
+    def _use_defaults(self):
+        self._cleared = True
+        self.accept()
+
+    def result_sources(self) -> list:
+        """The edited list, or [] when 'Use built-in defaults' was chosen
+        (empty → guidelines.py falls back to the bundled AU/WA set)."""
+        if self._cleared:
+            return []
+        return [s for s in self._sources if s.get("url") and s.get("name")]
 
 
 # ── about tab ────────────────────────────────────────────────────────────────
@@ -2974,6 +3324,8 @@ class SettingsDialog(QDialog):
         cfg["tools"]["knowledge_gaps"]["enabled"] = states["knowledge_gaps"]
         cfg["tools"]["gap_analyser"]["enabled"]   = states["gap_analyser"]
         cfg["tools"]["card_creator"]["enabled"]   = states["card_creator"]
+        cfg["tools"].setdefault("update_by_tag", {})
+        cfg["tools"]["update_by_tag"]["enabled"]  = states["update_by_tag"]
 
         save_config(cfg)
         # Re-register the capture shortcut so a changed binding works without

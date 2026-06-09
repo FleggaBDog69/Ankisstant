@@ -28,6 +28,7 @@ TOOLS: list[tuple[str, str, str]] = [
     ("qbank",            "AI QBank",        f"{_PKG}.tools.qbank"),
     ("browse",           "AI Browse",       f"{_PKG}.tools.browse"),
     ("card_creator",     "AI Create",       f"{_PKG}.tools.card_creator"),
+    ("update_by_tag",    "Update by Tag",   f"{_PKG}.tools.update_by_tag"),
 ]
 
 

@@ -34,9 +34,10 @@ def _patch_progress_show_win() -> None:
         _progress.ProgressManager._showWin = _safe_show_win
     except Exception as e:
         # Logger isn't importable this early (this runs at module import,
-        # before the package is fully wired). Fall back to print.
-        import sys
-        print(f"[ankisstant] warn: progress patch failed: {e}", file=sys.stderr)
+        # before the package is fully wired). Fall back to a plain print —
+        # NOT stderr, which would trip Anki's global "error occurred" dialog
+        # for a non-fatal, best-effort patch failure.
+        print(f"[ankisstant] warn: progress patch failed: {e}")
 
 
 _patch_progress_show_win()
@@ -52,6 +53,7 @@ from .tools import qbank as _qbank
 from .tools import browse as _browse
 from .tools import knowledge_gaps as _knowledge_gaps
 from .tools import card_creator as _creator
+from .tools import update_by_tag as _update_by_tag
 from .ui.main_window import open_main_window
 from .ui.settings import open_settings
 from .ui.welcome import open_welcome
@@ -62,6 +64,7 @@ TOOLS = [
     ("browse",         _browse),
     ("knowledge_gaps", _knowledge_gaps),
     ("card_creator",   _creator),
+    ("update_by_tag",  _update_by_tag),
 ]
 
 
@@ -118,6 +121,13 @@ def _on_profile_loaded() -> None:
         run_once_if_needed()
     except Exception as e:
         log.error(f"config / migration failed: {e}")
+
+    # Install the bundled Malleus Q&A notetype + its Create profile (idempotent).
+    try:
+        from .tools import notetypes
+        notetypes.ensure_bundled()
+    except Exception as e:
+        log.error(f"bundled notetype install failed: {e}")
 
     for key, module in TOOLS:
         if not tool_enabled(key):
