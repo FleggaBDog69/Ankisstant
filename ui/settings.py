@@ -443,6 +443,13 @@ class _NotetypeProfileDialog(QDialog):
         self._image.setPlaceholderText("Field that receives <img> tags (usually same as Extra)")
         form.addRow("Image field:", self._image)
 
+        self._slide = QLineEdit(e.get("slide_field", ""))
+        self._slide.setMinimumWidth(360)
+        self._slide.setPlaceholderText(
+            "Field for lecture-slide images from a PDF (blank → 'Lecture Notes', else Extra)"
+        )
+        form.addRow("Lecture/slides field:", self._slide)
+
         self._sources = QLineEdit(e.get("sources_field", ""))
         self._sources.setMinimumWidth(360)
         self._sources.setPlaceholderText(
@@ -636,6 +643,7 @@ class _NotetypeProfileDialog(QDialog):
             "front_field":        self._front.text().strip() or "Text",
             "extra_field":        self._extra.text().strip() or "Extra",
             "image_field":        self._image.text().strip() or (self._extra.text().strip() or "Extra"),
+            "slide_field":        self._slide.text().strip(),
             "sources_field":      self._sources.text().strip(),
             "one_by_one_field":   self._obo.text().strip()   or "One by one",
             "card_creation_mode":             self._cc_skill_mode(),

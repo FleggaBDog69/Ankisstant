@@ -127,14 +127,30 @@ CLOZE FORMAT & STYLE
 - Cloze only (no Q&A). 1–3 clozes per card, each a discrete fact. Short answers (1–4 words).
 - LEVEL: Year 3 Australian med student; Australian drugs/guidelines (eTG, RACGP, PBS,
   ANZCOR) where relevant.
-- Ruthless concision — cut filler ("important to know that…", "remember that…"). No
-  bold/headers/bullets inside the cloze front.
+- Ruthless concision — cut filler ("important to know that…", "remember that…").
+- FRONT EMPHASIS — do this on EVERY card, for fast visual recognition. Mark up key words
+  INLINE with HTML so the eye lands on the anchor and the target instantly:
+    • <b>Bold</b> the topic/disease anchor and any augmenting qualifier ('first-line',
+      'most common', 'initial', 'acute', 'irreversible').
+    • <u>Underline</u> the word(s) that signal WHAT the cloze is asking for — the
+      category or role of the hidden answer (e.g. the <u>investigation</u>, the
+      <u>vessel</u>, the <u>protozoa</u>). Underline the cue, never the {{c1::...}} itself.
+    • <i>Italicise</i> genus/species names (e.g. <i>Cryptosporidium</i>).
+  Purposeful and SPARING — a few words per card, never a whole clause, never the obvious
+  filler words. Allowed in the front: inline <b>, <u>, <i> ONLY. NO bullets, lists,
+  headers, or <br> in the front.
 - Cloze the YIELD (the high-value fact), not background framing. If a fact only makes
   sense with framing, put the framing UNCLOZED in the front and cloze the testable part.
 
-EXTRA FIELD: the clinical "so what", mechanism, or exam pearl — never a repeat of the
-front. 2–4 sentences max. Skip if you have nothing meaningful to add. <b>/<u> sparingly;
-no other HTML.
+EXTRA FIELD (the back): concise and SCANNABLE — never a wall of text. The clinical "so
+what", mechanism, or exam pearl; never a repeat of the front. Skip it entirely if you have
+nothing high-yield to add.
+- Keep it to ≤ ~40 words. Prefer 2–4 short points over prose.
+- Lead each point with a BOLDED key term, separated by <br>:
+  "<b>Mechanism:</b> reverses bronchospasm + vasodilation<br><b>Pearl:</b> IV only in arrest".
+- Use <ul><li>…</li></ul> for a genuine list. Allowed HTML: <b>, <u>, <i>, <br>, <ul>,
+  <li> — nothing else (<i> for genus/species only). Cut filler ("important to know
+  that…", "remember that…").
 
 DO NOT include any prose outside the JSON array. No markdown fences. Just the JSON array."""
 
@@ -150,7 +166,12 @@ No cloze deletions. No prose outside the JSON array. No markdown fences.
 
 THE ONE THING THAT MATTERS: a clean question that forces recall.
 - The FRONT is one focused question the student must answer from memory — not a
-  recognition prompt, not a list of sub-parts. One question, one idea.
+  recognition prompt, not a list of sub-parts. One question, one idea. Mark up key words
+  INLINE for fast recognition: <b>bold</b> the topic/disease anchor and augmenting
+  qualifiers ('first-line', 'most common'); <u>underline</u> what the question is
+  specifically asking for (the investigation, the drug class); <i>italicise</i>
+  genus/species. Purposeful and sparing — inline <b>/<u>/<i> only, no bullets/headers in
+  the question.
 - The EXTRA (back) is the full answer: direct, clinically relevant, complete enough
   to stand alone. Use <b>/<u> and <br> sparingly; bullet lists with <br> where it aids
   clarity. Do not restate the question.
@@ -207,9 +228,10 @@ def _augment_system(base: str, profile: dict | None) -> str:
         extra.append("Additional style instructions for this notetype:")
         extra.append(instructions)
     extra.append(
-        "Do NOT change the JSON shape — still return {\"front\": ..., \"extra\": ...} "
-        "(or an array of them, depending on the original instruction). The 'front' key "
-        "always maps to the front field, 'extra' to the extra field."
+        "Keep the core JSON shape — each card is still {\"front\": ..., \"extra\": ...} "
+        "(or an array of them, depending on the original instruction); the 'front' key "
+        "always maps to the front field, 'extra' to the extra field. You MAY add the "
+        "extra per-card keys other instructions ask for (e.g. \"slide\", \"image_query\")."
     )
     return base + "\n" + "\n".join(extra)
 
@@ -479,6 +501,7 @@ def _resolved_profile(cfg: dict, name: str) -> dict:
         "front_field":        cfg.get("front_field", "Text"),
         "extra_field":        cfg.get("extra_field", "Extra"),
         "image_field":        cfg.get("extra_field", "Extra"),
+        "slide_field":        cfg.get("slide_field", ""),
         "one_by_one_field":   cfg.get("one_by_one_field", "One by one"),
         "extra_instructions": "",
     }
@@ -740,6 +763,137 @@ def _sync_slide_images(card: dict, slide_pages: list) -> None:
     card["_slide_paths"] = new_slide
 
 
+# Per-slide generation: one AI call per rendered page, so each card's source
+# slide is known by CONSTRUCTION (we set it ourselves) rather than guessed by
+# the model. This sidesteps the JSON-shape lock that suppressed the old "slide"
+# key, and lets the model focus on a single slide's worth of content at a time.
+_SLIDE_PER_PAGE_USER = (
+    "The attached image is ONE slide from a lecture deck (slide {n} of {total}).\n"
+    "Generate the high-yield {card_word} cards THIS slide warrants — typically 0–4. "
+    "Use ONLY what is on this slide; do not invent content from other slides.\n"
+    "Return an EMPTY array [] for a slide that carries no testable content "
+    "(title, learning-objectives, outline, references, acknowledgements, "
+    "thank-you, or a purely decorative image).\n"
+    "Output ONLY a JSON array of card objects — no prose, no markdown fences."
+)
+
+
+def _coerce_card_list(reply) -> list:
+    """Normalise an AI reply into a list of card dicts. Accepts a bare array, a
+    {"cards": [...]} object, or a single {"front","extra"} object."""
+    if isinstance(reply, list):
+        return [c for c in reply if isinstance(c, dict)]
+    if isinstance(reply, dict):
+        if isinstance(reply.get("cards"), list):
+            return [c for c in reply["cards"] if isinstance(c, dict)]
+        if "front" in reply:
+            return [reply]
+    return []
+
+
+def generate_cards_per_slide(slide_pages: list, *, system: str, card_word: str,
+                             model, skill_id: str = "", skill_invocation: str = "",
+                             cancel_check=None) -> list:
+    """Generate cards one rendered slide at a time. Qt-free, so it runs in the
+    background worker thread. Each call sends a single page image; every returned
+    card is tagged deterministically with its source slide (`slide`, 1-based) and
+    `_slide_indices` so the review screen auto-attaches that slide with no model
+    cooperation. Returns the concatenated card list (slides yielding [] are
+    skipped). A truthy `cancel_check()` stops the loop between slides."""
+    out: list = []
+    total = len(slide_pages)
+    for i, page in enumerate(slide_pages):
+        if cancel_check is not None and cancel_check():
+            break
+        try:
+            reply = core_api.ask_claude_json(
+                prompt=_SLIDE_PER_PAGE_USER.format(n=i + 1, total=total, card_word=card_word),
+                system=system, max_tokens=2048, model=model,
+                skill_id=skill_id, skill_invocation=skill_invocation,
+                attachments=[page], show_errors=False,
+            )
+        except Exception as e:
+            log.error(f"slide {i + 1} generation failed: {e}")
+            continue
+        for card in _coerce_card_list(reply):
+            if "front" not in card:
+                continue
+            card["slide"] = i + 1
+            card["_slide_indices"] = [i]
+            out.append(card)
+    return out
+
+
+# ── text-first slide matching ─────────────────────────────────────────────────
+#
+# The cheap lecture path: generate cards from the deck's extracted TEXT in one
+# call (no vision), then attach each card's source slide by matching the card's
+# words back to each page's text. Deterministic — no AI — so it runs free in the
+# background worker. A card that doesn't confidently match any slide is left
+# imageless (no slide key) rather than mis-attached.
+_SLIDE_MATCH_STOPWORDS = frozenset(
+    "the a an and or of to in is are be with for on as by from that this these "
+    "those it its which who whom whose what when where why how than then thus can "
+    "may will would should could into out over under more most less least also "
+    "such not no any all both each per via due between within without your you".split()
+)
+# Attribution leans on the ABSOLUTE number of distinct content words a card shares
+# with a page (a good cloze card adds its answer/mechanism, which inflates the
+# card's own vocabulary and unfairly deflates a pure fraction), plus a clear
+# margin over the runner-up page so an ambiguous card is left imageless rather
+# than mis-attached. The fraction is only a light floor against long, thin cards.
+_SLIDE_MATCH_MIN_HITS = 3       # ≥ this many distinct shared words with the best page
+_SLIDE_MATCH_MARGIN = 2         # …and beat the 2nd-best page by ≥ this many words
+_SLIDE_MATCH_MIN_SCORE = 0.25   # …and share ≥ this fraction of the card's own words
+
+
+def _significant_words(text: str) -> set:
+    """Lower-cased alphabetic words ≥4 chars that aren't stop-words. Cloze and
+    HTML markup are stripped first so only the card's real content is scored."""
+    text = re.sub(r"\{\{c\d+::(.*?)(?:::.*?)?\}\}", r"\1", str(text), flags=re.S)
+    text = re.sub(r"<[^>]+>", " ", text)
+    words = re.findall(r"[a-z][a-z'\-]{3,}", text.lower())
+    return {w for w in words if w not in _SLIDE_MATCH_STOPWORDS}
+
+
+def match_cards_to_slides(cards: list, page_texts: list) -> None:
+    """Attach each card to the slide it most likely came from by word-overlap
+    between the card and each page's extracted text. Sets `card["slide"]`
+    (1-based) and `card["_slide_indices"]` in place; the review dialog's
+    _sync_slide_images then attaches that page's image with no further work.
+    Cards with no confident match are left imageless. Qt-free — safe in the
+    background worker. Never raises."""
+    try:
+        page_words = [_significant_words(t or "") for t in page_texts]
+    except Exception as e:
+        log.error(f"match_cards_to_slides: page tokenise failed: {e}")
+        return
+    for card in cards:
+        if not isinstance(card, dict) or "front" not in card:
+            continue
+        try:
+            cw = _significant_words(
+                str(card.get("front", "")) + " " + str(card.get("extra", "")))
+            if not cw:
+                continue
+            best_i, best_hits, second_hits = -1, 0, 0
+            for i, pw in enumerate(page_words):
+                hits = len(cw & pw)
+                if hits > best_hits:
+                    best_hits, second_hits, best_i = hits, best_hits, i
+                elif hits > second_hits:
+                    second_hits = hits
+            if (best_i >= 0
+                    and best_hits >= _SLIDE_MATCH_MIN_HITS
+                    and (best_hits - second_hits) >= _SLIDE_MATCH_MARGIN
+                    and best_hits / len(cw) >= _SLIDE_MATCH_MIN_SCORE):
+                card["slide"] = best_i + 1
+                card["_slide_indices"] = [best_i]
+        except Exception as e:
+            log.error(f"match_cards_to_slides: card skipped: {e}")
+            continue
+
+
 def _auto_image_active(cfg: dict) -> bool:
     """Global default for the per-batch auto-image toggle."""
     return bool((cfg.get("images") or {}).get("auto_find", False))
@@ -947,6 +1101,27 @@ def _img_tags_for(paths: list[str]) -> str:
             continue
         bits.append(f'<img src="{html.escape(fname, quote=True)}">')
     return "<br>".join(bits)
+
+
+def _resolve_slide_field(profile: dict, field_names) -> str:
+    """Field that source-slide images go into: the profile's `slide_field` if set
+    and present on the notetype, else AnKing's 'Lecture Notes' field if it exists,
+    else the extra field (so nothing breaks on notetypes without a slides field)."""
+    fields = set(field_names or [])
+    configured = (profile.get("slide_field") or "").strip()
+    if configured and configured in fields:
+        return configured
+    if "Lecture Notes" in fields:
+        return "Lecture Notes"
+    return profile.get("extra_field", "Extra")
+
+
+def _append_field(note, field: str, html_frag: str) -> None:
+    """Append an HTML fragment to a note field (<br>-joined if non-empty)."""
+    if not html_frag or field not in note:
+        return
+    existing = note[field] or ""
+    note[field] = (existing + "<br>" if existing else "") + html_frag
 
 
 def _focus_directive(focus: str) -> str:
@@ -2232,6 +2407,9 @@ class CreatorPanel(QWidget):
         attachment_labels: list[str] = []    # for the source label
         pdf_paths: list[str] = []            # original PDF(s), for slide rasterisation
         self._slide_pages: list[str] = []    # rendered page images of a single slide deck
+        slide_mode = False                   # generate one AI call per rendered slide
+        lecture_match = False                # text-first: match cards back to slides post-gen
+        page_texts: list[str] = []           # per-page extracted text for that matching
 
         if mode == "source":
             url = self.url.text().strip()
@@ -2295,37 +2473,80 @@ class CreatorPanel(QWidget):
                     text_body = (text_body + "\n\n" + "\n".join(pptx_blocks)).strip() \
                         if text_body else "\n".join(pptx_blocks)
 
-            # Resolve the PDF(s): render to page-images and pick what to send the
-            # model based on the provider family. Slide auto-attach + the gallery
-            # need exactly one deck, so they only engage for a single PDF; with
-            # several PDFs we still generate (page-images on vision providers),
-            # just without slide numbering.
+            # Resolve the PDF(s). A single-PDF lecture takes the cheap TEXT-FIRST
+            # path: pull each page's text (free, no vision) and generate from that
+            # in one call. With Auto-image ON we ALSO rasterise — but only to ATTACH
+            # the source slide to each card, matched back by text after generation
+            # (the slide is the card's image, so no web image search there). With
+            # Auto-image OFF we just use the text and skip slides entirely.
+            # Image-only PDFs (no extractable text), multi-PDF, and manual/paste
+            # fall back to the vision paths below.
             family = active_family()
+            auto_image_on = bool(getattr(self, "cb_autoimg", None) is not None
+                                 and self.cb_autoimg.isChecked())
             if pdf_paths:
-                with loading(self.go_btn, "Rendering slides…"):
-                    rendered = {p: pdf_render.render_pdf_to_images(p) for p in pdf_paths}
-                if family == "anthropic":
-                    attachments_for_api.extend(pdf_paths)  # Claude reads the PDF directly
+                single = len(pdf_paths) == 1 and not is_manual_provider()
+                lecture_text = ""
+                if single:
+                    with loading(self.go_btn, "Reading slides…"):
+                        page_texts = pdf_render.extract_pdf_text_per_page(pdf_paths[0])
+                    lecture_text = "\n\n".join(
+                        f"[Slide {i + 1}]\n{t.strip()}"
+                        for i, t in enumerate(page_texts) if (t or "").strip()
+                    ).strip()
+                if single and len(lecture_text) >= 200:
+                    # Enough real text → text-first. Nothing is sent to the model as
+                    # an image; the deck text rides in as the SOURCE below.
+                    text_body = (text_body + "\n\n" + lecture_text).strip() \
+                        if text_body else lecture_text
+                    if auto_image_on:
+                        with loading(self.go_btn, "Rendering slides…"):
+                            self._slide_pages = list(
+                                pdf_render.render_pdf_to_images(pdf_paths[0]))
+                        lecture_match = bool(self._slide_pages)
+                    if not lecture_match:
+                        page_texts = []   # not needed when no slides are attached
                 else:
-                    pages_flat = [pg for p in pdf_paths for pg in rendered.get(p, [])]
-                    if not pages_flat:
-                        showWarning(
-                            "Couldn't render that PDF to images for this AI provider.\n\n"
-                            "Switch to Claude (which reads PDFs directly), or paste the "
-                            "text instead."
-                        )
-                        return
-                    if len(pages_flat) > 25 and not askUser(
-                        f"This deck has {len(pages_flat)} slides. They'll all be sent to "
-                        "your AI as images, which can be slow and use a lot of tokens.\n\n"
-                        "Generate anyway?"
-                    ):
-                        return
-                    attachments_for_api.extend(pages_flat)
-                if len(pdf_paths) == 1:
-                    self._slide_pages = list(rendered.get(pdf_paths[0], []))
+                    # Vision fallback: image-only deck, multi-PDF, or manual.
+                    page_texts = []
+                    with loading(self.go_btn, "Rendering slides…"):
+                        rendered = {p: pdf_render.render_pdf_to_images(p) for p in pdf_paths}
+                    if len(pdf_paths) == 1:
+                        self._slide_pages = list(rendered.get(pdf_paths[0], []))
+                    # Single deck on a real provider → slide-by-slide: one AI call per
+                    # rendered page, so each card's source slide is exact. The per-slide
+                    # loop attaches each page itself, so nothing goes into
+                    # attachments_for_api. Multi-PDF / manual fall to the one-call path.
+                    if self._slide_pages and single:
+                        slide_mode = True
+                        n_pages = len(self._slide_pages)
+                        if n_pages > 25 and not askUser(
+                            f"This deck has {n_pages} slides. Each is read separately, so this "
+                            f"makes {n_pages} AI requests (they run in the background).\n\n"
+                            "Generate anyway?"
+                        ):
+                            return
+                    else:
+                        if family == "anthropic":
+                            attachments_for_api.extend(pdf_paths)  # Claude reads the PDF directly
+                        else:
+                            pages_flat = [pg for p in pdf_paths for pg in rendered.get(p, [])]
+                            if not pages_flat:
+                                showWarning(
+                                    "Couldn't render that PDF to images for this AI provider.\n\n"
+                                    "Switch to Claude (which reads PDFs directly), or paste the "
+                                    "text instead."
+                                )
+                                return
+                            if len(pages_flat) > 25 and not askUser(
+                                f"This deck has {len(pages_flat)} slides. They'll all be sent to "
+                                "your AI as images, which can be slow and use a lot of tokens.\n\n"
+                                "Generate anyway?"
+                            ):
+                                return
+                            attachments_for_api.extend(pages_flat)
 
-            if not text_body and not attachments_for_api:
+            if not text_body and not attachments_for_api and not slide_mode:
                 showWarning("Provide pasted text, a URL, or attach a PDF / PPTX.")
                 return
 
@@ -2402,16 +2623,22 @@ class CreatorPanel(QWidget):
         # visual cards with an `image_query`. The review screen auto-fetches
         # candidate thumbnails for exactly those cards. Fail-open.
         try:
-            if getattr(self, "cb_autoimg", None) is not None and self.cb_autoimg.isChecked():
+            # In lecture-match mode the source slide IS the card's image, so we
+            # don't also ask for a web image query — slide-only, no web search.
+            if (not lecture_match and getattr(self, "cb_autoimg", None) is not None
+                    and self.cb_autoimg.isChecked()):
                 system_prompt = system_prompt + IMAGE_QUERY_INSTRUCTION
         except Exception as e:
             log.error(f"image-query instruction skipped: {e}")
 
-        # Slide deck: ask the model to tag each card with its source slide so the
-        # review screen can auto-attach that slide's image. Only when a single
-        # PDF rendered to pages. Fail-open.
+        # Slide deck (fallback one-call path only): ask the model to tag each card
+        # with its source slide so the review screen can auto-attach that slide's
+        # image. Skipped in slide_mode, where the per-slide loop sets `slide`
+        # deterministically and no model cooperation is needed. Fail-open.
         try:
-            if self._slide_pages:
+            # Lecture-match sets the slide deterministically (by text) after
+            # generation, so the model is not asked to guess a slide number.
+            if self._slide_pages and not slide_mode and not lecture_match:
                 system_prompt = system_prompt + _slide_index_instruction(len(self._slide_pages))
         except Exception as e:
             log.error(f"slide-index instruction skipped: {e}")
@@ -2457,6 +2684,11 @@ class CreatorPanel(QWidget):
             and qpc.get("grading_mode") == "same_call"
             and no_skill
         )
+        # Slide mode generates bare-array cards per page, so nothing can be folded
+        # into a single object reply — tagging and grading happen in the worker
+        # tail (autotag classify + grade_cards_sync) instead.
+        if slide_mode:
+            merge_tag = merge_explanation = merge_grade = False
         # Build the one-call request from the KG type's declarative field specs
         # (tools/kg/engine.py): the AI returns the tag + every AI-source field
         # (e.g. the MQ explanation) + cards in a SINGLE JSON object. Skill flows
@@ -2465,7 +2697,7 @@ class CreatorPanel(QWidget):
         # (a cached explanation) so it isn't re-requested. The plan is stashed for
         # reply routing and (for background jobs) serialised into the record.
         self._gen_plan = None
-        if no_skill:
+        if no_skill and not slide_mode:
             exclude = set() if want_explanation else {"explanation"}
             plan, req_fields = engine.plan_for(
                 type_meta, "create", want_cards=True, want_terms=False,
@@ -2522,7 +2754,9 @@ class CreatorPanel(QWidget):
                 user_msg=user_msg, system_prompt=system_prompt, model=model,
                 skill_id=skill_id, skill_invocation=skill_invocation,
                 attachments=attachments_for_api, slide_pages=self._slide_pages,
-                want_auto=want_auto, tag_material=tag_material)
+                want_auto=want_auto, tag_material=tag_material,
+                slide_mode=slide_mode, card_word=card_word,
+                lecture_match=lecture_match, page_texts=page_texts)
             self.cfg["default_n_cards"] = n
             self.cfg["selected_notetype"] = notetype_name
             save_tool_config("card_creator", self.cfg)
@@ -2532,31 +2766,48 @@ class CreatorPanel(QWidget):
             self._refresh_badge()
             return
 
-        reply = run_claude_json(
-            self.go_btn, loading_label,
-            prompt=user_msg, system=system_prompt, max_tokens=4096, model=model,
-            skill_id=skill_id, skill_invocation=skill_invocation,
-            attachments=attachments_for_api or None,
-        )
-
-        # Route the one-call reply via the engine: an object {tags, <ai fields>,
-        # grades, cards} when a plan was built, else a bare card array (skill
-        # flow). Per-note AI field values (the explanation, plus any custom AI
-        # fields) are persisted to the KG store; the explanation also leads the
-        # Missed Questions field.
-        if self._gen_plan is not None:
-            routed = engine.route(reply, self._gen_plan)
-            cards = routed.cards
-            merged_tag_levels = routed.tag_levels
-            same_call_grades = routed.grades
-            mq_explanation = str(routed.field_values.get("explanation") or "")
-            if gap is not None:
-                _persist_ai_field_values(gap, routed.field_values)
+        if slide_mode:
+            # Background-off, non-manual: read the deck one slide at a time on the
+            # main thread (inside loading). Each card is tagged with its exact
+            # slide; tagging/grading happen later in _finalize_review.
+            with loading(self.go_btn, "Reading slides one at a time…"):
+                cards = generate_cards_per_slide(
+                    self._slide_pages, system=system_prompt, card_word=card_word,
+                    model=model, skill_id=skill_id, skill_invocation=skill_invocation)
+            reply = cards  # a list (possibly empty) — keeps the None-guard below happy
+            merged_tag_levels, same_call_grades, mq_explanation = None, None, ""
         else:
-            cards, merged_tag_levels, same_call_grades, mq_explanation = reply, None, None, ""
+            reply = run_claude_json(
+                self.go_btn, loading_label,
+                prompt=user_msg, system=system_prompt, max_tokens=4096, model=model,
+                skill_id=skill_id, skill_invocation=skill_invocation,
+                attachments=attachments_for_api or None,
+            )
+
+            # Route the one-call reply via the engine: an object {tags, <ai fields>,
+            # grades, cards} when a plan was built, else a bare card array (skill
+            # flow). Per-note AI field values (the explanation, plus any custom AI
+            # fields) are persisted to the KG store; the explanation also leads the
+            # Missed Questions field.
+            if self._gen_plan is not None:
+                routed = engine.route(reply, self._gen_plan)
+                cards = routed.cards
+                merged_tag_levels = routed.tag_levels
+                same_call_grades = routed.grades
+                mq_explanation = str(routed.field_values.get("explanation") or "")
+                if gap is not None:
+                    _persist_ai_field_values(gap, routed.field_values)
+            else:
+                cards, merged_tag_levels, same_call_grades, mq_explanation = reply, None, None, ""
 
         if reply is None:
             return  # cancelled, or a parse failure already surfaced
+
+        # Text-first lecture: attach each card's source slide by matching the card
+        # back to the per-page text (deterministic, no AI). _finalize_review gets
+        # slide_pages below, so _sync_slide_images then pulls in the slide image.
+        if lecture_match and page_texts and resolve_card_validity(cards):
+            match_cards_to_slides(cards, page_texts)
 
         # Skill flows can't fold the explanation in (array output), so fall back
         # to a separate call there. Only the AI Generate flow does this — the
@@ -2960,7 +3211,8 @@ class CreatorPanel(QWidget):
                          want_explanation, merge_tag, merge_explanation, merge_grade,
                          user_msg, system_prompt, model, skill_id, skill_invocation,
                          attachments, slide_pages=None, want_auto=False,
-                         tag_material="") -> dict:
+                         tag_material="", slide_mode=False, card_word="cloze",
+                         lecture_match=False, page_texts=None) -> dict:
         """Snapshot everything a background job needs to generate, grade, and
         later reconstruct its review dialog — independent of live panel state.
         Imports Extra images into media and copies attachments so the record
@@ -2991,6 +3243,14 @@ class CreatorPanel(QWidget):
             "panel_image_filenames": panel_fns,
             "attachment_paths": attach_copied,
             "slide_pages": slide_copied,
+            # Slide mode: the worker generates one AI call per page (slide_pages)
+            # instead of a single call over `attachments`/`user_msg`.
+            "slide_mode": bool(slide_mode), "card_word": card_word or "cloze",
+            # Lecture-match (text-first): the worker generates from `user_msg`
+            # text, then matches each card back to a slide using `page_texts` and
+            # attaches that slide's image from `slide_pages`.
+            "lecture_match": bool(lecture_match),
+            "page_texts": list(page_texts or []),
             "user_msg": user_msg, "system_prompt": system_prompt, "model": model,
             "skill_id": skill_id, "skill_invocation": skill_invocation, "max_tokens": 4096,
             "merge_tag": bool(merge_tag), "merge_explanation": bool(merge_explanation),
@@ -3184,6 +3444,17 @@ class _CardRow(QFrame):
         self.front_lbl.setWordWrap(True)
         v.addWidget(self.front_lbl)
 
+        # Inline thumbnail of the source slide attached to this card (slide-deck
+        # PDFs). Click to open the gallery and swap slides. Hidden when none.
+        self.slide_thumb = QPushButton()
+        self.slide_thumb.setFlat(True)
+        self.slide_thumb.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.slide_thumb.setIconSize(QSize(200, 150))
+        self.slide_thumb.setToolTip("Source slide for this card — click to change.")
+        self.slide_thumb.clicked.connect(self._on_pick_slides)
+        self.slide_thumb.setVisible(False)
+        v.addWidget(self.slide_thumb, alignment=Qt.AlignmentFlag.AlignLeft)
+
         self.extra_toggle = QPushButton("Show extra ▾")
         self.extra_toggle.setCheckable(True)
         self.extra_toggle.setFlat(True)
@@ -3356,6 +3627,7 @@ class _CardRow(QFrame):
         if isinstance(vd, qp.Verdict):
             suffix += f"  · {vd.chip()}"
             self.setToolTip(vd.reason or "")
+        self._refresh_slide_thumb()
         n_slides = len(self.card.get("_slide_paths") or [])
         n_imgs = len(self.card.get("_image_paths") or [])
         if n_slides:
@@ -3448,6 +3720,27 @@ class _CardRow(QFrame):
             return
         if paths:
             self._add_card_images(paths)
+
+    def _refresh_slide_thumb(self):
+        """Show the first attached slide image inline (loaded from the local PNG),
+        or hide the thumbnail when this card has no slide attached."""
+        thumb = getattr(self, "slide_thumb", None)
+        if thumb is None:
+            return
+        paths = self.card.get("_slide_paths") or []
+        if not paths:
+            thumb.setIcon(QIcon())
+            thumb.setVisible(False)
+            return
+        try:
+            pix = QPixmap(paths[0])
+            if not pix.isNull():
+                thumb.setIcon(QIcon(pix))
+                thumb.setVisible(True)
+                return
+        except Exception:
+            pass
+        thumb.setVisible(False)
 
     def _on_pick_slides(self):
         """Open the slide gallery and update which slide image(s) attach here."""
@@ -3822,16 +4115,24 @@ class ReviewDialog(QDialog):
         return self.profile.get("extra_field", "Extra")
 
     def _images_for(self, card) -> str:
-        """Build an <img>-tag fragment combining panel-level images and any
-        per-card images attached during review. Files are copied into Anki
-        media here (NOT at generation time) so we only import what actually
-        gets created."""
+        """Build an <img>-tag fragment for the image field: panel-level images
+        plus per-card images attached during review, EXCLUDING slide images
+        (those route to the slide/Lecture-Notes field via `_slide_imgs_for`).
+        Files are copied into Anki media here (NOT at generation time) so we only
+        import what actually gets created."""
+        slide_paths = set(card.get("_slide_paths") or [])
         paths: list[str] = []
         paths.extend(self.panel_image_paths)
-        paths.extend(card.get("_image_paths") or [])
+        paths.extend(p for p in (card.get("_image_paths") or []) if p not in slide_paths)
         if not paths:
             return ""
         return _img_tags_for(paths)
+
+    def _slide_imgs_for(self, card) -> str:
+        """`<img>` fragment for the card's source-slide image(s), destined for the
+        slide/Lecture-Notes field. Empty when the card has no attached slide."""
+        paths = card.get("_slide_paths") or []
+        return _img_tags_for(list(paths)) if paths else ""
 
     def _get_notetype(self):
         name = (self.profile.get("name") or "").strip()
@@ -3871,6 +4172,7 @@ class ReviewDialog(QDialog):
         front_field   = self.profile.get("front_field", "Text")
         extra_field   = self.profile.get("extra_field", "Extra")
         image_field   = self.profile.get("image_field", extra_field)
+        slide_field   = _resolve_slide_field(self.profile, note.keys())
         sources_field = (self.profile.get("sources_field") or "").strip()
         obo_field     = self.profile.get("one_by_one_field", "One by one")
         try:
@@ -3879,15 +4181,17 @@ class ReviewDialog(QDialog):
             note.fields[0] = card.get("front", "")
         if extra_field in note:
             note[extra_field] = self._enrich_extra(card.get("extra", ""))
-        # Images go into image_field (often == extra_field, in which case we
-        # append; if it's a separate field, that field is set directly).
+        # Non-slide images go into image_field (often == extra_field, in which
+        # case we append; if it's a separate field, that field is set directly).
         img_html = self._images_for(card)
         if img_html and image_field in note:
             if image_field == extra_field:
-                existing = note[image_field] or ""
-                note[image_field] = (existing + "<br>" if existing else "") + img_html
+                _append_field(note, image_field, img_html)
             else:
                 note[image_field] = img_html
+        # Source-slide image(s) go into the slide field (AnKing 'Lecture Notes' by
+        # default), separate from the medical/searched images above.
+        _append_field(note, slide_field, self._slide_imgs_for(card))
         source_html = (card.get("source") or "").strip()
         if source_html and sources_field and sources_field in note:
             if sources_field == extra_field:
@@ -3974,10 +4278,12 @@ class ReviewDialog(QDialog):
             "front_field": self.profile.get("front_field", "Text"),
             "extra_field": self.profile.get("extra_field", "Extra"),
             "image_field":   self.profile.get("image_field", self.profile.get("extra_field", "Extra")),
+            "slide_field":   _resolve_slide_field(self.profile, [f["name"] for f in nt.get("flds", [])]),
             "sources_field": (self.profile.get("sources_field") or "").strip(),
             "obo_field":     self.profile.get("one_by_one_field", "One by one"),
             "enricher":      self._enrich_extra,
             "images_for":    self._images_for,
+            "slide_imgs_for": self._slide_imgs_for,
             # `kg_content_html` includes the captured MQ stem + notes + images
             # for MQ-type KGs (just images otherwise). Replaces the older
             # `kg_image_html` ctx key, which only carried screenshots.
@@ -4008,6 +4314,7 @@ def _fill_addcards(ac, card: dict, ctx: dict) -> None:
     front_field = ctx["front_field"]
     extra_field = ctx["extra_field"]
     image_field = ctx.get("image_field", extra_field)
+    slide_field = ctx.get("slide_field", extra_field)
     obo_field   = ctx["obo_field"]
     try:
         new_note[front_field] = card.get("front", "")
@@ -4018,10 +4325,11 @@ def _fill_addcards(ac, card: dict, ctx: dict) -> None:
     img_html = ctx["images_for"](card) if ctx.get("images_for") else ""
     if img_html and image_field in new_note:
         if image_field == extra_field:
-            existing = new_note[image_field] or ""
-            new_note[image_field] = (existing + "<br>" if existing else "") + img_html
+            _append_field(new_note, image_field, img_html)
         else:
             new_note[image_field] = img_html
+    slide_html = ctx["slide_imgs_for"](card) if ctx.get("slide_imgs_for") else ""
+    _append_field(new_note, slide_field, slide_html)
     sources_field = ctx.get("sources_field") or ""
     source_html = (card.get("source") or "").strip()
     if source_html and sources_field and sources_field in new_note:

@@ -69,6 +69,7 @@ def ensure_qa_profile() -> None:
             "front_field": "Front",
             "extra_field": "Back",       # the answer lands here
             "image_field": "Back",
+            "slide_field": "",           # Q&A decks have no lecture-slide field
             "sources_field": "Source",
             "one_by_one_field": "",
             "card_format": "qa",

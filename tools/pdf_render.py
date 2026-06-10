@@ -103,6 +103,61 @@ def render_pdf_to_images(
             pass
 
 
+# A per-page text cache keyed by (abspath, mtime). Text extraction is cheap, but
+# a single generate may ask for it more than once (dispatch + worker match), so
+# we memoise alongside the render cache.
+_TEXT_CACHE: dict[tuple, list[str]] = {}
+
+
+def extract_pdf_text_per_page(pdf_path: str) -> list[str]:
+    """Return the selectable text of each page, in page order (index 0 == page
+    1), using the SAME QtPdf module the rasteriser uses — no third-party
+    dependency. A page with no extractable text (image-only slide) yields "".
+    Returns [] on any failure, so a caller can compare total text length to
+    decide whether a text-first pass is viable or it must fall back to vision."""
+    try:
+        ap = os.path.abspath(pdf_path)
+        key = (ap, os.path.getmtime(ap))
+    except OSError:
+        key = None
+    if key is not None and key in _TEXT_CACHE:
+        return _TEXT_CACHE[key]
+
+    try:
+        from PyQt6.QtPdf import QPdfDocument  # type: ignore
+    except Exception as e:
+        log.error(f"pdf_render: QtPdf unavailable for text: {e}")
+        return []
+
+    doc = QPdfDocument(None)
+    try:
+        if doc.load(pdf_path) != QPdfDocument.Error.None_:
+            log.error(f"pdf_render: text load failed for {pdf_path}")
+            return []
+        count = doc.pageCount()
+        if count <= 0:
+            return []
+        out: list[str] = []
+        for i in range(count):
+            try:
+                sel = doc.getAllText(i)
+                out.append(sel.text() if sel is not None else "")
+            except Exception as e:
+                log.error(f"pdf_render: getAllText failed on page {i}: {e}")
+                out.append("")
+        if key is not None:
+            _TEXT_CACHE[key] = out
+        return out
+    except Exception as e:
+        log.error(f"pdf_render: text extract failed for {pdf_path}: {e}")
+        return []
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
+
+
 def page_count(pdf_path: str) -> int:
     """Number of pages in the PDF, or 0 if it can't be read."""
     try:

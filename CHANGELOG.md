@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.10.1
+
+### Improved (card formatting)
+- **Front emphasis is back.** Generated card fronts now mark up key words inline
+  for fast visual recognition — **bold** the disease/topic anchor and augmenting
+  qualifiers ('first-line', 'most common'), <u>underline</u> the word that cues
+  what the answer is (the investigation, the category), and *italicise*
+  genus/species. Applied purposefully and sparingly, per the Malleus typographical
+  rules. (A prior rule had banned all front formatting outright, so cards were
+  coming out plain.) No bullets or headers in the front — inline emphasis only.
+
+### Improved (slide-deck PDFs)
+- **Slides are now read one at a time.** Each page is sent to the AI on its own,
+  so every card is tied to the **exact slide it came from** — the source-slide
+  image attaches automatically and reliably (previously it often didn't attach at
+  all).
+- **Slide images go into the *Lecture Notes* field** instead of Extra, keeping the
+  back of the card clean. Searched/medical images still go to Extra. (Configurable
+  per notetype under Settings → AI Create → *Lecture/slides field*; falls back to
+  Extra on notetypes without a Lecture Notes field.)
+- **See the slide in the review screen.** Each card now shows a thumbnail of its
+  attached slide; click it to swap slides.
+- **Tidier, better-formatted card backs.** The Extra field is now short and
+  scannable — a few bolded, bulleted high-yield points instead of a wall of text.
+
 ## 1.10.0
 
 ### Added

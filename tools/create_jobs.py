@@ -118,9 +118,12 @@ def _normalise(item: dict) -> dict:
     out["status"] = st if st in VALID_STATUSES else QUEUED
     out["title"] = str(out.get("title", "")).strip()
     out.setdefault("error", "")
+    out["slide_mode"] = bool(out.get("slide_mode", False))
+    out["lecture_match"] = bool(out.get("lecture_match", False))
+    out.setdefault("card_word", "cloze")
     # List-shaped fields the UI/worker iterate over.
     for key in ("tags_raw", "kg_image_filenames", "panel_image_filenames",
-                "attachment_paths", "slide_pages"):
+                "attachment_paths", "slide_pages", "page_texts"):
         v = out.get(key)
         out[key] = list(v) if isinstance(v, (list, tuple)) else []
     out.setdefault("created_at", _now())
@@ -355,37 +358,66 @@ def _worker(rec: dict, cancel_ev) -> dict:
     from ..core.config import tool_config
     core_api.set_cancel_event(cancel_ev)
     try:
-        reply = core_api.ask_claude_json(
-            prompt=rec.get("user_msg", ""), system=rec.get("system_prompt", ""),
-            max_tokens=int(rec.get("max_tokens", 4096) or 4096),
-            model=rec.get("model"),
-            skill_id=rec.get("skill_id", ""),
-            skill_invocation=rec.get("skill_invocation", ""),
-            attachments=rec.get("attachment_paths") or None,
-            show_errors=False,
-        )
-        if cancel_ev.is_set():
-            raise _Cancelled()
-        if reply is None:
-            raise RuntimeError("the AI returned nothing (see console).")
-        # Route the one-call reply with the engine, using the plan the modal
-        # serialised into the record (note_field_keys + the merge flags). This is
-        # the SAME routing the interactive path uses, so background and modal
-        # generations land identically.
-        from .kg import engine
-        plan = engine.RequestPlan(
-            note_fields=list(rec.get("note_field_keys") or []),
-            want_tag=bool(rec.get("merge_tag")),
-            want_grade=bool(rec.get("merge_grade")),
-            want_cards=True)
-        routed = engine.route(reply, plan)
-        cards = routed.cards
-        merged_tag_levels = routed.tag_levels
-        same_call_grades = routed.grades
-        mq_explanation = str(routed.field_values.get("explanation") or "")
-        ai_field_values = routed.field_values
-        if not cc.resolve_card_validity(cards):
-            raise RuntimeError("the AI reply wasn't in the expected card format.")
+        if rec.get("slide_mode"):
+            # Slide-by-slide: one AI call per rendered page (basename-sorted so
+            # page order survives a restart). Each card is tagged with its exact
+            # source slide by the helper; nothing is folded, so there's no engine
+            # route — tag/grade happen in the shared tail below.
+            slide_pages = sorted(
+                (p for p in (rec.get("slide_pages") or []) if p and os.path.exists(p)),
+                key=lambda p: os.path.basename(p))
+            cards = cc.generate_cards_per_slide(
+                slide_pages, system=rec.get("system_prompt", ""),
+                card_word=rec.get("card_word", "cloze"), model=rec.get("model"),
+                skill_id=rec.get("skill_id", ""),
+                skill_invocation=rec.get("skill_invocation", ""),
+                cancel_check=cancel_ev.is_set)
+            if cancel_ev.is_set():
+                raise _Cancelled()
+            merged_tag_levels = None
+            same_call_grades = None
+            mq_explanation = ""
+            ai_field_values = {}
+            if not cc.resolve_card_validity(cards):
+                raise RuntimeError("no cards were generated from that slide deck.")
+        else:
+            reply = core_api.ask_claude_json(
+                prompt=rec.get("user_msg", ""), system=rec.get("system_prompt", ""),
+                max_tokens=int(rec.get("max_tokens", 4096) or 4096),
+                model=rec.get("model"),
+                skill_id=rec.get("skill_id", ""),
+                skill_invocation=rec.get("skill_invocation", ""),
+                attachments=rec.get("attachment_paths") or None,
+                show_errors=False,
+            )
+            if cancel_ev.is_set():
+                raise _Cancelled()
+            if reply is None:
+                raise RuntimeError("the AI returned nothing (see console).")
+            # Route the one-call reply with the engine, using the plan the modal
+            # serialised into the record (note_field_keys + the merge flags). This is
+            # the SAME routing the interactive path uses, so background and modal
+            # generations land identically.
+            from .kg import engine
+            plan = engine.RequestPlan(
+                note_fields=list(rec.get("note_field_keys") or []),
+                want_tag=bool(rec.get("merge_tag")),
+                want_grade=bool(rec.get("merge_grade")),
+                want_cards=True)
+            routed = engine.route(reply, plan)
+            cards = routed.cards
+            merged_tag_levels = routed.tag_levels
+            same_call_grades = routed.grades
+            mq_explanation = str(routed.field_values.get("explanation") or "")
+            ai_field_values = routed.field_values
+            if not cc.resolve_card_validity(cards):
+                raise RuntimeError("the AI reply wasn't in the expected card format.")
+            # Text-first lecture: attach each card to its source slide by matching
+            # the card back to the page text (deterministic, no AI). slide_pages
+            # are restored when the review dialog opens, so _sync_slide_images
+            # then pulls in the matched slide's image.
+            if rec.get("lecture_match") and rec.get("page_texts"):
+                cc.match_cards_to_slides(cards, rec.get("page_texts") or [])
         # Auto-tag in skill flows: a skill forces a bare-array reply with no
         # folded tag levels, so classify the material with a small dedicated
         # call (Qt-free, safe off the main thread). Same shared classifier AI
