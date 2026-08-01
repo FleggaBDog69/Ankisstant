@@ -169,6 +169,14 @@ family together. Where two things must stay distinct, one of them uses
 - **`palette()` is asked fresh on every call.** SynapsePro's active colour theme
   is module state it rewrites at runtime; a cached dict would go stale until the
   next Anki launch.
+- **A colour-theme change is detected, not signalled.** `set_active_theme()`
+  writes a module global and then repaints SynapsePro's *own* widgets by name.
+  Nothing is emitted, and Anki's `theme_did_change` fires only for light/dark —
+  so an already-open add-on window has nothing to subscribe to. `theme_signature()`
+  is compared on window activation (and on the dock becoming visible), which is
+  exactly when you'd get back from changing it. If SynapsePro ever grows a
+  signal, delete that and use it. **This is the top item on the wish list for
+  its author.**
 - **No import-time colour constants.** `weakness._BAR_CSS` and the lecture
   panel's `_C_NEW` / `_C_ROT` were module constants and are now functions —
   as constants they'd have frozen the palette at Anki launch, and switching

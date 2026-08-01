@@ -24,7 +24,7 @@ import importlib
 
 from aqt import gui_hooks, mw
 from aqt.qt import (
-    QDialog, QDockWidget, QFrame, QHBoxLayout, QLabel, QPushButton, QSize,
+    QDialog, QDockWidget, QEvent, QFrame, QHBoxLayout, QLabel, QPushButton, QSize,
     QSizePolicy, QStackedWidget, Qt, QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -670,6 +670,16 @@ class MainWindow(QDialog):
         layout.addWidget(self.body)
         synapse.apply_stylesheet(self)
 
+    def changeEvent(self, event):
+        # Coming back from SynapsePro's settings is how a colour-theme change
+        # reaches us — there's no signal to subscribe to. See check_theme_drift.
+        try:
+            if event.type() == QEvent.Type.ActivationChange and self.isActiveWindow():
+                check_theme_drift()
+        except Exception:
+            pass
+        super().changeEvent(event)
+
     def closeEvent(self, event):
         try:
             geom = self.frameGeometry()
@@ -752,7 +762,11 @@ class AnkisstantDock(QDockWidget):
 
     def _on_visibility(self, visible: bool) -> None:
         _sync_sidebar(bool(visible))
-        if not visible:
+        if visible:
+            # The dock lives inside the main window, so it never gets its own
+            # activation event — becoming visible again is the equivalent moment.
+            check_theme_drift()
+        else:
             self._persist_width()
 
     def _persist_width(self) -> None:
@@ -914,13 +928,35 @@ def _current_tool_key(body) -> str | None:
     return None
 
 
+_theme_sig = None
+
+
 def _on_theme_change() -> None:
-    """Follow a SynapsePro accent change or an Anki light/dark switch live."""
+    """Repaint for an Anki light/dark switch or a SynapsePro accent change."""
+    global _theme_sig
     try:
+        _theme_sig = synapse.theme_signature()
         if _host is not None and _is_live(_host):
             synapse.apply_stylesheet(_host)
             if _current is not None:
                 _current.refresh_theme()
+    except Exception:
+        pass
+
+
+def check_theme_drift() -> None:
+    """Repaint if SynapsePro's colour theme changed while we weren't looking.
+
+    Anki's ``theme_did_change`` covers light/dark, but SynapsePro's own colour
+    themes don't fire anything — it sets a module global and repaints its own
+    widgets by name. Changing one means visiting its settings and coming back,
+    so checking on window activation catches it without polling on a timer.
+    """
+    global _theme_sig
+    try:
+        sig = synapse.theme_signature()
+        if sig != _theme_sig:
+            _on_theme_change()
     except Exception:
         pass
 

@@ -28,10 +28,12 @@ SynapsePro itself is modified.
   applies to the popped-out window, which keeps the full-size pages.
 - The popped-out window carries a **"Dock to side panel"** entry, so the pop-out
   goes both ways.
-- **Ankisstant follows SynapsePro's colours**, including a colour-theme switch
-  made while a window is open. The main window, Settings, all the sub-dialogs,
-  and the AI Lecture results list. That last one had no dark-mode styling at all
-  before, so it now tracks the theme for the first time.
+- **Ankisstant follows SynapsePro's colours** — the main window, Settings, all
+  the sub-dialogs, and the AI Lecture results list. That last one had no
+  dark-mode styling at all before, so it now tracks the theme for the first
+  time. A light/dark switch is picked up immediately; a SynapsePro *colour
+  theme* switch is picked up the moment the panel is next activated, because
+  SynapsePro emits nothing an add-on can subscribe to.
 
 Two deliberate limits: SynapsePro has no amber, so warnings share red with errors
 (every one of those messages says which it is in words), and the QBank heatmap

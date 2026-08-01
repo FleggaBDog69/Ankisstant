@@ -154,6 +154,38 @@ def tokens() -> dict:
         return {}
 
 
+def theme_signature() -> tuple:
+    """A cheap value that changes whenever the effective palette does.
+
+    SynapsePro switches its colour theme by writing a module global and then
+    repainting *its own* widgets by name — there's no hook, and Anki's
+    ``theme_did_change`` fires only for light/dark. So an add-on window that's
+    already open has no way to be told, and keeps the old accent until something
+    else happens to repaint it.
+
+    Comparing this before and after is the workaround: it costs a dict lookup,
+    and it's honest about the fact that we're polling because there's nothing to
+    subscribe to. If SynapsePro ever grows a signal, delete this and use it.
+    """
+    if not _bridge_on():
+        return (False, None, None)
+    night = _night()
+    mod = _theme()
+    if mod is None:
+        return (night, None, None)
+    try:
+        active = mod.get_active_theme()
+    except Exception:
+        active = None
+    try:
+        # Only populated for the "custom" theme, but it can change underneath a
+        # name that doesn't.
+        custom = tuple(sorted((getattr(mod, "_CUSTOM_COLORS", None) or {}).items()))
+    except Exception:
+        custom = None
+    return (night, active, custom)
+
+
 def color(key: str, fallback: str) -> str:
     """One token, with Ankisstant's own colour as the fallback.
 
