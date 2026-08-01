@@ -46,7 +46,9 @@ _patch_progress_show_win()
 from aqt import mw, gui_hooks
 from aqt.qt import QAction, QKeySequence, QShortcut, Qt, QTimer
 
-from .core.config import ensure_config, load_config, tool_config, tool_enabled
+from .core.config import (
+    ensure_config, load_config, synapse_config, tool_config, tool_enabled,
+)
 from .core.migration import run_once_if_needed
 from .core import log
 from .tools import qbank as _qbank
@@ -54,6 +56,7 @@ from .tools import browse as _browse
 from .tools import knowledge_gaps as _knowledge_gaps
 from .tools import card_creator as _creator
 from .tools import update_by_tag as _update_by_tag
+from .tools import lecture as _lecture
 from .ui.main_window import open_main_window
 from .ui.settings import open_settings
 from .ui.welcome import open_welcome
@@ -65,6 +68,7 @@ TOOLS = [
     ("knowledge_gaps", _knowledge_gaps),
     ("card_creator",   _creator),
     ("update_by_tag",  _update_by_tag),
+    ("lecture",        _lecture),
 ]
 
 
@@ -140,6 +144,15 @@ def _on_profile_loaded() -> None:
     _setup_menu()
     _setup_capture_shortcut()
 
+    # SynapsePro bridge — a no-op when SynapsePro isn't installed. Registered
+    # per profile because its launcher strip is rebuilt per profile.
+    try:
+        from .core import synapse, synapse_sidebar
+        synapse.reset_cache()          # add-ons may have been enabled since
+        synapse_sidebar.register()
+    except Exception as e:
+        log.error(f"synapse sidebar registration failed: {e}")
+
     # First-run welcome — defer so the main window is up and ready to be
     # focused after the dialog closes. Also re-shown once after an upgrade that
     # bumps FORCE_WIZARD_VERSION (e.g. a new wizard page). We stamp the version
@@ -161,6 +174,17 @@ def _on_profile_loaded() -> None:
 # ── Top toolbar — adds an "Ankisstant" link next to Sync ─────────────────────
 
 def _on_top_toolbar_init_links(links, top_toolbar) -> None:
+    try:
+        # When SynapsePro is running and our button is live in its launcher
+        # strip, that button *is* this link — two front doors a centimetre apart
+        # is just clutter. Checked live on every redraw rather than from a flag
+        # set at startup: if injection ever fails, the link must still be here.
+        from .core import synapse_sidebar
+        if synapse_sidebar.injected_live() and \
+                synapse_config().get("hide_toolbar_link", True):
+            return
+    except Exception:
+        pass          # any doubt at all → keep the link
     try:
         links.append(
             top_toolbar.create_link(

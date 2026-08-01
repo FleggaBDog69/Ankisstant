@@ -1,5 +1,100 @@
 # Changelog
 
+## Unreleased
+
+### Added — SynapsePro integration
+
+All of this is inert unless [SynapsePro](https://github.com/mobesamedia/SynapsePro)
+is installed and enabled, and every part of it has its own off switch in
+**Settings ▸ SynapsePro**. Without it, Ankisstant is unchanged. Nothing in
+SynapsePro itself is modified.
+
+- **Ankisstant lives in SynapsePro's icon strip.** Two buttons: one opens
+  Ankisstant, one adds a knowledge gap without opening anything else. While
+  they're there, the "Ankisstant" link in Anki's top toolbar steps aside — it was
+  the same door. The Tools menu entry, `Ctrl+Shift+L`, the Browse menu and
+  `Ctrl+M` are untouched, and the toolbar link comes straight back if the strip
+  button ever isn't there.
+- **Opens as a side panel**, alongside SynapsePro's AI assistant, notebook and
+  mind-map — several can be open at once. **A pop-out button** returns it to the
+  free-floating window, and back, *without losing your place*: both queues, the
+  loaded panels and a half-filled Create form all survive the move.
+- **The side panel uses an icon rail** instead of the 200px text nav, to leave
+  the tools room to breathe. Queue counts show as a dot on the icon with the
+  number spelled out in the tooltip. The tool pages themselves are compacted to
+  fit — fields and combo boxes shrink instead of running off the right edge,
+  long button and checkbox wording is abbreviated with the full text on hover,
+  and the margins tighten. The panel can be dragged down to 210px. None of this
+  applies to the popped-out window, which keeps the full-size pages.
+- The popped-out window carries a **"Dock to side panel"** entry, so the pop-out
+  goes both ways.
+- **Ankisstant follows SynapsePro's colours**, including a colour-theme switch
+  made while a window is open. The main window, Settings, all the sub-dialogs,
+  and the AI Lecture results list. That last one had no dark-mode styling at all
+  before, so it now tracks the theme for the first time.
+
+Two deliberate limits: SynapsePro has no amber, so warnings share red with errors
+(every one of those messages says which it is in words), and the QBank heatmap
+keeps its own green ramp — it's a five-step density scale and there's no single
+token that can stand in for it.
+
+### Added
+- **Bulk knowledge-gap search.** Work a whole batch of KGs at once instead of one
+  at a time. Launch it from the **AI Browse queue** (⚡ *Bulk search all…*) or from
+  the Knowledge Gaps page (right-click → **🔍 Bulk search**). It opens as a popup,
+  so the normal Browse screen stays a clean single-topic surface. One AI call reads
+  every gap, then the full AI Lecture engine — tag leg + term leg, relevance judge,
+  dedupe, budget allocation — runs over the lot.
+- **Results grouped by gap.** Each gap gets its own collapsible subtree showing
+  which of its points the deck covers and which it doesn't, with every matched card
+  tickable. Points that found nothing say *why* — genuinely absent, topic present
+  but nothing testing this claim, or cards found that the budget passed over.
+  Uncovered gaps can be pushed straight to AI Create's queue.
+- **Gaps are sized individually.** Each gap is judged **narrow / focused / broad**,
+  and that drives two things: how many searchable points it splits into, and how
+  many cards it may pull. So `Graves + Tx` becomes 6-7 points with a 10-14 card
+  budget while `DOACs first line for AF long term` stays 1 point and **1 card** —
+  one assertion is one card — rather than both being levelled to one setting.
+- **Close the window while it searches.** Closing mid-run offers to leave the
+  search going; the window hides and reopens by itself when the results are in.
+- **A review table before anything searches.** Every gap's reading, scope and card
+  count is shown and editable, with ⚠ on the ones the AI wasn't confident it
+  understood. Rough shorthand is read through — `- [ ] Baclofen`, `anexadet`
+  (Andexanet) and `sued for wolff chaikoff` all resolve correctly.
+- **Per-gap tagging.** Every gap carries its own editable tag box in the results,
+  prefilled with its hierarchical tag (the same `base::Type::System::Subsystem::Topic`
+  scheme AI Browse and AI Create use) plus that gap's curated tags — unrelated gaps
+  never share one batch tag.
+- **Only fully-covered gaps close.** A broad gap whose deck covers 4 of its 7
+  points stays **open**: the rest is exactly the material worth making cards for.
+- **Send to AI Create, with the misses attached.** Pick which searched gaps go
+  over, and each one carries the *specific points your deck had nothing for* — so
+  a partly-covered gap asks for cards on the residue instead of the whole topic
+  again. Fully-covered gaps are listed but unticked.
+- **"In progress" is a real KG status.** Sending a gap to Browse or Create marks
+  it in progress, so a queue you're halfway through doesn't still read as
+  untouched. It has its own filter chip and shows in the list in words. The Open
+  filter still includes it — sending a gap somewhere never makes it vanish.
+
+### Fixed
+- **Relevance judging now runs in parallel** (4 calls at once, configurable in
+  Settings → AI Lecture). It was strictly one call after another, which is what
+  made a large bulk gap search take upwards of twenty minutes: the calls are
+  independent, so this is close to a straight division of the wait. Narrow gaps
+  also hand the judge a smaller candidate pool now — a gap entitled to one card
+  had no use for twenty candidates.
+- **KG title edits no longer revert.** Retitling a gap and then clicking another
+  one in the list silently discarded the edit. Title and tag edits now save on
+  focus-out, and the pane is flushed before it's pointed anywhere else.
+- **The Send buttons respect a multi-selection.** Selecting five gaps and pressing
+  *Send to AI Browse* / *AI Create* sent only the one the detail pane happened to
+  be showing. The buttons now say how many they'll send.
+- **Sending a gap no longer switches tabs.** Queueing is a filing action; the nav
+  badge is the feedback, and the target tool's queue view refreshes in place.
+- **The results tree gives the card text the room.** The per-gap tag column was
+  taking a quarter of the width for one short string; cards now show far more of
+  their text, with the rest in the tooltip.
+
 ## 1.10.1
 
 ### Improved (card formatting)

@@ -14,7 +14,7 @@ from aqt.qt import (
 )
 
 from ...core.config import tool_config, save_tool_config
-from ...core.qt_utils import attach_tag_completer
+from ...core.qt_utils import attach_tag_completer, theme_dialog
 from ..kg import store as kg_store
 from ..kg import engine
 
@@ -295,6 +295,7 @@ class CaptureDialog(QDialog):
         QShortcut(QKeySequence("Ctrl+Return"), self, self._save)
         QShortcut(QKeySequence("Meta+Return"), self, self._save)
 
+        theme_dialog(self)
         if self._first_input is not None:
             self._first_input.setFocus()
 

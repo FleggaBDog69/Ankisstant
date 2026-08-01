@@ -21,6 +21,7 @@ except ImportError:
     from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage
 
 from ...core.config import tool_config, save_tool_config
+from ...core.qt_utils import theme_dialog
 from .stats import add_session
 
 
@@ -146,6 +147,7 @@ class _QuestionCountDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        theme_dialog(self)   # chrome only — never the hosted page
 
     def values(self):
         return self.correct_spin.value(), self.incorrect_spin.value()
@@ -284,6 +286,7 @@ class BrowserWindow(QDialog):
         if ai_visible_start:
             self._ai_toggle.setChecked(True)
             QTimer.singleShot(0, lambda: self._toggle_ai(True))
+        theme_dialog(self)   # chrome only — never the hosted page
 
     def _current_ai(self):
         idx = self._ai_combo.currentIndex()

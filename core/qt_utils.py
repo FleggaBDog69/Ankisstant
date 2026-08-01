@@ -18,6 +18,7 @@ from aqt.qt import (
 from aqt.utils import tooltip
 
 from . import log
+from . import synapse
 
 
 @contextmanager
@@ -205,7 +206,7 @@ def manual_ai_complete(prompt: str, system: str = "",
         )
         att.setTextFormat(Qt.TextFormat.RichText)
         att.setWordWrap(True)
-        att.setStyleSheet("color: #b85c00;")
+        att.setStyleSheet(f"color: {synapse.status_warn()};")
         v.addWidget(att)
 
     copy_row = QHBoxLayout()
@@ -253,7 +254,7 @@ def manual_ai_complete(prompt: str, system: str = "",
     v.addWidget(reply_box, 1)
 
     err = QLabel("")
-    err.setStyleSheet("color: #c0392b;")
+    err.setStyleSheet(f"color: {synapse.status_error()};")
     err.setWordWrap(True)
     err.setVisible(False)
     v.addWidget(err)
@@ -490,10 +491,14 @@ def make_setup_banner(parent: QWidget | None = None) -> QFrame:
     button. Caller is responsible for inserting/removing it from a layout."""
     frame = QFrame(parent)
     frame.setObjectName("ankisstantSetupBanner")
+    # Amber wash. SynapsePro has no amber, so under the bridge this becomes its
+    # `red` at low alpha — still clearly "something needs your attention", which
+    # is what the banner is for. The banner always says what's wrong in words,
+    # so nothing depends on reading the tint.
     frame.setStyleSheet(
         "QFrame#ankisstantSetupBanner {"
-        "  background: rgba(255, 196, 0, 0.18);"
-        "  border: 1px solid rgba(255, 196, 0, 0.65);"
+        f"  background: {synapse.tint('red', 0.18, 'rgba(255, 196, 0, 0.18)')};"
+        f"  border: 1px solid {synapse.tint('red', 0.65, 'rgba(255, 196, 0, 0.65)')};"
         "  border-radius: 6px;"
         "}"
     )
@@ -560,3 +565,23 @@ def make_help_button(title: str, body_html: str, parent: QWidget | None = None) 
 
     btn.clicked.connect(_show)
     return btn
+
+
+def theme_dialog(widget) -> None:
+    """Apply the SynapsePro bridge stylesheet to one of Ankisstant's dialogs.
+
+    Call this at the *end* of __init__, once the layout is built — the blanket
+    sheet is generic chrome, and the per-widget stylesheets that carry meaning
+    (ok/warn/error status text, the "queued" highlight) are set afterwards in
+    source order and must keep winning.
+
+    A no-op when SynapsePro isn't installed, when the bridge is switched off, or
+    when the "theme the smaller dialogs" kill switch is off — in each case the
+    dialog looks exactly as it always did. Never raises: a themed dialog is nice
+    to have, an unopenable one is not.
+    """
+    try:
+        from . import synapse
+        synapse.apply_stylesheet(widget, dialog=True)
+    except Exception as e:
+        log.error(f"theme_dialog failed: {e}")

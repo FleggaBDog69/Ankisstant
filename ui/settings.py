@@ -231,6 +231,21 @@ def _wrap_scroll(widget: QWidget) -> QScrollArea:
     return sa
 
 
+def _synapse_theme(widget: QWidget, dialog: bool = False) -> None:
+    """Apply the SynapsePro bridge stylesheet, if there is one.
+
+    A no-op without SynapsePro, so every window that calls this looks exactly as
+    it did before the bridge existed. Applied *after* the layout is built, so
+    per-widget stylesheets that encode meaning (status colours, queue
+    highlights) still win over the blanket sheet.
+    """
+    try:
+        from ..core import synapse
+        synapse.apply_stylesheet(widget, dialog=dialog)
+    except Exception:
+        pass
+
+
 def _expand_form(layout: QFormLayout) -> QFormLayout:
     """Make QFormLayout field columns fill the row width."""
     layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
@@ -329,6 +344,7 @@ class _QBankEditDialog(QDialog):
         bb.accepted.connect(self._on_accept)
         bb.rejected.connect(self.reject)
         layout.addRow(bb)
+        _synapse_theme(self, dialog=True)
 
     def _on_accept(self):
         if self._name.text().strip() and self._url.text().strip():
@@ -379,6 +395,7 @@ class _PeriodEditDialog(QDialog):
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         layout.addRow(bb)
+        _synapse_theme(self, dialog=True)
 
     def result_period(self) -> dict:
         return {
@@ -580,6 +597,7 @@ class _NotetypeProfileDialog(QDialog):
         bb.accepted.connect(self._on_accept)
         bb.rejected.connect(self.reject)
         root.addWidget(bb)
+        _synapse_theme(self, dialog=True)
 
     def _cc_skill_mode(self) -> str:
         return "skill" if self._cc_mode.currentIndex() == 0 else "prompt"
@@ -684,6 +702,7 @@ class _ExamDateEditDialog(QDialog):
         bb.accepted.connect(self._on_accept)
         bb.rejected.connect(self.reject)
         layout.addRow(bb)
+        _synapse_theme(self, dialog=True)
 
     def _on_accept(self):
         if self._label.text().strip():
@@ -1287,6 +1306,10 @@ class _GlobalTab(QWidget):
         self._tool_update.setChecked(bool(tools_cfg.get("update_by_tag", {}).get("enabled", True)))
         tb.addWidget(self._tool_update)
 
+        self._tool_lecture = QCheckBox("AI Lecture")
+        self._tool_lecture.setChecked(bool(tools_cfg.get("lecture", {}).get("enabled", True)))
+        tb.addWidget(self._tool_lecture)
+
         layout.addRow(tools_box)
 
     def get_tool_states(self) -> dict:
@@ -1301,6 +1324,7 @@ class _GlobalTab(QWidget):
             "gap_analyser":       self._tool_ga.isChecked(),
             "card_creator":       self._tool_creator.isChecked(),
             "update_by_tag":      self._tool_update.isChecked(),
+            "lecture":            self._tool_lecture.isChecked(),
         }
 
 
@@ -1966,6 +1990,7 @@ class _FieldEditorDialog(QDialog):
         bb.rejected.connect(self.reject)
         root.addWidget(bb)
         self._sync_dynamic()
+        _synapse_theme(self, dialog=True)
 
     def _sync_dynamic(self, *_args) -> None:
         src = self._source.currentData() or "capture"
@@ -2152,6 +2177,7 @@ class _TypeEditorDialog(QDialog):
         bb.accepted.connect(self._on_save)
         bb.rejected.connect(self.reject)
         outer.addWidget(bb)
+        _synapse_theme(self, dialog=True)
 
     def _pick_color(self):
         current = QColor(self._color.text().strip() or "#6b7280")
@@ -3062,6 +3088,7 @@ class _GroundingSourcesDialog(QDialog):
         self._region = region if region in ("au_wa", "usa", "intl") else "au_wa"
         self._cleared = False
         self._build()
+        _synapse_theme(self, dialog=True)
 
     def _build(self):
         from ..grounding.guidelines import preset_keys, preset_label
@@ -3249,6 +3276,264 @@ def _addon_version() -> str:
         return "?"
 
 
+class _LectureTab(QWidget):
+    """AI Lecture settings. Small by design — the tool is a focused one, and its
+    per-run knobs (points, budget, vision) also live on the panel itself; this
+    tab sets their defaults and the tagging that has no panel control."""
+
+    def __init__(self, lec_cfg: dict, parent=None):
+        super().__init__(parent)
+        self._lec_cfg = lec_cfg or {}
+        d = DEFAULTS["tools"]["lecture"]
+
+        layout = _expand_form(QFormLayout(self))
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setVerticalSpacing(10)
+
+        intro = QLabel(
+            "<small>Defaults for AI Lecture. The point target, note budget and "
+            "vision toggle also appear on the tool's own panel — this sets what "
+            "they start at.</small>")
+        intro.setWordWrap(True)
+        intro.setTextFormat(Qt.TextFormat.RichText)
+        intro.setStyleSheet("color: gray;")
+        layout.addRow(intro)
+
+        # Model lives on the AI tab (Settings → AI → the Lecture rows); no
+        # tool-local model picker, matching Browse.
+
+        self._target_points = QSpinBox()
+        self._target_points.setRange(5, 200)
+        self._target_points.setValue(int(self._lec_cfg.get("target_points", d["target_points"])))
+        self._target_points.setToolTip(
+            "A target, not a cap — the AI aims here and consolidates toward it, "
+            "but whatever it finds is kept. Ignored when you paste your own "
+            "learning objectives.")
+        layout.addRow("Learning points (target):", self._target_points)
+
+        self._target_cards = QSpinBox()
+        self._target_cards.setRange(5, 500)
+        self._target_cards.setValue(int(self._lec_cfg.get("target_cards", d["target_cards"])))
+        self._target_cards.setToolTip(
+            "Rough estimate of how many notes to surface — not a hard budget. "
+            "Shared out so every point gets its best note before any gets a "
+            "second, and never padded: expect fewer than this, not exactly it.")
+        layout.addRow("Notes to find (approx.):", self._target_cards)
+
+        self._candidate_cap = QSpinBox()
+        self._candidate_cap.setRange(3, 25)
+        self._candidate_cap.setValue(int(self._lec_cfg.get("candidate_cap", d["candidate_cap"])))
+        self._candidate_cap.setToolTip(
+            "How many candidate notes per point the AI judges for relevance. "
+            "Lower = smaller, faster, cheaper relevance calls — but it drops "
+            "cards: the pre-judge ranking only loosely predicts what the judge "
+            "keeps, so trimming the tail loses roughly one good card per point "
+            "for every 3 you cut. 10 is the quality floor; lower only to save "
+            "cost on a throttled account.")
+        layout.addRow("Candidates per point:", self._candidate_cap)
+
+        self._rel_workers = QSpinBox()
+        self._rel_workers.setRange(1, 8)
+        self._rel_workers.setValue(
+            int(self._lec_cfg.get("relevance_workers", d["relevance_workers"])))
+        self._rel_workers.setToolTip(
+            "How many relevance calls run at once. Judging is the slow leg — "
+            "tens of seconds per call — and the calls are independent, so this "
+            "is close to a straight division of the wait: 4 workers turned a "
+            "20-minute bulk gap search into a few minutes. Each one is a "
+            "separate AI request, so raise it only if your provider is happy "
+            "with the concurrency. 1 = the old one-at-a-time behaviour.")
+        layout.addRow("Parallel relevance calls:", self._rel_workers)
+
+        self._use_vision = QCheckBox("Read diagrams and tables as images (slower, costs more)")
+        self._use_vision.setChecked(bool(self._lec_cfg.get("use_vision", d["use_vision"])))
+        self._use_vision.setToolTip(
+            "Off by default. Text and local OCR read almost every slide. Turn on "
+            "only for lectures whose meaning lives in the LAYOUT (a drug-to-class "
+            "matching table). Costs ~4-5x and adds minutes.")
+        layout.addRow("Vision:", self._use_vision)
+
+        self._use_ocr = QCheckBox("Use local OCR for pages with no text layer")
+        self._use_ocr.setChecked(bool(self._lec_cfg.get("use_local_ocr", d["use_local_ocr"])))
+        self._use_ocr.setToolTip(
+            "Soft-detects tesseract or another add-on's OCR for scanned / "
+            "image-only pages. Never runs on a page that already has text. Falls "
+            "back to vision (if on) when no engine is found.")
+        layout.addRow("Local OCR:", self._use_ocr)
+
+        self._high_yield = QCheckBox("Drop low-yield padding (stats, 'emerging' asides, long lists)")
+        self._high_yield.setChecked(bool(self._lec_cfg.get("high_yield_only", d["high_yield_only"])))
+        self._high_yield.setToolTip(
+            "On by default. Keeps only points a card could actually test. Off "
+            "extracts everything the lecture says. Also on the tool's panel.")
+        layout.addRow("No low-yield:", self._high_yield)
+
+        self._tag_root = QLineEdit(str(self._lec_cfg.get("tag_root", d["tag_root"])))
+        self._tag_root.setMinimumWidth(420)
+        self._tag_root.setPlaceholderText("lecture")
+        self._tag_root.setToolTip(
+            "The parent tag matches land under — the panel pre-fills "
+            "'<root>::<lecture name>' from the file name.")
+        layout.addRow("Tag root:", self._tag_root)
+
+        self._audit_tag = QLineEdit(str(self._lec_cfg.get("audit_tag", d["audit_tag"])))
+        self._audit_tag.setMinimumWidth(420)
+        self._audit_tag.setPlaceholderText("e.g. !!Fleg::AI::Lecture")
+        attach_tag_completer(self._audit_tag)
+        self._audit_tag.setToolTip(
+            "A marker tag added to every note this tool touches, so AI-sourced "
+            "notes stay auditable. Leave blank to skip it.")
+        layout.addRow("Audit tag:", self._audit_tag)
+
+    def set_model_family(self, family: str, manual: bool = False) -> None:
+        # No tool-local model widget: the model resolves from the AI tab matrix.
+        return
+
+    def get_values(self) -> dict:
+        return {
+            "target_points":  int(self._target_points.value()),
+            "target_cards":   int(self._target_cards.value()),
+            "candidate_cap":  int(self._candidate_cap.value()),
+            "relevance_workers": int(self._rel_workers.value()),
+            "use_vision":     self._use_vision.isChecked(),
+            "use_local_ocr":  self._use_ocr.isChecked(),
+            "high_yield_only": self._high_yield.isChecked(),
+            "tag_root":       self._tag_root.text().strip() or "lecture",
+            "audit_tag":      self._audit_tag.text().strip(),
+        }
+
+
+class _SynapseTab(QWidget):
+    """The SynapsePro bridge — one kill switch per behaviour.
+
+    Every switch here returns Ankisstant to exactly how it looked and behaved
+    before the bridge existed, which is the contract the whole integration is
+    built on. Nothing on this page writes anything into SynapsePro; the bridge
+    only ever reads its palette.
+    """
+
+    def __init__(self, syn_cfg: dict, parent=None):
+        super().__init__(parent)
+        self._cfg = syn_cfg or {}
+        d = DEFAULTS["synapse"]
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        # State in words, never by colouring something green — a status you can
+        # only read by its colour isn't a status.
+        try:
+            from ..core import synapse
+            present = synapse.synapse_available()
+        except Exception:
+            present = False
+        status = QLabel(
+            "<b>SynapsePro detected.</b> The settings below are active."
+            if present else
+            "<b>SynapsePro not detected.</b> Everything below is inert until it's "
+            "installed and enabled — Ankisstant looks and behaves exactly as it "
+            "always has."
+        )
+        status.setTextFormat(Qt.TextFormat.RichText)
+        status.setWordWrap(True)
+        layout.addWidget(status)
+
+        intro = QLabel(
+            "<small>When SynapsePro is running, Ankisstant borrows its colours "
+            "and puts its front door in SynapsePro's icon strip, so the two read "
+            "as one app. Turn any of it off and that part goes back to how it "
+            "was. Nothing here changes SynapsePro itself.</small>")
+        intro.setWordWrap(True)
+        intro.setTextFormat(Qt.TextFormat.RichText)
+        intro.setStyleSheet("color: gray;")
+        layout.addWidget(intro)
+
+        self._checks: dict[str, QCheckBox] = {}
+
+        def add_group(title: str, rows: list[tuple[str, str, str]]) -> None:
+            box = QGroupBox(title)
+            form = QVBoxLayout(box)
+            form.setContentsMargins(12, 10, 12, 10)
+            form.setSpacing(6)
+            for key, label, tip in rows:
+                cb = QCheckBox(label)
+                cb.setChecked(bool(self._cfg.get(key, d[key])))
+                cb.setToolTip(tip)
+                hint = QLabel(f"<small>{tip}</small>")
+                hint.setTextFormat(Qt.TextFormat.RichText)
+                hint.setWordWrap(True)
+                hint.setStyleSheet("color: gray; margin-left: 20px;")
+                form.addWidget(cb)
+                form.addWidget(hint)
+                self._checks[key] = cb
+            layout.addWidget(box)
+
+        add_group("Appearance", [
+            ("theme_bridge", "Use SynapsePro's colours",
+             "Ankisstant follows whichever colour theme SynapsePro is on, "
+             "including a change made while a window is open."),
+            ("match_font", "Also use its font",
+             "Off by default — every other add-on window uses Anki's own font, "
+             "so matching SynapsePro's makes Ankisstant the odd one out."),
+            ("theme_settings", "Theme the main window and Settings",
+             "The two big windows. Spin boxes, drop-downs and lists are "
+             "restyled; checkboxes are deliberately left native so their "
+             "state always reads correctly."),
+            ("theme_dialogs", "Theme the smaller dialogs",
+             "Add KG, the Create editors, bulk search, screenshot capture and "
+             "the rest."),
+        ])
+
+        add_group("Where Ankisstant lives", [
+            ("sidebar_buttons", "Add Ankisstant to SynapsePro's icon strip",
+             "Two buttons: one opens Ankisstant, one adds a knowledge gap "
+             "without opening anything. The per-tool icons stay inside "
+             "Ankisstant's own rail rather than crowding the strip."),
+            ("hide_toolbar_link", "Drop the \"Ankisstant\" link from Anki's top toolbar",
+             "Only while the strip button is actually there — if SynapsePro is "
+             "missing or the button fails to appear, the link stays put. The "
+             "Tools menu entry and Ctrl+Shift+L are never touched."),
+        ])
+
+        mode_box = QGroupBox("Opening Ankisstant")
+        mode_layout = _expand_form(QFormLayout(mode_box))
+        mode_layout.setContentsMargins(12, 10, 12, 10)
+        self._open_mode = QComboBox()
+        self._open_mode.addItem("Side panel, beside SynapsePro's own panels", "dock")
+        self._open_mode.addItem("Separate window", "window")
+        idx = self._open_mode.findData(self._cfg.get("open_mode", d["open_mode"]))
+        self._open_mode.setCurrentIndex(max(0, idx))
+        self._open_mode.setToolTip(
+            "The pop-out button inside Ankisstant switches between these too — "
+            "this is just what it starts as.")
+        mode_layout.addRow("Open as:", self._open_mode)
+        mode_hint = QLabel(
+            "<small>As a side panel it sits on the right and several panels can "
+            "be open at once. The nav column becomes an icon rail there to leave "
+            "room for the tools. Without SynapsePro it's always a separate "
+            "window.</small>")
+        mode_hint.setTextFormat(Qt.TextFormat.RichText)
+        mode_hint.setWordWrap(True)
+        mode_hint.setStyleSheet("color: gray;")
+        mode_layout.addRow(mode_hint)
+        layout.addWidget(mode_box)
+
+        layout.addStretch(1)
+
+    def set_model_family(self, family: str, manual: bool = False) -> None:
+        # No model widget on this tab — it configures presentation, not AI.
+        return
+
+    def get_values(self) -> dict:
+        values = {k: cb.isChecked() for k, cb in self._checks.items()}
+        values["open_mode"] = self._open_mode.currentData() or "dock"
+        # dock_width isn't exposed: it's whatever the user last dragged the
+        # panel to, and a number box for it would be a worse control than the
+        # panel edge itself.
+        return values
+
+
 class _AboutTab(QWidget):
     def __init__(self):
         super().__init__()
@@ -3340,6 +3625,7 @@ class SettingsDialog(QDialog):
         self.setWindowTitle("Ankisstant — Settings")
         self.setMinimumSize(820, 680)
         self._build(initial_tab)
+        _synapse_theme(self)
 
     def _build(self, initial_tab: str | None = None):
         root = QVBoxLayout(self)
@@ -3356,6 +3642,8 @@ class SettingsDialog(QDialog):
             self._original_cfg.get("tools", {}).get("gap_analyser", {}),
         )
         self._creator_tab = _CreatorTab(self._original_cfg.get("tools", {}).get("card_creator", {}), self._original_cfg)
+        self._lecture_tab = _LectureTab(self._original_cfg.get("tools", {}).get("lecture", {}))
+        self._synapse_tab = _SynapseTab(self._original_cfg.get("synapse", {}))
         self._about_tab   = _AboutTab()
 
         # Browse and Create both show a "Month tag" group editing the same
@@ -3383,6 +3671,18 @@ class SettingsDialog(QDialog):
             self._tab_index_for_key["knowledge_gaps"] = tabs.addTab(_wrap_scroll(self._kg_tab), "Knowledge Gaps")
         if tool_enabled("card_creator"):
             self._tab_index_for_key["card_creator"] = tabs.addTab(_wrap_scroll(self._creator_tab), "AI Create")
+        if tool_enabled("lecture"):
+            self._tab_index_for_key["lecture"] = tabs.addTab(_wrap_scroll(self._lecture_tab), "AI Lecture")
+
+        # Not gated on a tool being enabled — it configures the whole add-on's
+        # presentation, not a tool. Hidden only when SynapsePro isn't installed,
+        # where every switch on it would be a no-op with nothing to explain.
+        try:
+            from ..core import synapse as _synapse
+            if _synapse.synapse_available():
+                tabs.addTab(_wrap_scroll(self._synapse_tab), "SynapsePro")
+        except Exception:
+            pass
 
         tabs.addTab(_wrap_scroll(self._about_tab),   "About")
         root.addWidget(tabs)
@@ -3414,7 +3714,8 @@ class SettingsDialog(QDialog):
     def _sync_tool_models(self, provider: str):
         manual = (provider or "").lower() == "manual"
         family = family_for(provider)
-        for tab in (self._qbank_tab, self._browse_tab, self._kg_tab, self._creator_tab):
+        for tab in (self._qbank_tab, self._browse_tab, self._kg_tab,
+                    self._creator_tab, self._lecture_tab):
             tab.set_model_family(family, manual=manual)
 
     def _on_save(self):
@@ -3431,6 +3732,7 @@ class SettingsDialog(QDialog):
         cfg["tools"]["knowledge_gaps"] = {**cfg["tools"].get("knowledge_gaps", {}), **self._kg_tab.get_values()}
         cfg["tools"]["gap_analyser"]   = {**cfg["tools"].get("gap_analyser", {}),   **self._kg_tab.get_gap_analyser_values()}
         cfg["tools"]["card_creator"]   = {**cfg["tools"].get("card_creator", {}),   **self._creator_tab.get_values()}
+        cfg["tools"]["lecture"]        = {**cfg["tools"].get("lecture", {}),        **self._lecture_tab.get_values()}
 
         # Tool on/off + Browse's panel mode — single source of truth is the
         # Tools tab's switchboard (each tool's own tab no longer has
@@ -3444,6 +3746,14 @@ class SettingsDialog(QDialog):
         cfg["tools"]["card_creator"]["enabled"]   = states["card_creator"]
         cfg["tools"].setdefault("update_by_tag", {})
         cfg["tools"]["update_by_tag"]["enabled"]  = states["update_by_tag"]
+        cfg["tools"].setdefault("lecture", {})
+        cfg["tools"]["lecture"]["enabled"]        = states["lecture"]
+
+        # Top-level, not under cfg["tools"] — it's bridge configuration, and it
+        # must not show up in the Tools on/off switchboard. Merged rather than
+        # replaced so dock_width (set by dragging the panel, not by this tab)
+        # survives a save.
+        cfg["synapse"] = {**cfg.get("synapse", {}), **self._synapse_tab.get_values()}
 
         save_config(cfg)
         # Re-register the capture shortcut so a changed binding works without
@@ -3451,6 +3761,14 @@ class SettingsDialog(QDialog):
         try:
             from .. import _setup_capture_shortcut
             _setup_capture_shortcut()
+        except Exception:
+            pass
+        # Add or drop the SynapsePro strip buttons (and the toolbar link with
+        # them) straight away, rather than making the user restart to see a
+        # switch they just flipped take effect.
+        try:
+            from ..core import synapse_sidebar
+            synapse_sidebar.apply_settings_change()
         except Exception:
             pass
         tooltip("Settings saved.")

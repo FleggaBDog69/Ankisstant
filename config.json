@@ -11,6 +11,16 @@
   "provider": "auto",
   "model_defaults": {"anthropic": "claude-haiku-4-5-20251001", "gemini": "gemini-2.5-flash", "openai": "gpt-4o-mini"},
   "window": {"width": 900, "height": 600, "x": null, "y": null},
+  "synapse": {
+    "theme_bridge": true,
+    "match_font": false,
+    "sidebar_buttons": true,
+    "hide_toolbar_link": true,
+    "theme_settings": true,
+    "theme_dialogs": true,
+    "open_mode": "dock",
+    "dock_width": 720
+  },
   "tools": {
     "qbank": {
       "enabled": true,

@@ -61,6 +61,8 @@ _AI_TOOLS: list[dict] = [
     {"key": "native_search", "label": "Native browser search", "skills": False, "tier": "smart"},
     {"key": "gap_analysis",  "label": "Gap analysis",    "skills": False, "tier": "smart"},
     {"key": "quality_pass",  "label": "Quality pass",    "skills": True,  "tier": "fast"},
+    {"key": "lecture_extract",   "label": "Lecture extraction", "skills": False, "tier": "smart"},
+    {"key": "lecture_relevance", "label": "Lecture relevance",  "skills": False, "tier": "smart"},
 ]
 
 DEFAULTS: dict = {
@@ -96,6 +98,16 @@ DEFAULTS: dict = {
         "search":        {"model": dict(_SMART_MODELS)},
         "gap_analysis":  {"model": dict(_SMART_MODELS)},
         "quality_pass":  {"model": dict(_FAST_MODELS),  "skill": {"anthropic": "", "cli": ""}},
+        "lecture_extract":   {"model": dict(_SMART_MODELS)},
+        # Stays SMART. The clean Haiku-vs-Sonnet re-run (fail=0, 255 candidates)
+        # agreed on 93.3% of cards — but that headline hides the shape: 15 of the
+        # 17 disagreements were Haiku DROPPING a card Sonnet kept (flumazenil for
+        # a benzodiazepine-mechanism point, duloxetine for "antidepressants'
+        # other uses"), i.e. relevant cards a student revising that point wants.
+        # In a tool that fails OPEN precisely because a wrongly-dropped card is
+        # invisible and fakes a gap, Haiku errs in the one harmful direction, and
+        # the cost gap is small ($0.39 vs $0.60). Not worth demoting.
+        "lecture_relevance": {"model": dict(_SMART_MODELS)},
     },
     # One-time seed of ai_matrix from the legacy scattered model keys. Flips True
     # after the first run so later AI-tab edits aren't clobbered by re-seeding.
@@ -118,6 +130,34 @@ DEFAULTS: dict = {
     "month_tag_enabled": True,
     "month_tag_prefix": "Ankisstant::Month",
     "window": {"width": 900, "height": 600, "x": None, "y": None},
+    # ── SynapsePro bridge ──────────────────────────────────────────────────
+    # Every key here is a kill switch: turning it off returns Ankisstant to
+    # exactly how it looked and behaved before the bridge existed. All of it
+    # is inert when SynapsePro isn't installed. Top-level rather than under
+    # "tools" — it configures the integration, not a tool, so it has no
+    # business in the Tools on/off switchboard.
+    "synapse": {
+        # Borrow SynapsePro's colour palette at all.
+        "theme_bridge": True,
+        # Also borrow its font family. Off by default — Anki's own font is
+        # what every other add-on window uses.
+        "match_font": False,
+        # Inject the Ankisstant and ＋ buttons into its launcher strip.
+        "sidebar_buttons": True,
+        # Drop our own "Ankisstant" link from Anki's top toolbar once the
+        # sidebar button is live (it's the same door twice). Only ever takes
+        # effect while injection is actually succeeding.
+        "hide_toolbar_link": True,
+        # Theme the main window and Settings.
+        "theme_settings": True,
+        # Theme the sub-dialogs (Create's editors, bulk search, capture, …).
+        "theme_dialogs": True,
+        # "dock" = open as a side panel beside SynapsePro's own panels;
+        # "window" = the free-floating window Ankisstant has always used.
+        # The pop-out button flips this for the session.
+        "open_mode": "dock",
+        "dock_width": 720,
+    },
     "tools": {
         "qbank": {
             "enabled": True,
@@ -413,6 +453,101 @@ DEFAULTS: dict = {
             "audit_tag": "Ankisstant::AI::Updated",
             "review_tag": "Ankisstant::AI::UpdateReview",
         },
+        # AI Lecture: a lecture file in, the cards you ALREADY own out. Retrieval,
+        # not generation — extract learning points, match them against the
+        # collection, then tag + unsuspend what's found.
+        "lecture": {
+            "enabled": True,
+            # A TARGET, not a cap. The prompt aims here and consolidates toward
+            # it, but whatever comes back is kept: truncating at N would drop the
+            # 26th point, which the coverage report would then call a real gap in
+            # your deck — a lie. Keeping the overflow makes the count a visible
+            # quality signal instead. There is no correct number; this is a knob.
+            # Raised 25 -> 40 alongside the "enumerate the members of a named
+            # class" extraction rule: decomposing enumerable clinical sets (stroke
+            # territories, cranial-nerve palsies, shock types...) into a point each
+            # legitimately lifts the count, and 25 was crushing them back together.
+            "target_points": 40,
+            # Rough ESTIMATE of how many cards to surface, not a hard budget:
+            # allocated round-robin so every point gets its best card before any
+            # gets a second, and nothing is ever padded to reach it — if the
+            # points only yield 30 good cards, 30 is the answer. Runs short of
+            # this far more often than it hits it, now that a deliberate score-1
+            # card is dropped rather than filling a slot (see _KEEP_MIN_SCORE).
+            # 45 is a lean default for a single lecture; a big LO-list pass wants
+            # more, but that's a per-run choice, not a bigger default here.
+            "target_cards": 45,
+            # How many notes each objective may claim beyond its minimum
+            # non-redundant set-cover — the knob that decides whether a run is a
+            # lean revision shortlist or a fuller study set. "tight" = one note
+            # per distinct sub-fact (the original behaviour); "standard" = up to
+            # 3 per objective; "thorough" = up to 5. It only keeps notes the
+            # relevance judge already approved, and target_cards is still the
+            # ceiling on the total. See matcher.DEPTH_TARGETS.
+            "depth": "thorough",
+            # How many candidate notes per point are handed to the relevance
+            # judge. This is the real load lever: fewer candidates = smaller,
+            # faster relevance calls. But it is NOT free — the pre-judge ranking
+            # only loosely predicts what the judge keeps, so trimming the tail
+            # drops good cards. MEASURED across 5 real lectures: 10->7 saves 29%
+            # of the relevance work but loses ~1 kept-and-shown card per point.
+            # Raised 10->20 alongside the depth presets: a "thorough" run hands a
+            # point up to 5 notes, so the judge needs a deeper pool to draw them
+            # from (and sparse points need more candidates before they cluster at
+            # all). Batches still pack to a fixed size, so this adds calls, not
+            # bigger ones. Lower toward 12-15 to trade depth for speed.
+            "candidate_cap": 20,
+            # How many relevance calls run AT ONCE. The judge is the slow leg —
+            # one call per ~20 candidates, ~30s each on the CLI — and it was
+            # running strictly one after another, so a 49-point bulk gap search
+            # took ~25 minutes of nothing but waiting on a subprocess. The calls
+            # are independent (each judges its own points against its own
+            # candidates), so they parallelise cleanly. 4 is deliberately modest:
+            # each one is a separate `claude` process, and the win is mostly in
+            # the first few. 1 restores the old serial behaviour.
+            "relevance_workers": 4,
+            # Send imagery-bearing slides to the model as images, not just their
+            # text layer. OFF by default: text-first is the common path, and
+            # local OCR (use_local_ocr) now recovers no-text pages without it.
+            # Vision is the opt-in for the one thing neither text nor OCR can do
+            # — read content that lives in LAYOUT (a drug-to-class matching
+            # table is a meaningless bag of words without it). Costs ~4-5x and
+            # minutes (measured: $0.15/~60s text-only vs $0.62/324s with vision),
+            # so it's a deliberate choice per lecture, not the default.
+            "use_vision": False,
+            # Soft-detect tesseract / another add-on's macocr for segments with
+            # NO text layer. Never runs on a segment that has text — OCR'ing a
+            # readable page loses 13-21% of its words. Falls back to vision when
+            # neither engine is present; there is no bundled binary.
+            "use_local_ocr": True,
+            # When on, the extractor drops low-yield lecture padding — bare
+            # statistics, "emerging/experimental" asides, and enumerated lists
+            # that only exist as individual-fact cards in the deck — rather than
+            # emitting them as points. A point should be something a card could
+            # TEST, not merely something a lecturer said. Off restores the raw
+            # extract. Part of the extraction cache key (like use_vision).
+            "high_yield_only": True,
+            # Off by default: the lecture is the source of truth, and the
+            # extractor must NOT backfill canonical facts the material omits
+            # (the fix for a run that invented a regional-V/Q point the slides
+            # never taught). On lets it supplement with closely-related standard
+            # knowledge — a deliberate, user-chosen behaviour. Part of the
+            # extraction cache key (like use_vision / high_yield_only).
+            "enrich": False,
+            # Opt-in. Writes the source slide images of high-yield slides into
+            # the note's slide field. Off by default because _append_field
+            # appends: a second run over the same lecture would stack duplicate
+            # <img> tags unless the filename guard catches them.
+            "attach_slides": False,
+            # Blank → resolved automatically to AnKing's "Lecture Notes" field.
+            # Mirrors the AI Create profile key of the same name.
+            "slide_field": "",
+            # Mirrors AI Browse / AI Create's audit-tag scheme (!!Fleg::AI::…),
+            # so every AI-touched note is auditable under one branch.
+            "audit_tag": "!!Fleg::AI::Lecture",
+            "tag_root": "lecture",
+            "last_file_dir": "",
+        },
     },
 }
 
@@ -434,6 +569,7 @@ def ensure_config() -> None:
     raw = mw.addonManager.getConfig(ADDON) or {}
     merged = _deep_merge(DEFAULTS, raw)
     _migrate_auto_tag_scheme(merged)
+    _migrate_lecture_audit_tag(merged)
     _migrate_dead_gemini_models(merged)
     if merged != raw:
         mw.addonManager.writeConfig(ADDON, merged)
@@ -445,6 +581,7 @@ def load_config() -> dict:
     _migrate_provider_schema(cfg)
     _migrate_creator_notetypes(cfg)
     _migrate_auto_tag_scheme(cfg)
+    _migrate_lecture_audit_tag(cfg)
     _migrate_ai_matrix(cfg)
     _migrate_dead_gemini_models(cfg)
     return cfg
@@ -628,6 +765,17 @@ def _migrate_creator_notetypes(cfg: dict) -> None:
         cc["selected_notetype"] = legacy_name
 
 
+def _migrate_lecture_audit_tag(cfg: dict) -> None:
+    """Rename the AI Lecture audit tag from the old 'Ankisstant::AI::Lecture'
+    onto the '!!Fleg::AI::…' scheme that Browse and Create already use, so all
+    AI-touched notes sit under one auditable branch. Idempotent, and ONLY
+    rewrites the exact legacy value — a tag the user has customised is left
+    alone."""
+    lec = cfg.get("tools", {}).get("lecture")
+    if isinstance(lec, dict) and (lec.get("audit_tag") or "").strip() == "Ankisstant::AI::Lecture":
+        lec["audit_tag"] = "!!Fleg::AI::Lecture"
+
+
 def _migrate_auto_tag_scheme(cfg: dict) -> None:
     """Consolidate the old dual auto-tag system (per-type prefixes + a separate
     Browse prefix) onto the single {base}::{type}::… scheme. Idempotent: only
@@ -670,6 +818,22 @@ def save_tool_config(tool_name: str, tool_cfg: dict) -> None:
 
 def tool_enabled(tool_name: str) -> bool:
     return bool(tool_config(tool_name).get("enabled", False))
+
+
+def synapse_config() -> dict:
+    """The SynapsePro bridge settings slice. Always a dict, never raises — the
+    bridge is consulted from paint paths where a config read failing must not
+    take a window down with it."""
+    try:
+        return load_config().get("synapse", {}) or {}
+    except Exception:
+        return {}
+
+
+def save_synapse_config(values: dict) -> None:
+    cfg = load_config()
+    cfg["synapse"] = {**cfg.get("synapse", {}), **(values or {})}
+    save_config(cfg)
 
 
 # ── provider / model resolution ────────────────────────────────────────────────

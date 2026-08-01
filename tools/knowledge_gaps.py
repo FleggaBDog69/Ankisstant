@@ -30,7 +30,7 @@ from ..core import anki_utils
 from ..core.config import active_family, tool_config, tool_model_for
 from ..core.qt_utils import (
     attach_tag_completer, make_help_button, make_setup_banner,
-    provider_configured, run_claude_json, set_ai_buttons_enabled,
+    provider_configured, run_claude_json, set_ai_buttons_enabled, theme_dialog,
 )
 from .kg import store as kg_store
 
@@ -48,8 +48,9 @@ SOURCE_LABELS = {
 }
 
 STATUS_LABELS = {
-    "open":      "Open",
-    "done":      "Done",
+    "open":        "Open",
+    "in_progress": "In progress",
+    "done":        "Done",
 }
 
 
@@ -186,6 +187,7 @@ class AddKGDialog(QDialog):
         btn_row.addWidget(save)
         layout.addLayout(btn_row)
 
+        theme_dialog(self)
         self._title.setFocus()
 
     def _on_attach_image(self) -> None:
@@ -280,6 +282,10 @@ class _KGListItem(QListWidgetItem):
         text = f"[{type_meta['name']}]  {title}"
         if len(text) > 80:
             text = text[:80].rstrip() + "…"
+        # In-progress says so in words. Italic-grey alone would read as "done",
+        # and a colour alone tells you nothing about which state it is.
+        if status == "in_progress":
+            text += "   · sent, in progress"
         self.setText(text)
 
         # Grey done items so they stay visible but recede.
@@ -576,6 +582,9 @@ class KGDetailPane(QWidget):
         f.setPointSize(f.pointSize() + 2)
         f.setBold(True)
         self._title_input.setFont(f)
+        # Auto-save on focus-out / Enter. Hitting Save is for the whole record;
+        # the title is the field people edit and then click straight away from.
+        self._title_input.editingFinished.connect(self._commit_edit)
         root.addWidget(self._title_input)
 
         meta_row = QHBoxLayout()
@@ -618,6 +627,7 @@ class KGDetailPane(QWidget):
         self._tags_input = QLineEdit()
         self._tags_input.setPlaceholderText("space-separated — School::Year3::Cardio")
         attach_tag_completer(self._tags_input, multi=True)
+        self._tags_input.editingFinished.connect(self._commit_edit)
         tag_row.addWidget(self._tags_input, 1)
         root.addLayout(tag_row)
 
@@ -656,6 +666,9 @@ class KGDetailPane(QWidget):
 
         # Actions
         actions_row = QHBoxLayout()
+        # Labels are rewritten by refresh_send_labels() to name the selection
+        # size, because these buttons act on every selected gap, not just the
+        # one on screen.
         self._browse_btn = QPushButton("🔍 Send to AI Browse")
         self._browse_btn.setAutoDefault(False)
         self._browse_btn.clicked.connect(self._send_to_browse)
@@ -1074,6 +1087,56 @@ class KGDetailPane(QWidget):
             kg.pop(legacy, None)
         return kg
 
+    # Everything _gather() owns. Compared against the stored record to decide
+    # whether an unsaved edit is sitting in the pane.
+    _EDITABLE_KEYS = ("title", "type", "status", "dismissed", "tags",
+                      "fields", "resources")
+
+    def flush(self) -> bool:
+        """Persist unsaved edits before the pane is pointed at another KG.
+
+        Without this, retitling a gap and then clicking the next one in the list
+        silently threw the edit away — load() overwrites every widget and
+        nothing had written the old values back, so the title 'reverted' the
+        moment you flicked away and back. Quiet on purpose: no tooltip, no list
+        rebuild (rebuilding mid-selection-change would fight the selection).
+
+        Returns True if something was actually written.
+        """
+        if not self._current:
+            return False
+        try:
+            merged = self._gather()
+        except Exception as e:
+            print(f"[ankisstant] KG flush skipped — couldn't read the pane: {e}")
+            return False
+        # A blank title is a half-finished edit, not an instruction to wipe the
+        # gap's name. Leave the stored one alone.
+        if not merged.get("title"):
+            return False
+        if all(merged.get(k) == self._current.get(k) for k in self._EDITABLE_KEYS):
+            return False
+        try:
+            updated = kg_store.update(self._current["id"], **{
+                k: v for k, v in merged.items() if k != "id"
+            })
+        except Exception as e:
+            print(f"[ankisstant] KG autosave failed: {e}")
+            return False
+        if not updated:
+            return False
+        self._current = updated
+        return True
+
+    def _commit_edit(self) -> None:
+        """editingFinished on the title/tags boxes — save on focus-out or Enter,
+        so the row in the list catches up straight away."""
+        if self.flush():
+            try:
+                self._parent_panel.refresh_row(self._current.get("id"))
+            except Exception as e:
+                print(f"[ankisstant] KG row refresh failed: {e}")
+
     def _save(self) -> None:
         if not self._current:
             return
@@ -1102,67 +1165,38 @@ class KGDetailPane(QWidget):
 
     # ── actions ──────────────────────────────────────────────────────────────
 
+    def refresh_send_labels(self, n: int) -> None:
+        """Say out loud how many gaps the buttons will send, so a multi-select
+        can't silently send one."""
+        if n > 1:
+            self._browse_btn.setText(f"🔍 Send {n} gaps to AI Browse")
+            self._create_btn.setText(f"＋ Send {n} gaps to AI Create")
+        else:
+            self._browse_btn.setText("🔍 Send to AI Browse")
+            self._create_btn.setText("＋ Create card from this KG")
+
+    def _send_ids(self) -> list[str]:
+        """What the send buttons act on: the whole list selection, falling back
+        to the loaded gap. Selecting five gaps and pressing the button used to
+        send only the one the pane happened to be showing."""
+        ids = self._parent_panel._selected_ids()
+        cur = (self._current or {}).get("id")
+        if not ids and cur:
+            ids = [cur]
+        return ids
+
     def _send_to_browse(self) -> None:
-        if not self._current:
-            return
-        # Persist any local edits first so the Browse handoff sees fresh data.
-        self._save()
-        kg_id = self._current.get("id")
-        # Re-read so the queued snapshot includes the edits we just saved.
-        kg = kg_store.get(kg_id) or self._current
-        main = self.window()
-        if not hasattr(main, "browse_queue"):
-            showWarning("Open the KG page from Tools → Ankisstant first.")
-            return
-        if not any(isinstance(q, dict) and q.get("id") == kg_id
-                   for q in main.browse_queue):
-            main.browse_queue.append(kg)
-        if hasattr(main, "refresh_queue_badge"):
-            main.refresh_queue_badge()
-        if hasattr(main, "show_browse_tool"):
-            main.show_browse_tool()
-        # Leave status open — Browse marks it done on a successful Tag & Unsuspend.
-        self._parent_panel.refresh_list(preserve_selection=kg_id)
+        # Persist local edits first so the handoff carries fresh data.
+        self.flush()
+        ids = self._send_ids()
+        if ids:
+            self._parent_panel._bulk_send_to_browse(ids)
 
     def _send_to_create(self) -> None:
-        if not self._current:
-            return
-        self._save()
-        kg = self._current
-        main = self.window()
-        if not hasattr(main, "gap_queue"):
-            showWarning("Open the KG page from Tools → Ankisstant first.")
-            return
-        # Pull supplemental context out of the type-specific fields blob.
-        # `concept` is carried separately (it leads the Missed Questions field
-        # as the knowledge-gap line) so it isn't duplicated inside `notes`.
-        stem_html = kg_store.field(kg, "stem_html")
-        notes_bits = []
-        for k in ("notes", "lo"):
-            v = kg_store.field(kg, k)
-            if v:
-                notes_bits.append(v)
-        images = (kg.get("fields") or {}).get("images") or []
-        item = {
-            "title":       kg.get("title", ""),
-            "kg_id":       kg.get("id", ""),
-            "stem_html":   stem_html or None,
-            "notes":       "\n\n".join(notes_bits) or None,
-            "concept":     kg_store.field(kg, "concept") or "",
-            "explanation": kg_store.field(kg, "explanation") or "",
-            "images":      list(images),
-            "kg_type":     (kg.get("type") or "").lower(),
-            # User-curated tags on the KG flow through to the Create form's tag
-            # field (in addition to any auto-tag), instead of being dropped.
-            "tags":        [t for t in (kg.get("tags") or []) if t],
-        }
-        main.gap_queue.append(item)
-        if hasattr(main, "refresh_queue_badge"):
-            main.refresh_queue_badge()
-        if hasattr(main, "show_create_tool"):
-            main.show_create_tool()
-        # Leave status as open — Create marks it done on a successful Add.
-        self._parent_panel.refresh_list(preserve_selection=kg["id"])
+        self.flush()
+        ids = self._send_ids()
+        if ids:
+            self._parent_panel._bulk_send_to_create(ids)
 
 
 # ── Bulk import modal ──────────────────────────────────────────────────────────
@@ -1216,6 +1250,7 @@ class _BulkImportDialog(QDialog):
         self.setWindowTitle("Bulk import knowledge gaps")
         self.setMinimumSize(560, 480)
         self._build()
+        theme_dialog(self)
 
     def _build(self) -> None:
         root = QVBoxLayout(self)
@@ -1386,8 +1421,9 @@ class _BulkImportDialog(QDialog):
 # ── Main panel ───────────────────────────────────────────────────────────────
 
 _STATUS_FILTERS = [
-    ("open",      "Open"),
-    ("done",      "Done"),
+    ("open",        "Open"),
+    ("in_progress", "In progress"),
+    ("done",        "Done"),
 ]
 
 
@@ -1580,12 +1616,20 @@ class KnowledgeGapsPanel(QWidget):
                 f"QPushButton:hover:!checked {{ background: rgba(127,127,127,0.12); }}"
             )
         else:
+            # The chips that aren't a KG *type* (All, Open, …) have no colour of
+            # their own, so they take the app accent. Under SynapsePro that's its
+            # accent rather than Anki's highlight; the type chips above keep the
+            # user's chosen colours untouched — those are data, not chrome.
+            from ..core import synapse
+            sel_bg = synapse.color("blue", "palette(highlight)")
+            sel_fg = synapse.color("surface", "palette(highlighted-text)")
+            hover = synapse.color("hover_subtle", "rgba(127,127,127,0.12)")
             btn.setStyleSheet(
                 "QPushButton { padding: 2px 10px; font-size: 11px; "
                 "border: 1px solid rgba(127,127,127,0.3); border-radius: 12px; "
                 "background: transparent; }"
-                "QPushButton:checked { background: palette(highlight); color: palette(highlighted-text); }"
-                "QPushButton:hover:!checked { background: rgba(127,127,127,0.12); }"
+                f"QPushButton:checked {{ background: {sel_bg}; color: {sel_fg}; }}"
+                f"QPushButton:hover:!checked {{ background: {hover}; }}"
             )
         btn.clicked.connect(lambda _c=False, k=key: self._set_filter(k))
         row.addWidget(btn)
@@ -1668,7 +1712,12 @@ class KnowledgeGapsPanel(QWidget):
         status = kg.get("status", "open")
         dismissed = bool(kg.get("dismissed", False))
         if f == "open":
-            return status == "open"
+            # Not-yet-done, in one view: sending a gap to Browse must not make it
+            # disappear out from under you. The "In progress" chip isolates the
+            # sent ones when you want just those.
+            return status in ("open", "in_progress")
+        if f == "in_progress":
+            return status == "in_progress"
         if f == "done":
             # By default hide dismissed items even within the Done filter;
             # the "Include dismissed" toggle flips this back on.
@@ -1682,10 +1731,13 @@ class KnowledgeGapsPanel(QWidget):
         return True
 
     def refresh_list(self, preserve_selection: str | None = None) -> None:
+        # Anything unsaved in the detail pane goes to disk before we re-read it,
+        # or the rebuild would show (and then reload) the pre-edit record.
+        self._detail.flush()
         items = kg_store.load_all()
         # Active items above done; newest first within each bucket.
         # Python's sort is stable so we can apply secondary then primary.
-        status_order = {"open": 0, "done": 1}
+        status_order = {"open": 0, "in_progress": 1, "done": 2}
         items.sort(key=lambda k: k.get("created_at", ""), reverse=True)
         items.sort(key=lambda k: status_order.get(k.get("status", "open"), 4))
 
@@ -1715,18 +1767,49 @@ class KnowledgeGapsPanel(QWidget):
 
         if target_row >= 0:
             self._list.setCurrentRow(target_row)
+            # _on_select deliberately skips reloading the gap already in the
+            # pane (so it can't clobber a live edit). A list rebuild means the
+            # record may have changed underneath it, so reload it here.
+            li = self._list.item(target_row)
+            if isinstance(li, _KGListItem):
+                self._detail.load(kg_store.get(li.kg_id))
         elif visible:
             self._list.setCurrentRow(0)
         else:
             self._detail.load(None)
 
+    def refresh_row(self, kg_id: str) -> None:
+        """Re-render one list row from the store. Used after an autosave, where
+        a full refresh_list() would fight the selection that's mid-change."""
+        if not kg_id:
+            return
+        kg = kg_store.get(kg_id)
+        if not kg:
+            return
+        for i in range(self._list.count()):
+            li = self._list.item(i)
+            if isinstance(li, _KGListItem) and li.kg_id == kg_id:
+                li.refresh(kg)
+                return
+
     def _on_select(self) -> None:
+        # Save whatever the pane is holding BEFORE it gets pointed elsewhere —
+        # load() blows the widgets away, so an unsaved title would be lost here.
+        prev_id = (self._detail._current or {}).get("id")
+        if self._detail.flush():
+            self.refresh_row(prev_id)
+
         items = self._list.selectedItems()
         if not items:
             self._detail.load(None)
             return
         li = items[0]
         if not isinstance(li, _KGListItem):
+            return
+        self._detail.refresh_send_labels(len(items))
+        # Extending a selection over the gap that's already loaded must not
+        # reload it — that would revert edits still in the boxes.
+        if prev_id and prev_id == li.kg_id:
             return
         kg = kg_store.get(li.kg_id)
         self._detail.load(kg)
@@ -1747,11 +1830,22 @@ class KnowledgeGapsPanel(QWidget):
         menu = QMenu(self._list)
         n = len(ids)
         label = "1 gap" if n == 1 else f"{n} gaps"
+        # Bulk search runs the whole selection through AI Lecture's engine in one
+        # pass, sized per gap — as opposed to Browse, which works one at a time.
+        bulk = menu.addAction(f"🔍 Bulk search {label}",
+                              lambda: self._bulk_search(ids))
+        bulk.setToolTip(
+            "Search your deck for all of these at once. Each gap is read for how "
+            "broad it is, so a whole-disease gap pulls more cards than a "
+            "one-fact gap, and each gap's matches are tagged under its own tag."
+        )
         menu.addAction(f"Send {label} to Create",
                        lambda: self._bulk_send_to_create(ids))
         menu.addAction(f"Send {label} to Browse",
                        lambda: self._bulk_send_to_browse(ids))
         menu.addSeparator()
+        menu.addAction(f"Mark {label} In progress",
+                       lambda: self._bulk_set_status(ids, "in_progress", dismissed=False))
         menu.addAction(f"Mark {label} Done",
                        lambda: self._bulk_set_status(ids, "done", dismissed=False))
         menu.addAction(f"Dismiss {label}",
@@ -1766,7 +1860,8 @@ class KnowledgeGapsPanel(QWidget):
     def _bulk_set_status(self, ids: list[str], status: str, dismissed: bool) -> None:
         for kid in ids:
             kg_store.update(kid, status=status, dismissed=dismissed)
-        verb = {"done": "Done", "open": "Open"}.get(status, status)
+        verb = {"done": "Done", "open": "Open",
+                "in_progress": "In progress"}.get(status, status)
         if status == "done" and dismissed:
             verb = "Dismissed"
         tooltip(f"{len(ids)} gap(s) → {verb}.")
@@ -1785,12 +1880,39 @@ class KnowledgeGapsPanel(QWidget):
         tooltip(f"Deleted {len(ids)} gap(s).")
         self.refresh_list()
 
+    def _bulk_search(self, ids: list[str]) -> None:
+        """Open the bulk-search popup on this selection. It searches the whole
+        batch in one pass, sized per gap — as opposed to Browse, which works one
+        gap at a time."""
+        try:
+            from .kg.bulk_search import open_bulk_search
+        except Exception as e:
+            print(f"[ankisstant] bulk search unavailable: {e}")
+            showWarning(f"Couldn't open bulk search:\n\n{e}")
+            return
+        kgs = [kg for kg in (kg_store.get(i) for i in ids) if kg]
+        if not kgs:
+            tooltip("Those gaps are no longer in the list.")
+            return
+        open_bulk_search(kgs, parent=self.window())
+
+    def _mark_in_progress(self, ids: list[str]) -> None:
+        """A gap that's been handed to a tool is no longer untouched. Only Open
+        gaps move — sending a Done one somewhere doesn't reopen it."""
+        for kid in ids:
+            try:
+                kg = kg_store.get(kid)
+                if kg and kg.get("status") == "open":
+                    kg_store.update(kid, status="in_progress")
+            except Exception as e:
+                print(f"[ankisstant] couldn't mark {kid} in progress: {e}")
+
     def _bulk_send_to_create(self, ids: list[str]) -> None:
         main = self.window()
         if not hasattr(main, "gap_queue"):
             showWarning("Open the KG page from Tools → Ankisstant first.")
             return
-        queued = 0
+        sent: list[str] = []
         for kid in ids:
             kg = kg_store.get(kid)
             if not kg:
@@ -1812,12 +1934,18 @@ class KnowledgeGapsPanel(QWidget):
                 "kg_type":     (kg.get("type") or "").lower(),
                 "tags":        [t for t in (kg.get("tags") or []) if t],
             })
-            queued += 1
+            sent.append(kid)
         if hasattr(main, "refresh_queue_badge"):
             main.refresh_queue_badge()
-        if queued and hasattr(main, "show_create_tool"):
-            main.show_create_tool()
-        tooltip(f"Queued {queued} gap(s) for Create.")
+        # Deliberately NOT switching tabs: queueing is a filing action, and
+        # being thrown onto another screen mid-triage is what made working
+        # through a list of gaps painful. The nav badge is the feedback, and
+        # the Create panel's own queue view is refreshed in place.
+        if hasattr(main, "refresh_tool_queue"):
+            main.refresh_tool_queue("card_creator")
+        self._mark_in_progress(sent)
+        tooltip(f"Queued {len(sent)} gap(s) for AI Create — see the AI Create "
+                "badge in the sidebar.")
         self.refresh_list()
 
     def _bulk_send_to_browse(self, ids: list[str]) -> None:
@@ -1826,21 +1954,28 @@ class KnowledgeGapsPanel(QWidget):
             showWarning("Open the KG page from Tools → Ankisstant first.")
             return
         existing = {q.get("id") for q in main.browse_queue if isinstance(q, dict)}
-        queued = 0
+        sent: list[str] = []
+        already = 0
         for kid in ids:
             if kid in existing:
+                already += 1
                 continue
             kg = kg_store.get(kid)
             if not kg:
                 continue
             main.browse_queue.append(kg)
             existing.add(kid)
-            queued += 1
+            sent.append(kid)
         if hasattr(main, "refresh_queue_badge"):
             main.refresh_queue_badge()
-        if queued and hasattr(main, "show_browse_tool"):
-            main.show_browse_tool()
-        tooltip(f"Queued {queued} KG(s) for Browse.")
+        # No tab switch — see _bulk_send_to_create.
+        if hasattr(main, "refresh_tool_queue"):
+            main.refresh_tool_queue("browse")
+        self._mark_in_progress(sent)
+        msg = f"Queued {len(sent)} KG(s) for AI Browse — see the AI Browse badge."
+        if already:
+            msg += f" {already} was already in that queue."
+        tooltip(msg)
         self.refresh_list()
 
     # ── add / analyse ────────────────────────────────────────────────────────

@@ -9,6 +9,7 @@ from aqt.qt import (
 )
 
 from ...core.config import tool_config
+from ...core.qt_utils import theme_dialog
 from .stats import add_session, ensure_storage
 
 
@@ -70,6 +71,7 @@ class _SessionDialog(QDialog):
         bb.accepted.connect(self._save)
         bb.rejected.connect(self.reject)
         layout.addWidget(bb)
+        theme_dialog(self)
 
     def _on_source_change(self, _idx: int) -> None:
         is_other = self._source.currentData() == _OTHER

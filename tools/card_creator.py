@@ -40,8 +40,35 @@ from ..core.qt_utils import (
     attach_tag_completer, is_manual_provider, loading, make_help_button,
     make_setup_banner, provider_configured, run_claude_json,
     set_ai_buttons_enabled,
+    theme_dialog,
 )
 from .kg import engine
+from ..core import synapse
+
+
+def _queue_box_css(object_name: str) -> str:
+    """The blue wash that marks a "these are queued" box.
+
+    Under SynapsePro it follows its accent, so the highlight means the same
+    thing but in the shell's own colour. `blue_accent` rather than `blue`
+    because plain `blue` is already the app accent on buttons and nav — two
+    different meanings sharing one colour reads as an accident.
+
+    Built per call, never as a module constant: a constant would freeze the
+    palette at Anki launch and stop tracking theme changes until a restart.
+    """
+    from ..core import synapse
+    bg = synapse.tint("blue_accent", 0.16, "rgba(80,160,255,0.16)")
+    edge = synapse.tint("blue_accent", 0.55, "rgba(80,160,255,0.55)")
+    return (f"QFrame#{object_name} {{ background: {bg}; "
+            f"border: 1px solid {edge}; border-radius: 6px; }}")
+
+
+def _queue_list_css() -> str:
+    from ..core import synapse
+    sel = synapse.tint("blue_accent", 0.30, "rgba(80,160,255,0.30)")
+    return ("QListWidget { background: transparent; border: none; color: palette(text); }"
+            f"QListWidget::item:selected {{ background: {sel}; color: palette(text); }}")
 
 
 NAME = "AI Create"
@@ -50,6 +77,7 @@ NAME = "AI Create"
 # ── prompts ───────────────────────────────────────────────────────────────────
 
 CARD_GEN_SYSTEM = """You generate high-yield Anki cloze cards for a Year 3 Australian medical student.
+
 
 OUTPUT FORMAT
 Return ONLY a JSON array. Each element:
@@ -1272,7 +1300,7 @@ def _prompt_for_pasted_cards(parent):
     v.addWidget(box, 1)
 
     err = QLabel("")
-    err.setStyleSheet("color: #c0392b;")
+    err.setStyleSheet(f"color: {synapse.status_error()};")
     err.setWordWrap(True)
     err.setVisible(False)
     v.addWidget(err)
@@ -1382,8 +1410,7 @@ class CreatorPanel(QWidget):
         self.queue_box.setObjectName("queueBox")
         self.queue_box.setFrameShape(QFrame.Shape.StyledPanel)
         self.queue_box.setStyleSheet(
-            "QFrame#queueBox { background: rgba(80,160,255,0.16); "
-            "border: 1px solid rgba(80,160,255,0.55); border-radius: 6px; }"
+            _queue_box_css("queueBox")
         )
         qbl = QVBoxLayout(self.queue_box)
         qbl.setContentsMargins(10, 8, 10, 8)
@@ -1398,8 +1425,7 @@ class CreatorPanel(QWidget):
         self.queue_list = QListWidget()
         self.queue_list.setMaximumHeight(140)
         self.queue_list.setStyleSheet(
-            "QListWidget { background: transparent; border: none; color: palette(text); }"
-            "QListWidget::item:selected { background: rgba(80,160,255,0.30); color: palette(text); }"
+            _queue_list_css()
         )
         qbl.addWidget(self.queue_list)
 
@@ -1513,7 +1539,7 @@ class CreatorPanel(QWidget):
         self.topic.setMinimumWidth(500)
         tl.addWidget(self.topic)
         warn = QLabel("⚠ Topic-based cards carry more hallucination risk. Always verify.")
-        warn.setStyleSheet("color: #b85c00;")
+        warn.setStyleSheet(f"color: {synapse.status_warn()};")
         tl.addWidget(warn)
         root.addWidget(self.topic_box)
         self.topic_box.setVisible(False)
@@ -1708,16 +1734,14 @@ class CreatorPanel(QWidget):
         self.jobs_box.setObjectName("jobsBox")
         self.jobs_box.setFrameShape(QFrame.Shape.StyledPanel)
         self.jobs_box.setStyleSheet(
-            "QFrame#jobsBox { background: rgba(80,160,255,0.16); "
-            "border: 1px solid rgba(80,160,255,0.55); border-radius: 6px; }"
+            _queue_box_css("jobsBox")
         )
         jbl = QVBoxLayout(self.jobs_box)
         jbl.setContentsMargins(10, 8, 10, 8)
         jbl.setSpacing(5)
 
         _job_list_qss = (
-            "QListWidget { background: transparent; border: none; color: palette(text); }"
-            "QListWidget::item:selected { background: rgba(80,160,255,0.30); color: palette(text); }"
+            _queue_list_css()
         )
 
         self.inprogress_header = QLabel("In progress")
@@ -3435,7 +3459,7 @@ class _CardRow(QFrame):
 
         if dup_msg:
             dup = QLabel(f"⚠ {dup_msg}")
-            dup.setStyleSheet("color: #b85c00; font-size: 11px;")
+            dup.setStyleSheet(f"color: {synapse.status_warn()}; font-size: 11px;")
             dup.setWordWrap(True)
             v.addWidget(dup)
 
@@ -3767,6 +3791,7 @@ class _SlideGalleryDialog(QDialog):
         self.setWindowTitle("Choose slide images")
         self.setMinimumSize(720, 560)
         self._build(set(selected or []))
+        theme_dialog(self)
 
     def _build(self, selected: set):
         root = QVBoxLayout(self)
@@ -3871,6 +3896,7 @@ class ReviewDialog(QDialog):
         self.setWindowTitle("Review proposed cards")
         self.setMinimumSize(800, 700)
         self._build()
+        theme_dialog(self)
 
     def _build(self):
         root = QVBoxLayout(self)

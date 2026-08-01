@@ -282,12 +282,27 @@ def build_card_html(platforms: list, cfg: dict) -> str:
         "});})();</script>"
     ) if first_platform_key else ""
 
-    return f"""
+    # The SynapsePro bridge's :root vars, so the two `--ank-*` uses below can
+    # resolve. Empty string without SynapsePro, and then every fallback applies.
+    from ...core import synapse
+    syn_vars = synapse.css_vars()
+
+    return f"""{syn_vars}
 <div style="display:flex;justify-content:center;width:100%;">
 <style>
+  /* DELIBERATELY LIGHT-TOUCH. This fragment is injected into Anki's own deck
+     browser, not into a SynapsePro panel, so it should sit on the deck page
+     rather than fight it: the card surface and the buttons stay on Anki's
+     --canvas / --button-bg, and only the borders pick up SynapsePro's, which is
+     enough to read as the same product without looking pasted on.
+
+     The contribution ramp below (#9be9a8 -> #216e39) is NOT themed, on purpose.
+     It's a 5-step sequential scale and SynapsePro has a single `green` token
+     with no scale, so recolouring from it would flatten the density read —
+     which is the entire point of the chart. */
   .ec-card {{
     background: var(--canvas, #fff);
-    border: 1px solid rgba(127,127,127,0.2);
+    border: 1px solid var(--ank-border-soft, rgba(127,127,127,0.2));
     border-radius: 10px;
     padding: 12px 16px 10px;
     margin: 10px auto 18px;
@@ -357,7 +372,7 @@ def build_card_html(platforms: list, cfg: dict) -> str:
   .ec-btns {{ display: flex; gap: 6px; align-items: center; }}
   .ec-btn {{
     font-size: 12px; padding: 4px 12px; border-radius: 6px;
-    border: 1px solid rgba(127,127,127,0.3);
+    border: 1px solid var(--ank-border, rgba(127,127,127,0.3));
     background: var(--button-bg, #f6f8fa);
     color: inherit; cursor: pointer; font-family: inherit; font-weight: 500;
   }}

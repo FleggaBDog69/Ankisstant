@@ -31,6 +31,7 @@ from ..core.config import tool_config, tool_model_for
 from ..grounding import guidelines as grounding
 from . import card_creator as cc
 from . import quality_pass as qp
+from ..core import synapse
 
 
 NAME = "Update by Tag"
@@ -382,11 +383,12 @@ class UpdateByTagPanel(QWidget):
         n = len(self._note_ids)
         if n == 0:
             self._found_lbl.setText("No notes matched.")
-            self._found_lbl.setStyleSheet("color: #c05050;")
+            self._found_lbl.setStyleSheet(f"color: {synapse.status_error('#c05050')};")
             self._run_btn.setEnabled(False)
         else:
             self._found_lbl.setText(f"Found {n} note{'s' if n != 1 else ''} — ready to copy.")
-            self._found_lbl.setStyleSheet("color: #3a9e6a; font-weight: 600;")
+            self._found_lbl.setStyleSheet(
+                f"color: {synapse.status_ok()}; font-weight: 600;")
             self._run_btn.setEnabled(bool(self._profiles()))
 
     # -- run --
@@ -497,7 +499,8 @@ class UpdateByTagPanel(QWidget):
         lbl = QLabel(f"{'✓' if ok else '✗'}  note {nid} — {detail}")
         lbl.setWordWrap(True)
         lbl.setStyleSheet(
-            f"font-size: 10px; padding: 1px 3px; color: {'#3a9e6a' if ok else '#c05050'};"
+            "font-size: 10px; padding: 1px 3px; color: "
+            f"{synapse.status_ok() if ok else synapse.status_error('#c05050')};"
         )
         self._results_layout.addWidget(lbl)
 

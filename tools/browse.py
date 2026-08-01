@@ -31,6 +31,31 @@ from . import autotag
 from .kg import engine
 
 
+def _queue_box_css(object_name: str) -> str:
+    """The blue wash that marks a "these are queued" box.
+
+    Under SynapsePro it follows its accent, so the highlight means the same
+    thing but in the shell's own colour. `blue_accent` rather than `blue`
+    because plain `blue` is already the app accent on buttons and nav — two
+    different meanings sharing one colour reads as an accident.
+
+    Built per call, never as a module constant: a constant would freeze the
+    palette at Anki launch and stop tracking theme changes until a restart.
+    """
+    from ..core import synapse
+    bg = synapse.tint("blue_accent", 0.16, "rgba(80,160,255,0.16)")
+    edge = synapse.tint("blue_accent", 0.55, "rgba(80,160,255,0.55)")
+    return (f"QFrame#{object_name} {{ background: {bg}; "
+            f"border: 1px solid {edge}; border-radius: 6px; }}")
+
+
+def _queue_list_css() -> str:
+    from ..core import synapse
+    sel = synapse.tint("blue_accent", 0.30, "rgba(80,160,255,0.30)")
+    return ("QListWidget { background: transparent; border: none; color: palette(text); }"
+            f"QListWidget::item:selected {{ background: {sel}; color: palette(text); }}")
+
+
 NAME = "AI Browse"
 
 
@@ -55,11 +80,21 @@ SEARCH_TERMS_SYSTEM = (
     "are 'psoriasis IL-17', 'psoriasis Th17', 'psoriasis secukinumab', "
     "'psoriasis IL-23' — far more likely to hit than 'cell-mediated immunity' or "
     "'pathogenesis T cells', which are prose, not card text.\n\n"
-    "EXPAND SHORTHAND — AND KEEP BOTH FORMS:\n"
-    "If the input uses loose or informal shorthand, map it to the formal/canonical "
-    "term AND keep the short form too, since the deck may use either (e.g. 'Th1' → "
-    "also 'T helper', plus the relevant cytokines; 'EM' → 'erythema multiforme'). "
-    "Translate the user's casual wording into the precise terminology a deck uses.\n\n"
+    "ANCHOR ON THE FULL NAME THE CARD USES — NOT THE ABBREVIATION:\n"
+    "The input is often casual shorthand ('sxs pd', 'ms flare'). Anki matches "
+    "literal tokens; it will NOT expand 'PD' to 'Parkinson' or know 'sxs' means "
+    "'symptoms'. Cards spell disease and anatomy names OUT. On a real deck "
+    "'Parkinson' is on 343 cards but the bare token 'PD' on 24 — an anchor of "
+    "'PD ...' misses ~93% of the deck; likewise 'MSA' (2) vs 'Multiple System "
+    "Atrophy' (5), 'CN3' (2) vs 'oculomotor'/'CN III'/'third nerve' (dozens). So "
+    "translate the input to the full clinical name and anchor THERE: 'sxs pd' → "
+    "'Parkinson symptoms', 'Parkinson clinical features'. A short disease/anatomy "
+    "abbreviation may appear ONLY as an EXTRA term, never the sole anchor (each "
+    "term is one AND-query, so 'both forms' means TWO terms). Keep a token "
+    "verbatim only where the deck prints it that way: molecular/receptor/genetic "
+    "tokens (IL-17, Th17, TNF, HLA-B27, D2) and universally-abbreviated entities "
+    "(HIV, COPD, ACE). Prefer the common clinical word over the technical synonym "
+    "('dilated pupil' not 'mydriasis').\n\n"
     "DECOMPOSITION:\n"
     "If the input combines MORE THAN ONE distinct concept — joined by 'and', "
     "commas, semicolons, '=', 'causes', 'associated with', or a chain of reasoning "
@@ -85,6 +120,7 @@ SEARCH_TERMS_SYSTEM = (
     "quantity.\n\n"
     "Return ONLY the JSON array of strings. No prose, no quotes around the array."
 )
+
 
 RESCOPE_SYSTEM = (
     "You regenerate Anki search terms for a medical student. You will be given a topic, "
@@ -341,6 +377,31 @@ class BrowsePanel(QWidget):
         self._rebuild_queue_view()
         tooltip(f"Removed: {self._kg_title(removed)[:60]}")
 
+    def _on_bulk_search(self) -> None:
+        """Hand the whole Browse queue to the bulk-search popup.
+
+        The queue holds KG snapshots taken when they were queued; re-read each
+        from the store so the popup works on current titles/notes/tags rather
+        than a stale copy, and silently drop any that have since been deleted."""
+        queue = getattr(self._main_window, "browse_queue", None) or []
+        if not queue:
+            tooltip("Browse queue is empty — send some gaps over from the "
+                    "Knowledge Gaps page first.")
+            return
+        from .kg import store as kg_store
+        from .kg.bulk_search import open_bulk_search
+        fresh = []
+        for q in queue:
+            if not isinstance(q, dict):
+                continue
+            kg = kg_store.get(q.get("id") or "") or q
+            if str(kg.get("title") or "").strip():
+                fresh.append(kg)
+        if not fresh:
+            tooltip("Those queued gaps are no longer in your KG list.")
+            return
+        open_bulk_search(fresh, parent=self._main_window or self)
+
     def _on_clear_queue(self) -> None:
         queue = getattr(self._main_window, "browse_queue", None) or []
         if not queue:
@@ -406,8 +467,7 @@ class BrowsePanel(QWidget):
         self.queue_box.setObjectName("browseQueueBox")
         self.queue_box.setFrameShape(QFrame.Shape.StyledPanel)
         self.queue_box.setStyleSheet(
-            "QFrame#browseQueueBox { background: rgba(80,160,255,0.16); "
-            "border: 1px solid rgba(80,160,255,0.55); border-radius: 6px; }"
+            _queue_box_css("browseQueueBox")
         )
         qbl = QVBoxLayout(self.queue_box)
         qbl.setContentsMargins(10, 8, 10, 8)
@@ -420,8 +480,7 @@ class BrowsePanel(QWidget):
         self.queue_list = QListWidget()
         self.queue_list.setMaximumHeight(120)
         self.queue_list.setStyleSheet(
-            "QListWidget { background: transparent; border: none; color: palette(text); }"
-            "QListWidget::item:selected { background: rgba(80,160,255,0.30); color: palette(text); }"
+            _queue_list_css()
         )
         qbl.addWidget(self.queue_list)
         queue_btn_row = QHBoxLayout()
@@ -429,6 +488,19 @@ class BrowsePanel(QWidget):
         self.queue_remove_btn.setAutoDefault(False)
         self.queue_remove_btn.clicked.connect(self._on_remove_selected_kg)
         queue_btn_row.addWidget(self.queue_remove_btn)
+        # Bulk search — the whole queue at once, in a popup. Browse proper stays
+        # a single-topic surface; this is the occasional batch pass, and it runs
+        # on AI Lecture's engine (relevance judge, per-gap budget) rather than
+        # looping this panel's raw term search.
+        self.queue_bulk_btn = QPushButton("⚡ Bulk search all…")
+        self.queue_bulk_btn.setAutoDefault(False)
+        self.queue_bulk_btn.setToolTip(
+            "Search your deck for every queued gap in one pass. Each gap is read "
+            "for how broad it is, so a whole-disease gap pulls more cards than a "
+            "one-fact gap, and each gap's matches get their own tag."
+        )
+        self.queue_bulk_btn.clicked.connect(self._on_bulk_search)
+        queue_btn_row.addWidget(self.queue_bulk_btn)
         queue_btn_row.addStretch(1)
         self.queue_load_btn = QPushButton("Load next →")
         self.queue_load_btn.setAutoDefault(False)

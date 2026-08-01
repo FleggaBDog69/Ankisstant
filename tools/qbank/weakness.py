@@ -100,7 +100,19 @@ def top_topics(items: list[dict], since_days: int, n: int) -> list[tuple]:
 # ── UI ─────────────────────────────────────────────────────────────────────────
 
 # Bar colour — a warm amber that reads on both light and dark themes.
-_BAR_CSS = "background:#f59e0b;border-radius:3px;"
+#
+# A function, not a module constant. A constant would be evaluated at import
+# time, i.e. once at Anki launch, and would then hold whatever colour SynapsePro
+# was on at that moment for the rest of the session — the theme switch would
+# appear to do nothing until a restart. Every colour the bridge touches has to
+# be resolved at paint time.
+#
+# SynapsePro has no amber token. `red` is the nearest thing that still reads as
+# "this is the problem area", which is what the bar is for; the amber-vs-red
+# gradation is lost, and that's a known compromise (see SYNAPSE_BRIDGE.md).
+def _bar_css() -> str:
+    from ...core import synapse
+    return f"background:{synapse.color('red', '#f59e0b')};border-radius:3px;"
 # Max bar width in px (mapped to the largest count in view).
 _BAR_MAX = 200
 
@@ -252,7 +264,7 @@ class WeaknessSection(QWidget):
         bar = QFrame()
         width = max(6, int(_BAR_MAX * count / max_count)) if max_count else 6
         bar.setFixedSize(width, 12)
-        bar.setStyleSheet(_BAR_CSS)
+        bar.setStyleSheet(_bar_css())
         row.addWidget(bar)
 
         cnt = QLabel(f"<b>{count}</b>")

@@ -37,6 +37,7 @@ from aqt.qt import (
 )
 
 from ..core import log
+from ..core.qt_utils import theme_dialog
 
 # A descriptive, browser-shaped User-Agent. Wikimedia's upload host (and a few
 # others) return 403 for terse bot-looking agents — that rejection hit BOTH the
@@ -388,6 +389,7 @@ class ImageSearchDialog(QDialog):
         self._paths: list[str] = []
         self._closed = False
         self._build(initial_query)
+        theme_dialog(self)
 
     def _build(self, initial_query: str):
         root = QVBoxLayout(self)
