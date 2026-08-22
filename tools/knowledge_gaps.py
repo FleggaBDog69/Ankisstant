@@ -571,16 +571,22 @@ class _GroupEditDialog(QDialog):
         form.addWidget(self._seg, 2, 1)
         root.addLayout(form)
 
-        self._levels = QCheckBox(
-            "Add the gap's system / subsystem / topic underneath")
-        self._levels.setChecked(saved["levels"] if saved else True)
-        self._levels.setStyleSheet("font-size: 11px;")
+        form.addWidget(QLabel("Under it"), 3, 0)
+        self._levels = QComboBox()
+        for key in ("full", "sub", "topic", "none"):
+            self._levels.addItem(autotag.GROUP_LEVEL_LABELS[key], key)
+        want = autotag.normalise_levels(saved["levels"]) if saved else "full"
+        ix = self._levels.findData(want)
+        self._levels.setCurrentIndex(ix if ix >= 0 else 0)
         self._levels.setToolTip(
-            "On: !!Curtanki::Year_3::SRS::02::Repro::Penis::Peyronie_disease\n"
-            "Off: every card in this group gets exactly the path above, and "
-            "nothing after it."
+            "How much of the gap's classification goes under the path.\n\n"
+            "All three levels are usually one too many for something already as "
+            "narrow as an SRS block or a PBL case — the block IS the system. "
+            "But dropping them entirely puts every gap in the batch on one node "
+            "with nothing to tell them apart, so “Topic only” is the middle "
+            "that usually fits."
         )
-        root.addWidget(self._levels)
+        form.addWidget(self._levels, 3, 1)
 
         self._preview = QLabel("")
         self._preview.setStyleSheet("color: gray; font-size: 11px;")
@@ -596,7 +602,7 @@ class _GroupEditDialog(QDialog):
         self._name.textChanged.connect(self._refresh_preview)
         self._seg.textChanged.connect(self._refresh_preview)
         self._where.currentIndexChanged.connect(self._refresh_preview)
-        self._levels.toggled.connect(self._refresh_preview)
+        self._levels.currentIndexChanged.connect(self._refresh_preview)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -610,6 +616,17 @@ class _GroupEditDialog(QDialog):
     def _absolute(self) -> bool:
         return bool(self._where.currentData())
 
+    def _levels_mode(self) -> str:
+        return str(self._levels.currentData() or "full")
+
+    def _tail(self) -> str:
+        """The example tail shown in the preview, so the shape of the finished
+        tag is on screen rather than described."""
+        return {"full": "::System::Subsystem::Topic",
+                "sub": "::Subsystem::Topic",
+                "topic": "::Topic",
+                "none": ""}[self._levels_mode()]
+
     def _refresh_preview(self, *_a) -> None:
         name = self._name.text().strip()
         typed = self._seg.text().strip()
@@ -618,10 +635,10 @@ class _GroupEditDialog(QDialog):
         absolute = self._absolute()
         base = (auto_tag_base() or "").rstrip(":")
         esc = _html.escape
+        tail = self._tail()
 
-        self._levels.setVisible(absolute)
         self._seg.setPlaceholderText(
-            "e.g. !!Curtanki::Year_3::SRS::02" if absolute
+            "e.g. !!Curtanki::Year_3::SRS::02::KGs" if absolute
             else (derived or "(from the name)"))
 
         if not name:
@@ -631,10 +648,10 @@ class _GroupEditDialog(QDialog):
                 self._preview.setText(
                     "Type the full tag path this group should own — start "
                     "typing and it will complete from your existing tags.")
-            elif self._levels.isChecked():
+            elif tail:
                 self._preview.setText(
-                    f"Tags land under <code>{esc(path)}</code>::System::"
-                    "Subsystem::Topic<br>&nbsp;&nbsp;(its own branch"
+                    f"Tags land under <code>{esc(path + tail)}</code>"
+                    "<br>&nbsp;&nbsp;(its own branch"
                     + (f" — <b>not</b> under {esc(base)}" if base else "") + ")")
             else:
                 self._preview.setText(
@@ -649,7 +666,7 @@ class _GroupEditDialog(QDialog):
             source = "your override" if path else "derived from the name"
             self._preview.setText(
                 f"Tags land under <code>{esc(base)}::*::"
-                f"{esc(path or derived)}</code> &nbsp;({source})")
+                f"{esc((path or derived) + tail)}</code> &nbsp;({source})")
 
         msgs = []
         if not name:
@@ -669,13 +686,16 @@ class _GroupEditDialog(QDialog):
 
     def values(self) -> tuple[str, dict | None]:
         """(name, override) — the override is None when the group should keep
-        deriving its segment from the name and filing under the base."""
+        deriving its segment from the name, file under the base, and take all
+        three levels. Anything else is an override, INCLUDING a depth change on
+        its own: "derived path but topic only" is a real answer."""
         path = autotag.clean_segment_path(self._seg.text().strip())
         name = self._name.text().strip()
-        if not path:
+        mode = self._levels_mode()
+        if not path and not self._absolute() and mode == "full":
             return name, None
-        return name, {"path": path, "absolute": self._absolute(),
-                      "levels": bool(self._levels.isChecked())}
+        return name, {"path": path or autotag.derive_group_segment(name),
+                      "absolute": self._absolute(), "levels": mode}
 
 
 class _GroupManagerDialog(QDialog):
@@ -785,15 +805,15 @@ class _GroupManagerDialog(QDialog):
                 it = QTableWidgetItem(text)
                 if c == 1:
                     ov = autotag.group_override(n)
-                    if ov and ov["absolute"]:
-                        it.setToolTip(
-                            "Its own branch — tagged outside the auto-tag base."
-                            + ("" if ov["levels"] else
-                               " Exact tag; no levels underneath."))
-                        it.setText(text + "  (own branch)")
-                    elif ov:
-                        it.setToolTip("Overridden — not derived from the name.")
-                        it.setText(text + "  (set)")
+                    if ov:
+                        depth = autotag.GROUP_LEVEL_LABELS.get(
+                            ov["levels"], ov["levels"])
+                        where = ("Its own branch — tagged outside the auto-tag "
+                                 "base." if ov["absolute"]
+                                 else "Overridden — not derived from the name.")
+                        it.setToolTip(f"{where}\nUnder it: {depth}")
+                        it.setText(text + ("  (own branch)" if ov["absolute"]
+                                           else "  (set)"))
                 if c == 0:
                     it.setToolTip(
                         f"Last touched: {st['last'][:10] or 'unknown'}")

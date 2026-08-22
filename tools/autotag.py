@@ -217,10 +217,37 @@ def clean_segment_path(text: str) -> str:
 #   "Cardio::SRS4"                                      relative segment
 #   {"path": "...", "absolute": bool, "levels": bool}    the full form
 #
-# `levels` (absolute only) says whether the gap's system/subsystem/topic are
-# appended underneath the path, or whether the path IS the whole tag.
+# `levels` says HOW MUCH of the gap's system/subsystem/topic goes underneath the
+# path. Not a yes/no, because both extremes are wrong for a real batch: the full
+# three levels are one too many under something already as narrow as an SRS
+# block or a PBL case (the block IS the system), while none at all dumps every
+# gap in the batch onto one node with no leaf to tell them apart.
 
-_PLAN_DEFAULTS = {"path": "", "absolute": False, "levels": True}
+GROUP_LEVEL_MODES = {
+    "full":  ("system", "subsystem", "topic"),
+    "sub":   ("subsystem", "topic"),
+    "topic": ("topic",),
+    "none":  (),
+}
+GROUP_LEVEL_LABELS = {
+    "full":  "System · Subsystem · Topic",
+    "sub":   "Subsystem · Topic",
+    "topic": "Topic only",
+    "none":  "Nothing — the path is the whole tag",
+}
+
+_PLAN_DEFAULTS = {"path": "", "absolute": False, "levels": "full"}
+
+
+def normalise_levels(value) -> str:
+    """A levels setting -> one of GROUP_LEVEL_MODES.
+
+    Accepts the bool this was first written as: True meant "append all three",
+    False meant "append nothing", and both keep meaning exactly that."""
+    if isinstance(value, bool):
+        return "full" if value else "none"
+    mode = str(value or "").strip().lower()
+    return mode if mode in GROUP_LEVEL_MODES else "full"
 
 
 def group_tag_overrides() -> dict:
@@ -249,7 +276,7 @@ def normalise_override(raw) -> dict | None:
             return None
         return {"path": path,
                 "absolute": bool(raw.get("absolute")),
-                "levels": bool(raw.get("levels", True))}
+                "levels": normalise_levels(raw.get("levels", "full"))}
     return None
 
 
@@ -280,8 +307,19 @@ def group_tag_plan(name: str, *, path: str | None = None,
     if absolute is not None:
         plan = dict(plan, absolute=bool(absolute))
     if levels is not None:
-        plan = dict(plan, levels=bool(levels))
+        plan = dict(plan, levels=normalise_levels(levels))
     return plan
+
+
+def trim_levels(levels: dict | None, mode: str) -> dict:
+    """The {system, subsystem, topic} dict cut down to `mode`'s levels.
+
+    Dropped levels are blanked rather than removed, so they collapse out of the
+    template the same way an unclassified gap's empty level always has."""
+    keep = GROUP_LEVEL_MODES.get(normalise_levels(mode), GROUP_LEVEL_MODES["full"])
+    levels = levels or {}
+    return {k: (levels.get(k, "") if k in keep else "")
+            for k in ("system", "subsystem", "topic")}
 
 
 def group_segment_override(name: str) -> str:
@@ -380,7 +418,12 @@ def tag_from_levels(levels: dict | None, kg_type_key: str | None = None,
       RELATIVE  {base}::{type}::{group}::{system}::{subsystem}::{topic}
       ABSOLUTE  {group path}::{system}::{subsystem}::{topic}   — the base and
                 the type segment are not used, because the group owns its own
-                branch. With `levels` off, the path IS the tag.
+                branch.
+
+    How many of the three trailing levels appear is the group's `levels` mode
+    (see GROUP_LEVEL_MODES); "none" means the path is the whole tag. It applies
+    to both shapes, and defaults to "full" — which is what every caller rendered
+    before the mode existed.
 
     Returns '' when unusable (nothing to build from, or it collapses to just the
     base). Pass either a type key OR the resolved type_meta dict.
@@ -398,21 +441,23 @@ def tag_from_levels(levels: dict | None, kg_type_key: str | None = None,
         plan = dict(_PLAN_DEFAULTS, **{k: v for k, v in group_plan.items()
                                        if k in _PLAN_DEFAULTS})
         plan["path"] = clean_segment_path(plan["path"])
+        plan["levels"] = normalise_levels(plan["levels"])
     elif group_seg is not None:
         plan = dict(_PLAN_DEFAULTS, path=clean_segment_path(group_seg))
     else:
         plan = group_tag_plan(group)
 
-    levels = levels or {}
+    kept = trim_levels(levels, plan["levels"])
+    any_kept = any(str(v).strip() for v in kept.values())
 
     # ── absolute: the group's branch, standing on its own ────────────────────
     if plan["absolute"] and plan["path"]:
-        if not plan["levels"] or not levels:
+        if not any_kept:
             return plan["path"]
         # Rendered through the SAME template as everything else, with the path
         # standing in for the base and no type segment — so a customised
         # template still shapes the levels the way the user set it up.
-        tag = format_hierarchical_tag(plan["path"], levels, type_seg="",
+        tag = format_hierarchical_tag(plan["path"], kept, type_seg="",
                                       group_seg="")
         return tag or plan["path"]
 
@@ -424,7 +469,7 @@ def tag_from_levels(levels: dict | None, kg_type_key: str | None = None,
         type_seg = type_meta.get("name") or type_meta.get("key") or ""
     else:
         type_seg, _enabled = kg_type_info((kg_type_key or default_type_key()))
-    tag = format_hierarchical_tag(base, levels, type_seg=type_seg,
+    tag = format_hierarchical_tag(base, kept, type_seg=type_seg,
                                   group_seg=plan["path"])
     if not tag or tag == base:
         return ""

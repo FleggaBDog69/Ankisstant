@@ -286,12 +286,15 @@ DEFAULTS: dict = {
             #       a segment INSIDE the auto-tag base:
             #       !!Fleg::KG::Cardio::SRS4::System::Sub::Topic
             #
-            #   "SRS 2": {"path": "!!Curtanki::Year_3::SRS::02",
-            #             "absolute": True, "levels": True}
+            #   "SRS 2": {"path": "!!Curtanki::Year_3::SRS::02::KGs",
+            #             "absolute": True, "levels": "topic"}
             #       the group owns its own branch — the base and the type
-            #       segment are not used at all. `levels` says whether the
-            #       gap's system/subsystem/topic go underneath the path or
-            #       whether the path IS the whole tag.
+            #       segment are not used at all. `levels` says how much of the
+            #       gap's classification goes underneath: "full" (system ·
+            #       subsystem · topic), "sub", "topic", or "none" (the path is
+            #       the whole tag). True/False are still read as full/none.
+            #       All three levels are usually one too many under something
+            #       already as narrow as an SRS block or a PBL case.
             #
             # Absolute exists because one global base is the wrong shape for a
             # collection that already has its own tag tree: without it, the
