@@ -748,6 +748,111 @@ def merge(batch_results: list[list[LearningPoint]]) -> list[LearningPoint]:
     return out
 
 
+TWIN_SYSTEM = (
+    "You are given a numbered list of learning points extracted from one "
+    "medical lecture. Some are TWINS: they state the SAME fact in different "
+    "words — 'Cushing reflex is hypertension, bradycardia and irregular "
+    "respiration' and 'Cushing triad: raised blood pressure, bradycardia, "
+    "abnormal breathing' are one point written twice.\n\n"
+    "Twins are harmful downstream: each one searches the student's deck for "
+    "the same cards, and the pair is then allocated two slots of a fixed card "
+    "budget to teach one fact.\n\n"
+    "Group ONLY points that state the same fact. Points about the same "
+    "disease, drug or structure but DIFFERENT facts — one on mechanism, one on "
+    "side effects; one on diagnosis, one on treatment; two different "
+    "herniation syndromes; a definition and its clinical consequence — are NOT "
+    "twins. A point that is strictly more specific than another is NOT its "
+    "twin. When unsure, do NOT group: a wrong merge silently deletes a fact "
+    "the student needed, and nothing downstream can recover it.\n\n"
+    'OUTPUT — a JSON object {"twins": [[id, id, ...], ...]}, each inner list a '
+    "group of point ids that state one fact. Include only groups of two or "
+    'more. If there are none, return {"twins": []}. Return ONLY the JSON. No '
+    "prose, no code fences."
+)
+
+
+def ai_collapse_twins(points: list[LearningPoint], *,
+                      model: str | None = None) -> int:
+    """Second, semantic tier of twin collapsing — the one merge() can't do.
+
+    merge() fuses points by significant-word overlap, which catches rewordings
+    and stops well short of synonym paraphrases: "irregular respiration" and
+    "abnormal breathing" overlap at 0.17, and a threshold low enough to fuse
+    them would fuse genuinely different facts. Those need a judge.
+
+    Same shape and same contract as matcher.ai_dedupe_selected, which does this
+    tier for cards: one cheap call over a small list, FAILS OPEN (a failed or
+    unparseable reply merges nothing), and mutates in place. The survivor of
+    each group is the EARLIEST point in document order, so the lecture's own
+    ordering is preserved and the fold direction is predictable; its refs and
+    terms absorb the others'.
+
+    Must NOT run on the main thread — it makes an AI call. Returns the number of
+    points removed. `points` is mutated in place.
+    """
+    if len(points) < 2:
+        return 0
+    lines = [f"{i}: {p.concept}" for i, p in enumerate(points)]
+    try:
+        reply = core_api.ask_claude_json(
+            prompt="LEARNING POINTS:\n" + "\n".join(lines),
+            system=TWIN_SYSTEM,
+            max_tokens=200 + 8 * len(points),
+            model=model,
+            show_errors=False,
+        )
+    except core_api.ClaudeCancelled:
+        raise
+    except Exception as e:
+        log.warn(f"lecture: AI twin pass failed, keeping all points: {e}")
+        return 0
+
+    if not isinstance(reply, dict):
+        return 0
+    groups = reply.get("twins")
+    if not isinstance(groups, list):
+        return 0
+
+    drop: set[int] = set()
+    merged = 0
+    for group in groups:
+        if not isinstance(group, list):
+            continue
+        idxs = sorted({i for i in (_as_index(g, len(points)) for g in group)
+                       if i is not None and i not in drop})
+        if len(idxs) < 2:
+            continue
+        keeper = points[idxs[0]]
+        for i in idxs[1:]:
+            other = points[i]
+            log.info(f"lecture: AI merged twin points — kept "
+                     f"'{keeper.concept[:70]}', folded in '{other.concept[:70]}'")
+            keeper.refs = sorted(set(keeper.refs) | set(other.refs))
+            keeper.note_refs = sorted(set(keeper.note_refs) | set(other.note_refs))
+            for t in other.terms:
+                if t.lower() not in {x.lower() for x in keeper.terms}:
+                    keeper.terms.append(t)
+            drop.add(i)
+            merged += 1
+
+    if merged:
+        points[:] = [p for i, p in enumerate(points) if i not in drop]
+        log.info(f"lecture: AI twin pass merged {merged} point(s) — "
+                 f"{len(points)} remain")
+    return merged
+
+
+def _as_index(value, n: int) -> int | None:
+    """Coerce one id from the model's reply to a valid point index, or None.
+    The model is asked for the numbers it was shown; anything else is dropped
+    rather than trusted."""
+    try:
+        i = int(value)
+    except (TypeError, ValueError):
+        return None
+    return i if 0 <= i < n else None
+
+
 def enforce_companion_cap(points: list[LearningPoint], cap: int) -> list[LearningPoint]:
     """Hard-trim points drawn from the user's notes down to `cap`.
 

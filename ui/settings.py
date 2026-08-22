@@ -3411,6 +3411,20 @@ class _LectureTab(QWidget):
             "extracts everything the lecture says. Also on the tool's panel.")
         layout.addRow("No low-yield:", self._high_yield)
 
+        self._twin_pass = QCheckBox(
+            "Merge learning points that say the same thing in different words")
+        self._twin_pass.setChecked(
+            bool(self._lec_cfg.get("ai_twin_pass",
+                                   DEFAULTS["tools"]["lecture"]["ai_twin_pass"])))
+        self._twin_pass.setToolTip(
+            "On by default. One cheap AI call over the extracted points, "
+            "merging any pair that states one fact twice.\n\nWithout it a twin "
+            "pair searches your deck for the same cards and then takes two "
+            "slots of the note cap to teach one thing. Fails open — if the call "
+            "fails, nothing is merged.\n\nRuns once per extraction and is cached "
+            "with it, so a re-run of the same lecture costs nothing.")
+        layout.addRow("Merge twins:", self._twin_pass)
+
         self._tag_root = QLineEdit(str(self._lec_cfg.get("tag_root", d["tag_root"])))
         self._tag_root.setMinimumWidth(420)
         self._tag_root.setPlaceholderText("lecture")
@@ -3441,6 +3455,7 @@ class _LectureTab(QWidget):
             "use_vision":     self._use_vision.isChecked(),
             "use_local_ocr":  self._use_ocr.isChecked(),
             "high_yield_only": self._high_yield.isChecked(),
+            "ai_twin_pass":   self._twin_pass.isChecked(),
             "tag_root":       self._tag_root.text().strip() or "lecture",
             "audit_tag":      self._audit_tag.text().strip(),
         }

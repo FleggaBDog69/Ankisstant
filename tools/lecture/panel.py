@@ -597,6 +597,27 @@ def run_pipeline(path: str, cfg: dict, *, report, cancel_ev: threading.Event,
                     "usable for this file. It may be unreadable, or empty of "
                     "testable content."
                 )
+            # Semantic twin pass. merge() has already fused rewordings by word
+            # overlap; this catches the pair that says one thing in two
+            # vocabularies, which no local threshold can separate from two
+            # genuinely different facts.
+            #
+            # Placed BEFORE the cache write on purpose: the collapse is paid for
+            # once per extraction, and a cached run inherits the result for free
+            # rather than re-judging the same points every time.
+            twin_model = tool_model_for("lecture_relevance")
+            if bool(cfg.get("ai_twin_pass", True)) and twin_model:
+                _check()
+                report("Checking for points that say the same thing…", 32)
+                try:
+                    extractor.ai_collapse_twins(points, model=twin_model)
+                except (Cancelled, core_api.ClaudeCancelled):
+                    raise
+                except Exception as e:
+                    # Fail open, like every other optional pass here: worse
+                    # points beat no lecture.
+                    log.warn(f"lecture: twin pass skipped: {e}")
+
             # Only cache a real, non-empty extraction we just paid for.
             cache.store(ck, points)
 

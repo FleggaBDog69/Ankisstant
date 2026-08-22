@@ -547,6 +547,17 @@ DEFAULTS: dict = {
             # TEST, not merely something a lecturer said. Off restores the raw
             # extract. Part of the extraction cache key (like use_vision).
             "high_yield_only": True,
+            # One cheap AI call over the extracted points, merging any pair that
+            # states one fact in two vocabularies. The local word-overlap merge
+            # in extractor.merge() catches rewordings and deliberately stops
+            # short of synonyms, because a threshold loose enough to fuse those
+            # also fuses genuinely different facts. Cached with the extraction,
+            # so it costs once per lecture.
+            "ai_twin_pass": True,
+            # Size the note cap from how many points the lecture yielded, rather
+            # than the fixed target_cards above. The cap is a ceiling that is
+            # never padded to, so this only ever relaxes it.
+            "auto_target_cards": True,
             # Off by default: the lecture is the source of truth, and the
             # extractor must NOT backfill canonical facts the material omits
             # (the fix for a run that invented a regional-V/Q point the slides
