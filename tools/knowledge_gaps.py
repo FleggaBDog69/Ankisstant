@@ -2881,9 +2881,9 @@ class KnowledgeGapsPanel(QWidget):
         work = menu.addAction(f"⚡ Work through {label}…",
                               lambda: self._work_through(ids))
         work.setToolTip(
-            "One pass: read the gaps, search your deck for each point, commit "
-            "the cards that already cover them, and write cards for the points "
-            "nothing covered — without going back to the queue in between."
+            "One screen: your deck is searched for every point, and cards are "
+            "written for the points nothing covered — both shown together, "
+            "reviewed together, and added by one button in one undoable step."
         )
         menu.addSeparator()
         # Bulk search runs the whole selection through AI Lecture's engine in one
@@ -2947,8 +2947,13 @@ class KnowledgeGapsPanel(QWidget):
         if not ids:
             menu.exec(self._list.mapToGlobal(pos))
             return
-        menu.addAction(f"⚡ Work through {label} ({n})…",
-                       lambda: self._work_through(ids))
+        grp_work = menu.addAction(f"⚡ Work through {label} ({n})…",
+                                  lambda: self._work_through(ids))
+        grp_work.setToolTip(
+            "One screen: your deck is searched for every point, and cards are "
+            "written for the points nothing covered — both shown together, "
+            "reviewed together, and added by one button in one undoable step."
+        )
         menu.addSeparator()
         menu.addAction(f"🔍 Bulk search {label} ({n})",
                        lambda: self._bulk_search(ids))
@@ -3028,12 +3033,14 @@ class KnowledgeGapsPanel(QWidget):
         open_bulk_search(kgs, parent=self.window())
 
     def _work_through(self, ids: list[str]) -> None:
-        """Search AND create, in one continuous pass.
+        """Search AND create, on ONE screen.
 
-        The same dialog as Bulk search, in unified mode: committing the found
-        cards rolls straight on into Mass AI Create carrying the points the deck
-        turned out not to have. Bulk search and Mass AI Create stay on the menu
-        underneath it — this adds a path, it doesn't replace either."""
+        The same dialog as Bulk search, in unified mode: the deck is searched
+        for every gap, the points it can't cover are written as cards into the
+        bottom of that same results screen while you read the found ones, and a
+        single button commits both under one checkpoint. Bulk search and Mass AI
+        Create stay on the menu underneath it — this adds a path, it doesn't
+        replace either."""
         try:
             from .kg.bulk_search import open_unified
         except Exception as e:

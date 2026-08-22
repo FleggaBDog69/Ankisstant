@@ -14,6 +14,15 @@
 # Browse panel is already a busy single-topic surface. It opens over Browse,
 # does its job, and goes away.
 #
+# UNIFIED MODE IS ONE RESULT SCREEN, NOT A WIZARD.
+# The results page splits in two: what your deck already had on top, and — for
+# every point it turned out NOT to have — the cards written for it underneath,
+# generated automatically as soon as the search lands. Both halves are reviewed
+# side by side and committed by ONE button under ONE checkpoint, so a single
+# Ctrl+Z takes the entire pass back out. Generation runs while you read the
+# found cards, which is the real reason the two halves share a screen: in a
+# wizard that time is spent staring at a progress bar.
+#
 # WHY THE RESULTS ARE GROUPED BY GAP, AND TAGGED PER GAP.
 # A lecture commits everything under one tag because everything came from one
 # lecture. A batch of gaps did not — they're unrelated, and one shared tag would
@@ -27,9 +36,9 @@ from __future__ import annotations
 from aqt import mw
 from aqt.qt import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QHBoxLayout, QHeaderView,
-    QLabel, QLineEdit, QProgressBar, QPushButton, QSpinBox, QStackedWidget, Qt,
-    QTableWidget, QTableWidgetItem, QTimer, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
-    QWidget,
+    QLabel, QLineEdit, QProgressBar, QPushButton, QScrollArea, QSpinBox,
+    QSplitter, QStackedWidget, Qt, QTableWidget, QTableWidgetItem, QTimer,
+    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 from aqt.utils import askUser, showWarning, tooltip
 
@@ -47,6 +56,53 @@ from . import store as kg_store, triage as kg_triage
 # results list: the allocator's choice is what's ticked, and this is the short
 # tail he can promote from if it got one wrong.
 EXTRA_CANDIDATES_PER_POINT = 6
+
+
+def create_record_for(kg: dict, concept: str, points: list[dict]) -> dict:
+    """One gap, flattened into the record shape the generation side reads.
+
+    FLATTENED, not dict(kg): gen_prompt.build_generation_request and
+    build_job_record read `notes`, `stem_html`, `concept` and `explanation` off
+    the TOP level, while the store keeps them under fields{}. Handing over a raw
+    store record silently wrote cards with none of the gap's own context.
+    `fields` rides along as well, for the declarative field values
+    card_creator._gap_field_values resolves at commit time.
+
+    `points` are the ones the deck was just measured against and found wanting,
+    already serialised. They go in twice on purpose: structured, for
+    triage.plan_from_queued_gap to rebuild a plan with no AI call, and as prose
+    on the end of the notes, because that is what the model actually reads.
+    """
+    kg_id = str(kg.get("kg_id") or kg.get("id") or "")
+    kg_type = str(kg.get("type") or kg.get("kg_type") or "").lower()
+    notes_bits = []
+    own = kg_store.field(kg, "notes")
+    if own:
+        notes_bits.append(own)
+    concepts = [str(p.get("concept") or "").strip() for p in points]
+    concepts = [c for c in concepts if c]
+    if concepts:
+        notes_bits.append("My deck has no card for these parts of this gap:\n"
+                          + "\n".join(f"\u2022 {c}" for c in concepts))
+    return {
+        "id":           kg_id,
+        "kg_id":        kg_id,
+        "title":        str(kg.get("title") or ""),
+        "type":         kg_type,
+        "kg_type":      kg_type,
+        "group":        str(kg.get("group") or "").strip(),
+        "tags":         [t for t in (kg.get("tags") or []) if t],
+        "fields":       dict(kg.get("fields") or {}),
+        "stem_html":    kg_store.field(kg, "stem_html"),
+        "explanation":  kg_store.field(kg, "explanation"),
+        "images":       list((kg.get("fields") or {}).get("images") or []),
+        "concept":      str(concept or "").strip() or str(kg.get("title") or ""),
+        "notes":        "\n\n".join(notes_bits),
+        "points":       list(points),
+        # One card per uncovered point is the honest default: the point IS the
+        # thing the deck is missing.
+        "target_cards": max(1, len(points)),
+    }
 
 
 def _short(text: str, n: int) -> str:
@@ -91,6 +147,25 @@ class BulkSearchDialog(QDialog):
         # fire afterwards, and touching a deleted Qt widget from one is a crash.
         self._closed = False
         self._tag_edits: dict[str, QLineEdit] = {}   # kg_id -> its tag box
+
+        # ── the writing half of the one screen ───────────────────────────────
+        # Unified mode no longer hands the uncovered points to another window:
+        # it generates cards for them into the bottom of this results page, and
+        # commits them together with the found cards. The JOBS are ordinary
+        # create_jobs records on disk (same as Mass AI Create), so this dialog
+        # polls a batch_id rather than owning threads — a crash mid-write loses
+        # nothing, and the batch can be reopened from AI Create.
+        self._deck = None                    # built on the plan page, unified only
+        self._notetype = None
+        self._write_cb = None
+        self._gen_batch_id = ""
+        self._gen_groups: list = []          # mass_create._KGGroup, one per gap
+        self._gen_active = False             # jobs still running
+        self._gen_rendered = False           # the written cards are on screen
+        self._applied = False
+        self._poll = QTimer(self)
+        self._poll.setInterval(750)
+        self._poll.timeout.connect(self._on_gen_poll)
 
         self._build()
         self._fill_plan_table()
@@ -212,12 +287,112 @@ class BulkSearchDialog(QDialog):
             "you can edit or drop them. Per-run — it isn't remembered."
         )
         col.addWidget(self._lp_gate_cb)
+        if self._unified:
+            col.addLayout(self._build_write_strip())
         return w
 
+    def _build_write_strip(self):
+        """Where the cards written for the uncovered points go.
+
+        On the PLAN page, not down beside the results, because generation starts
+        by itself the moment the search lands — by the time you can see the
+        written cards it is too late to be asked which deck they belong in."""
+        from .mass_create import _deck_names, _notetype_profiles
+        cc_cfg = tool_config("card_creator")
+
+        outer = QVBoxLayout()
+        outer.setContentsMargins(0, 0, 0, 0)
+        self._write_cb = QCheckBox("Write cards for whatever the search doesn't find")
+        self._write_cb.setChecked(True)
+        self._write_cb.setStyleSheet("font-size: 11px;")
+        self._write_cb.setToolTip(
+            "Generation starts on its own as soon as the search results are up, "
+            "so you can read what your deck already had while the rest is being "
+            "written. The cards land in the bottom half of the results screen "
+            "for review — nothing reaches your collection until you press "
+            "Apply.\n\n"
+            "Untick to just search: the uncovered gaps are then offered to AI "
+            "Create the old way, in its own window.")
+        outer.addWidget(self._write_cb)
+
+        strip = QHBoxLayout()
+        strip.setContentsMargins(20, 0, 0, 0)
+        lbl = QLabel("into deck")
+        lbl.setStyleSheet("color: gray; font-size: 11px;")
+        strip.addWidget(lbl)
+        self._deck = QComboBox()
+        self._deck.setEditable(True)
+        self._deck.addItems(_deck_names())
+        self._deck.setCurrentText(cc_cfg.get("default_deck") or "Default")
+        self._deck.setMinimumWidth(200)
+        strip.addWidget(self._deck, 1)
+        lbl2 = QLabel("as")
+        lbl2.setStyleSheet("color: gray; font-size: 11px;")
+        strip.addWidget(lbl2)
+        self._notetype = QComboBox()
+        for prof in _notetype_profiles(cc_cfg):
+            self._notetype.addItem(prof["name"])
+        want = (cc_cfg.get("selected_notetype")
+                or cc_cfg.get("default_notetype") or "").strip()
+        ix = self._notetype.findText(want)
+        if ix >= 0:
+            self._notetype.setCurrentIndex(ix)
+        self._notetype.setMinimumWidth(180)
+        strip.addWidget(self._notetype, 1)
+        strip.addStretch(1)
+        outer.addLayout(strip)
+
+        def _sync(on: bool) -> None:
+            for wd in (self._deck, self._notetype, lbl, lbl2):
+                wd.setEnabled(on)
+        self._write_cb.toggled.connect(_sync)
+        return outer
+
     def _build_results_page(self) -> QWidget:
+        """ONE screen, two halves.
+
+        Top: the cards your deck already had. Bottom: the cards written for the
+        points it didn't. A splitter rather than two pages because the halves
+        answer each other — whether a written card is wanted depends on what the
+        found list turned up, and in a wizard that judgement is two clicks and a
+        window apart. The bottom half stays hidden until there is something in
+        it, so a plain (non-unified) search looks exactly as it did."""
         w = QWidget()
         col = QVBoxLayout(w)
         col.setContentsMargins(0, 0, 0, 0)
+
+        self._split = QSplitter(Qt.Orientation.Vertical)
+        self._split.setChildrenCollapsible(False)
+        self._split.addWidget(self._build_found_pane())
+        self._gen_pane = self._build_gen_pane()
+        self._gen_pane.setVisible(False)
+        self._split.addWidget(self._gen_pane)
+        self._split.setStretchFactor(0, 3)
+        self._split.setStretchFactor(1, 2)
+        col.addWidget(self._split, 1)
+
+        send_row = QHBoxLayout()
+        self._send_create_btn = QPushButton("\u2192  Send gaps to AI Create\u2026")
+        self._send_create_btn.setAutoDefault(False)
+        self._send_create_btn.setToolTip(
+            "Pick which gaps go to AI Create. Each one carries the specific "
+            "points your deck had nothing for, so a partly-covered gap asks for "
+            "cards on the residue rather than the whole topic again. They land "
+            "in AI Create's queue \u2014 nothing is generated yet.")
+        self._send_create_btn.clicked.connect(self._on_send_to_create)
+        send_row.addWidget(self._send_create_btn)
+        send_row.addStretch(1)
+        col.addLayout(send_row)
+        return w
+
+    def _build_found_pane(self) -> QWidget:
+        w = QWidget()
+        col = QVBoxLayout(w)
+        col.setContentsMargins(0, 0, 0, 0)
+
+        self._found_head = QLabel("What your deck already has for these gaps")
+        self._found_head.setStyleSheet("font-weight: 600;")
+        col.addWidget(self._found_head)
 
         self._tree = QTreeWidget()
         self._tree.setColumnCount(2)
@@ -262,20 +437,65 @@ class BulkSearchDialog(QDialog):
         self._gap_hint.setStyleSheet("color: gray; font-size: 11px;")
         self._gap_hint.setWordWrap(True)
         col.addWidget(self._gap_hint)
-
-        send_row = QHBoxLayout()
-        self._send_create_btn = QPushButton("→  Send gaps to AI Create…")
-        self._send_create_btn.setAutoDefault(False)
-        self._send_create_btn.setToolTip(
-            "Pick which gaps go to AI Create. Each one carries the specific "
-            "points your deck had nothing for, so a partly-covered gap asks for "
-            "cards on the residue rather than the whole topic again. They land "
-            "in AI Create's queue — nothing is generated yet.")
-        self._send_create_btn.clicked.connect(self._on_send_to_create)
-        send_row.addWidget(self._send_create_btn)
-        send_row.addStretch(1)
-        col.addLayout(send_row)
         return w
+
+    def _build_gen_pane(self) -> QWidget:
+        """The written half. Empty and hidden until generation actually starts."""
+        w = QWidget()
+        col = QVBoxLayout(w)
+        col.setContentsMargins(0, 8, 0, 0)
+
+        head = QHBoxLayout()
+        self._gen_head = QLabel("Written for what your deck is missing")
+        self._gen_head.setStyleSheet("font-weight: 600;")
+        self._gen_head.setWordWrap(True)
+        head.addWidget(self._gen_head, 1)
+        self._gen_approve_all = QPushButton("Approve all")
+        self._gen_approve_all.setAutoDefault(False)
+        self._gen_approve_all.clicked.connect(lambda: self._gen_bulk("approved"))
+        head.addWidget(self._gen_approve_all)
+        self._gen_reject_all = QPushButton("Reject all")
+        self._gen_reject_all.setAutoDefault(False)
+        self._gen_reject_all.clicked.connect(lambda: self._gen_bulk("rejected"))
+        head.addWidget(self._gen_reject_all)
+        col.addLayout(head)
+
+        self._gen_note = QLabel("")
+        self._gen_note.setStyleSheet("color: gray; font-size: 11px;")
+        self._gen_note.setWordWrap(True)
+        col.addWidget(self._gen_note)
+
+        self._gen_scroll = QScrollArea()
+        self._gen_scroll.setWidgetResizable(True)
+        inner = QWidget()
+        self._gen_layout = QVBoxLayout(inner)
+        self._gen_layout.setContentsMargins(0, 0, 0, 0)
+        # A plain label carries the per-gap status while the jobs run, so the
+        # pane is never an empty box: it's replaced by the real card rows the
+        # moment the batch finishes.
+        self._gen_progress_lbl = QLabel("")
+        self._gen_progress_lbl.setStyleSheet("font-size: 11px;")
+        self._gen_progress_lbl.setWordWrap(True)
+        self._gen_layout.addWidget(self._gen_progress_lbl)
+        self._gen_layout.addStretch(1)
+        self._gen_scroll.setWidget(inner)
+        col.addWidget(self._gen_scroll, 1)
+        return w
+
+    def _show_gen_pane(self) -> None:
+        if self._gen_pane.isVisible():
+            return
+        self._gen_pane.setVisible(True)
+        try:
+            h = max(1, self._split.height())
+            self._split.setSizes([int(h * 0.55), int(h * 0.45)])
+        except Exception:
+            pass
+
+    def _gen_bulk(self, state: str) -> None:
+        for g in self._gen_groups:
+            g.set_all(state)
+        self._refresh_gen_head()
 
     # ── stage 1: the plan table ──────────────────────────────────────────────
 
@@ -602,6 +822,15 @@ class BulkSearchDialog(QDialog):
         mw.taskman.run_in_background(_bg, self._on_search_done, uses_collection=False)
 
     def _on_stop(self) -> None:
+        # One Stop button, two things it can be stopping: the deck search, or
+        # the writing that follows it. Only one of them ever runs at a time.
+        if self._gen_active:
+            from .. import create_jobs
+            n = create_jobs.cancel_batch(self._gen_batch_id)
+            self._stop_btn.setEnabled(False)
+            self._gen_note.setText(
+                f"Stopping {n} job(s) — anything already written is kept.")
+            return
         if self._cancel_ev is not None:
             self._cancel_ev.set()
         self._stop_btn.setEnabled(False)
@@ -763,6 +992,12 @@ class BulkSearchDialog(QDialog):
         self._title.setText(
             f"<b>{len(self._run_plans)} gap(s) searched</b> · {total_notes} card(s) found")
         self._update_selection_count()
+        # Start writing straight away, on this same screen. Deferred one tick so
+        # the found cards paint first: they are readable for the whole time the
+        # rest is being generated, which is the point of not making this a page.
+        if (self._unified and self._write_cb is not None
+                and self._write_cb.isChecked() and not self._gen_batch_id):
+            QTimer.singleShot(0, self._start_generation)
 
     def _suggest_tag(self, plan, group) -> str:
         """This gap's hierarchical tag. Built from the point levels the triage
@@ -857,16 +1092,38 @@ class BulkSearchDialog(QDialog):
         )
         uncovered = len(partial) + len(empty)
         if self._unified:
-            # One button, one decision: commit what the deck already had and go
-            # straight on to writing what it didn't. It stays enabled with zero
-            # ticked, because "my deck covers none of this" is a valid answer
-            # and the run should continue rather than dead-end.
+            self._send_create_btn.setVisible(False)
+            if self._gen_batch_id:
+                # ONE screen, ONE button: the found cards and the written cards
+                # go in together, under one checkpoint.
+                approved = sum(g.count_approved() for g in self._gen_groups)
+                if self._gen_rendered and not self._applied:
+                    # Promoting a candidate card up here can make a card written
+                    # down there redundant — that has to be said as it happens,
+                    # not only when the written half changes.
+                    try:
+                        self._gen_note.setText(self._gen_note_text())
+                    except RuntimeError:
+                        self._closed = True
+                        return
+                if self._gen_active:
+                    self._commit_btn.setEnabled(False)
+                    self._commit_btn.setText("Writing the missing cards…")
+                else:
+                    self._commit_btn.setEnabled(n > 0 or approved > 0)
+                    self._commit_btn.setText(
+                        f"Apply everything — {n} found + {approved} written  ▶"
+                        if approved else f"Apply — {n} found card(s)")
+                return
+            # Writing switched off (or unavailable): this is the old two-step —
+            # commit what the deck had, then offer the rest to AI Create. It
+            # stays enabled with zero ticked, because "my deck covers none of
+            # this" is a valid answer and the run should continue, not dead-end.
             self._commit_btn.setEnabled(True)
             self._commit_btn.setText(
                 (f"Commit {n} found, then write {uncovered} gap(s)  ▶"
                  if n else f"Write the missing cards for {uncovered} gap(s)  ▶")
                 if uncovered else f"Commit {n} found card(s)")
-            self._send_create_btn.setVisible(False)
             return
         self._commit_btn.setEnabled(n > 0)
         self._send_create_btn.setText(
@@ -877,6 +1134,15 @@ class BulkSearchDialog(QDialog):
     # ── commit ───────────────────────────────────────────────────────────────
 
     def _on_commit(self) -> None:
+        """Tag and unsuspend what the deck already had.
+
+        On the one screen this is only half the job — _on_apply_everything runs
+        it and the written cards inside a single checkpoint. This path is the
+        plain search commit, and the fallback for a unified run with the writing
+        switched off."""
+        if self._gen_batch_id:
+            self._on_apply_everything()
+            return
         if not anki_utils.require_col() or not self._coverage:
             return
         ticked = self._ticked()
@@ -910,6 +1176,42 @@ class BulkSearchDialog(QDialog):
         if not askUser("\n".join(lines)):
             return
 
+        # One checkpoint around the lot, so one undo reverses the whole batch.
+        if hasattr(mw, "checkpoint"):
+            mw.checkpoint("Ankisstant: bulk gap search")
+
+        tagged, unsuspended = self._apply_found(ticked, all_nids, do_unsuspend)
+        closed = self._close_gaps(full)
+
+        self._commit_btn.setEnabled(False)
+        msg = (f"Done — {len(all_nids)} note(s) committed"
+               + (f" ({tagged} tagged)" if tagged != len(all_nids) else "")
+               + (f", {unsuspended} card(s) unsuspended" if do_unsuspend else "")
+               + f", {closed} gap(s) closed.")
+        left = len(partial) + len(empty)
+        if left and not self._unified:
+            msg += (f" {left} gap(s) stay open — send them to AI Create to make "
+                    "the cards your deck is missing.")
+        self._status.setText(msg)
+        tooltip(msg, period=5000)
+        try:
+            mw.col.reset()
+            mw.reset()
+        except Exception:
+            pass
+        if self._unified:
+            # Deferred a tick so the commit's tooltip and the deck reset land
+            # before a second dialog opens over the top of them.
+            QTimer.singleShot(0, self._continue_to_create)
+
+    def _apply_found(self, ticked: dict, all_nids: list[int],
+                     do_unsuspend: bool) -> tuple[int, int]:
+        """Tag (and optionally unsuspend) the ticked cards. Returns
+        (notes tagged, cards unsuspended).
+
+        No checkpoint and no confirm of its own: both callers own those, and on
+        the one screen this runs inside the SAME checkpoint as the newly written
+        cards so one undo takes back the whole pass."""
         cids: list[int] = []
         for nid in all_nids:
             try:
@@ -918,10 +1220,6 @@ class BulkSearchDialog(QDialog):
                 continue
             cids.extend(note.card_ids() if hasattr(note, "card_ids")
                         else [c.id for c in note.cards()])
-
-        # One checkpoint around the lot, so one undo reverses the whole batch.
-        if hasattr(mw, "checkpoint"):
-            mw.checkpoint("Ankisstant: bulk gap search")
 
         plans_by_id = {p.kg_id: p for p in self._run_plans}
         tagged = 0
@@ -954,31 +1252,9 @@ class BulkSearchDialog(QDialog):
             anki_utils.unsuspend_cards(cids)
             after = sum(1 for cid in cids if mw.col.get_card(cid).queue == -1)
             unsuspended = before - after
+        return tagged, unsuspended
 
-        closed = self._close_gaps(full)
-
-        self._commit_btn.setEnabled(False)
-        msg = (f"Done — {len(all_nids)} note(s) committed"
-               + (f" ({tagged} tagged)" if tagged != len(all_nids) else "")
-               + (f", {unsuspended} card(s) unsuspended" if do_unsuspend else "")
-               + f", {closed} gap(s) closed.")
-        left = len(partial) + len(empty)
-        if left and not self._unified:
-            msg += (f" {left} gap(s) stay open — send them to AI Create to make "
-                    "the cards your deck is missing.")
-        self._status.setText(msg)
-        tooltip(msg, period=5000)
-        try:
-            mw.col.reset()
-            mw.reset()
-        except Exception:
-            pass
-        if self._unified:
-            # Deferred a tick so the commit's tooltip and the deck reset land
-            # before a second dialog opens over the top of them.
-            QTimer.singleShot(0, self._continue_to_create)
-
-    # ── unified: the hand-off into generation ────────────────────────────────
+    # ── unified: the writing half, on the same screen ────────────────────────
 
     def _create_payload(self) -> list[dict]:
         """The gaps your deck didn't cover, as KG records carrying ONLY their
@@ -1000,21 +1276,448 @@ class BulkSearchDialog(QDialog):
             kg = kg_store.get(kg_id)
             if plan is None or not kg:
                 continue
-            rec = dict(kg)
-            rec["concept"] = plan.concept or str(kg.get("title") or "")
-            rec["points"] = [
-                {"concept": m.point.concept, "terms": list(m.point.terms),
-                 "system": m.point.system, "subsystem": m.point.subsystem,
-                 "topic": m.point.topic}
-                for m in missing
-            ]
-            # One card per uncovered point is the honest default: the point IS
-            # the thing the deck is missing.
-            rec["target_cards"] = max(1, len(missing))
-            out.append(rec)
+            out.append(create_record_for(
+                kg, plan.concept,
+                [{"concept": m.point.concept, "terms": list(m.point.terms),
+                  "system": m.point.system, "subsystem": m.point.subsystem,
+                  "topic": m.point.topic}
+                 for m in missing]))
         return out
 
+    # ── writing the missing cards, into the bottom of this same screen ───────
+
+    def _start_generation(self) -> None:
+        """Write cards for the points the search found nothing for.
+
+        Fires on its own. "Your deck doesn't have this" is the entire finding of
+        the search, and making you press a second button in a second window to
+        act on it was the step this screen exists to delete. It is still only a
+        PROPOSAL: the cards land in the bottom pane for review, and nothing
+        reaches the collection until Apply."""
+        if self._closed or self._gen_batch_id:
+            return
+        if not provider_configured() or is_manual_provider():
+            self._show_gen_pane()
+            self._gen_head.setText("Nothing was written")
+            self._gen_note.setText(
+                "Writing the missing cards needs a CLI or API provider — set "
+                "one up in Ankisstant Settings.")
+            return
+        payload = self._create_payload()
+        if not payload:
+            self._show_gen_pane()
+            self._gen_head.setText("Nothing left to write")
+            self._gen_note.setText(
+                "Every point was covered by a card you already have.")
+            return
+        notetype_name = (self._notetype.currentText().strip()
+                         if self._notetype is not None else "")
+        if not notetype_name:
+            self._show_gen_pane()
+            self._gen_head.setText("Nothing was written")
+            self._gen_note.setText(
+                "No notetype is set, so there was nothing to write the missing "
+                "cards as. Settings \u2192 AI Create adds notetype profiles.")
+            return
+        deck_name = ((self._deck.currentText().strip()
+                      if self._deck is not None else "") or "Default")
+
+        # Main thread, BEFORE the jobs go off-thread: a cold vocab cache makes
+        # every job invent its own tag branch.
+        try:
+            autotag.refresh_vocab_cache()
+        except Exception as e:
+            log.warn(f"work through: vocab cache refresh failed: {e}")
+
+        from ...core.config import tool_model_for
+        from .. import create_jobs
+        from . import gen_prompt
+
+        cc_cfg = tool_config("card_creator")
+        base_tags = [t.strip() for t in (cc_cfg.get("default_tags") or [])
+                     if str(t).strip()]
+        audit = (cc_cfg.get("audit_tag") or "").strip()
+        if audit and audit not in base_tags:
+            base_tags.append(audit)
+
+        plans, gaps_by_id, tags_by_kg = [], {}, {}
+        for rec in payload:
+            plan = kg_triage.plan_from_queued_gap(rec)
+            if plan is None:
+                continue
+            plans.append(plan)
+            gaps_by_id[plan.kg_id] = rec
+            # The tag you filed the FOUND cards under is the tag the WRITTEN
+            # ones get. They answer the same gap; having them land in two
+            # different branches is precisely what one screen exists to stop.
+            tags_by_kg[plan.kg_id] = self._tag_text(plan.kg_id)
+        if not plans:
+            self._show_gen_pane()
+            self._gen_head.setText("Nothing was written")
+            self._gen_note.setText(
+                "None of the uncovered points could be turned into a "
+                "generation plan \u2014 see the log.")
+            return
+
+        records = gen_prompt.build_batch(
+            plans=plans, gaps_by_id=gaps_by_id, deck_name=deck_name,
+            notetype_name=notetype_name, base_tags=base_tags,
+            tags_by_kg=tags_by_kg, model=tool_model_for("card_creation"))
+        if not records:
+            self._show_gen_pane()
+            self._gen_head.setText("Nothing was written")
+            self._gen_note.setText(
+                "Couldn't build a generation request for any of those gaps \u2014 "
+                "see the log.")
+            return
+
+        self._gen_batch_id = records[0]["batch_id"]
+        self._gen_active = True
+        create_jobs.enqueue_batch(records)
+        self._mark_in_progress([r.get("kg_id") for r in records])
+        self._show_gen_pane()
+        pts = sum(len(p.points) for p in plans)
+        self._gen_head.setText(
+            f"Writing cards for {pts} uncovered point(s)\u2026")
+        self._gen_note.setText(
+            f"{len(records)} gap(s) queued. Read the found cards above while "
+            "this runs \u2014 nothing is added to your collection until you "
+            "press Apply.")
+        self._gen_progress_lbl.setVisible(True)
+        self._progress.setRange(0, 100)
+        self._progress.setValue(0)
+        self._progress.setVisible(True)
+        self._stop_btn.setVisible(True)
+        self._stop_btn.setEnabled(True)
+        self._poll.start()
+        self._on_gen_poll()
+
+    def _mark_in_progress(self, kg_ids) -> None:
+        """Handed to a tool, so no longer untouched \u2014 same rule the KG page
+        follows when it queues a gap."""
+        for kg_id in kg_ids:
+            try:
+                kg = kg_store.get(kg_id)
+                if kg and kg.get("status") == "open":
+                    kg_store.update(kg_id, status="in_progress")
+            except Exception as e:
+                log.warn(f"work through: couldn't mark {kg_id} in progress: {e}")
+
+    def _on_gen_poll(self) -> None:
+        if self._closed:
+            try:
+                self._poll.stop()
+            except RuntimeError:
+                pass
+            return
+        from .. import create_jobs
+        jobs = create_jobs.by_batch(self._gen_batch_id)
+        if not jobs:
+            self._poll.stop()
+            self._gen_active = False
+            self._progress.setVisible(False)
+            self._stop_btn.setVisible(False)
+            self._gen_note.setText("That batch is no longer in the job list.")
+            self._update_selection_count()
+            return
+        counts = create_jobs.batch_progress(self._gen_batch_id)
+        if counts["finished"]:
+            self._poll.stop()
+            self._gen_active = False
+            self._progress.setVisible(False)
+            self._stop_btn.setVisible(False)
+            self._resurface()
+            self._render_generated(jobs)
+            return
+        try:
+            self._progress.setValue(
+                int(100 * counts["done"] / max(1, counts["total"])))
+        except RuntimeError:
+            self._closed = True
+            return
+        labels = {
+            create_jobs.QUEUED: "queued",
+            create_jobs.RUNNING: "\u23f3 writing\u2026",
+            create_jobs.READY: "\u2705 written",
+            create_jobs.ERROR: "\u26a0\ufe0f failed",
+            create_jobs.INTERRUPTED: "\u26d4 interrupted",
+        }
+        try:
+            self._gen_progress_lbl.setText("\n".join(
+                f"{labels.get(j.get('status'), j.get('status'))}   "
+                f"{j.get('title') or '(untitled)'}" for j in jobs))
+            self._gen_note.setText(
+                f"{counts['ready']} of {counts['total']} gap(s) written \u00b7 "
+                f"{counts['running']} writing \u00b7 {counts['queued']} queued"
+                + (f" \u00b7 {counts['error']} failed" if counts["error"] else ""))
+        except RuntimeError:
+            self._closed = True
+            return
+        self._update_selection_count()
+
+    def _render_generated(self, jobs: list[dict]) -> None:
+        """The written cards, in the same review rows AI Create uses.
+
+        Reusing mass_create._KGGroup (and through it card_creator._CardRow) is
+        deliberate: regenerate, one-by-one rewrite, split and the quality
+        verdicts all come along, so nothing about reviewing a written card is
+        worse for happening on this screen instead of in its own window."""
+        from .. import card_creator as cc
+        from .mass_create import _KGGroup, _norm_front
+
+        for g in self._gen_groups:
+            g.setParent(None)
+        self._gen_groups = []
+        try:
+            self._gen_progress_lbl.setVisible(False)
+        except RuntimeError:
+            self._closed = True
+            return
+
+        profile = cc._resolved_profile(
+            tool_config("card_creator"),
+            self._notetype.currentText().strip()
+            if self._notetype is not None else "")
+        front_field = profile.get("front_field", "Text")
+
+        # ONE dup-check pass for the batch rather than one per row: it's a
+        # find_notes per card on the main thread. Same rule mass_create follows.
+        dup_msgs: dict[int, str] = {}
+        seen: dict[str, str] = {}
+        idx = 0
+        for j in jobs:
+            for card in (j.get("cards") or []):
+                msg = cc.dup_check(card, front_field)
+                key = _norm_front(card)
+                if key and key in seen:
+                    extra = f"\u26a0 near-duplicate of a card under '{seen[key]}'"
+                    msg = f"{msg}  \u00b7  {extra}" if msg else extra
+                elif key:
+                    seen[key] = j.get("title") or "another gap"
+                if msg:
+                    dup_msgs[idx] = msg
+                idx += 1
+
+        idx = 0
+        for j in jobs:
+            group = _KGGroup(j, profile=profile, dup_msgs=dup_msgs,
+                             start_index=idx,
+                             on_counts_changed=self._refresh_gen_head,
+                             on_retry=self._on_gen_retry, parent=self)
+            idx += len(j.get("cards") or [])
+            self._gen_layout.insertWidget(self._gen_layout.count() - 1, group)
+            self._gen_groups.append(group)
+        if self._gen_groups:
+            self._gen_groups[0].set_expanded(True)
+        self._gen_rendered = True
+        self._show_gen_pane()
+        self._refresh_gen_head()
+
+    def _refresh_gen_head(self) -> None:
+        approved = sum(g.count_approved() for g in self._gen_groups)
+        rejected = sum(g.count_rejected() for g in self._gen_groups)
+        total = sum(g.count_total() for g in self._gen_groups)
+        gaps = sum(1 for g in self._gen_groups if g.count_total())
+        failed = sum(1 for g in self._gen_groups if not g.count_total())
+        try:
+            self._gen_head.setText(
+                f"Written for what your deck is missing \u2014 {approved} approved "
+                f"\u00b7 {rejected} rejected \u00b7 {total} card(s) across "
+                f"{gaps} gap(s)")
+            self._gen_note.setText(self._gen_note_text())
+        except RuntimeError:
+            self._closed = True
+            return
+        self._update_selection_count()
+
+    def _gen_note_text(self) -> str:
+        """The line under the written cards. Rebuilt from BOTH halves' state,
+        because ticking a found card can change what it should say."""
+        from .. import create_jobs
+        note = self._crosstalk_note()
+        blank = [g for g in self._gen_groups if not g.count_total()]
+        if blank:
+            retryable = sum(
+                1 for g in blank
+                if g.job.get("status") in (create_jobs.ERROR,
+                                           create_jobs.INTERRUPTED))
+            bit = f"{len(blank)} gap(s) came back with no cards"
+            if retryable:
+                bit += " — the failed ones have a Retry button"
+            note = ((note + "  ") if note else "") + bit + "."
+        return note or ("Untick anything you don't want. These go in with the "
+                        "found cards, on the same Apply button, in one step.")
+
+    def _crosstalk_note(self) -> str:
+        """The one thing a single screen can say that two windows cannot: you
+        have since ticked cards for a gap that was already written for.
+
+        Generation ran on what the SEARCH found, so promoting a candidate card
+        afterwards can make a written card redundant. Not auto-rejected \u2014
+        that's a judgement \u2014 but said out loud, per gap, in words."""
+        if not self._gen_groups:
+            return ""
+        full, _partial, _empty = self._outcome_split()
+        covered = set(full)
+        names = [g.title for g in self._gen_groups
+                 if g.kg_id in covered and g.count_approved()]
+        if not names:
+            return ""
+        shown = ", ".join(f"\u201c{n}\u201d" for n in names[:3])
+        more = f" and {len(names) - 3} more" if len(names) > 3 else ""
+        return (f"You've since ticked cards covering every point of {shown}{more} "
+                "\u2014 the cards written for those may now be redundant.")
+
+    def _on_gen_retry(self, job_id: str) -> None:
+        from .. import create_jobs
+        create_jobs.retry_job(job_id)
+        self._gen_active = True
+        self._gen_rendered = False
+        self._progress.setRange(0, 100)
+        self._progress.setValue(0)
+        self._progress.setVisible(True)
+        self._stop_btn.setVisible(True)
+        self._stop_btn.setEnabled(True)
+        try:
+            self._gen_progress_lbl.setVisible(True)
+        except RuntimeError:
+            self._closed = True
+            return
+        self._gen_note.setText("Retrying\u2026")
+        self._poll.start()
+        self._update_selection_count()
+
+    # ── the single commit ────────────────────────────────────────────────────
+
+    def _on_apply_everything(self) -> None:
+        """Tag and unsuspend what your deck already had, AND add the cards
+        written for what it didn't \u2014 inside ONE checkpoint.
+
+        This is the whole reason the two halves share a screen: one decision,
+        one confirm, and one Ctrl+Z that takes the entire pass back out."""
+        if not anki_utils.require_col() or not self._coverage:
+            return
+        if self._gen_active and not askUser(
+                "Cards are still being written for some of these gaps.\n\n"
+                "Apply what your deck already had now, and leave the writing "
+                "running? You'd add those cards separately from AI Create.",
+                defaultno=True):
+            return
+
+        ticked = self._ticked()
+        all_nids = sorted({nid for rec in ticked.values() for nid in rec["nids"]})
+        batches = [(g, g.approved_cards()) for g in self._gen_groups]
+        batches = [(g, cards) for g, cards in batches if cards]
+        n_new = sum(len(c) for _g, c in batches)
+        if not all_nids and not n_new:
+            tooltip("Nothing ticked and nothing approved \u2014 nothing to apply.")
+            return
+
+        full, _partial, _empty = self._outcome_split()
+        do_unsuspend = self._unsuspend_cb.isChecked()
+        deck = ((self._deck.currentText().strip()
+                 if self._deck is not None else "") or "Default")
+        untagged = [kg_id for kg_id, rec in ticked.items()
+                    if rec["nids"] and not self._tag_text(kg_id)]
+
+        lines = ["Apply this whole pass?", ""]
+        if all_nids:
+            lines.append(
+                f"\u2022 Tag {len(all_nids)} note(s) you already had, each under "
+                "its own gap's tag"
+                + (", and unsuspend them." if do_unsuspend else "."))
+        if n_new:
+            lines.append(f"\u2022 Add {n_new} newly written card(s) to "
+                         f"\u201c{deck}\u201d across {len(batches)} gap(s).")
+        if untagged:
+            lines.append(f"\u2022 {len(untagged)} gap(s) have an empty tag box \u2014 "
+                         "their found cards are unsuspended but not tagged.")
+        lines.append("")
+        lines.append("Existing card content is never modified, and one Ctrl+Z "
+                     "takes the whole thing back out.")
+        if not askUser("\n".join(lines), title="Work through gaps"):
+            return
+
+        # ONE checkpoint around both halves.
+        if hasattr(mw, "checkpoint"):
+            mw.checkpoint("Ankisstant: work through gaps")
+
+        tagged = unsuspended = 0
+        if all_nids:
+            tagged, unsuspended = self._apply_found(ticked, all_nids, do_unsuspend)
+        created_by_kg = self._apply_created(batches, deck)
+
+        # A gap closes if your deck turned out to cover it, or if cards were
+        # just written for it. Everything else stays open on purpose.
+        closed = self._close_gaps(sorted(set(
+            list(full) + [k for k, ids in created_by_kg.items() if ids])))
+
+        n_created = sum(len(v) for v in created_by_kg.values())
+        self._applied = True
+        self._commit_btn.setEnabled(False)
+        self._commit_btn.setText("Applied")
+        bits = []
+        if all_nids:
+            bits.append(f"{len(all_nids)} found note(s) committed"
+                        + (f" ({tagged} tagged)" if tagged != len(all_nids) else "")
+                        + (f", {unsuspended} card(s) unsuspended"
+                           if do_unsuspend else ""))
+        if n_created:
+            bits.append(f"{n_created} card(s) written into \u201c{deck}\u201d")
+        bits.append(f"{closed} gap(s) closed")
+        msg = "Done \u2014 " + ", ".join(bits) + "."
+        self._set_status(msg)
+        tooltip(msg, period=5000)
+        try:
+            mw.col.reset()
+            mw.reset()
+        except Exception:
+            pass
+
+    def _apply_created(self, batches, deck: str) -> dict:
+        """Commit the approved written cards. No checkpoint of its own \u2014 the
+        caller opened one around this and the found cards together."""
+        from .. import card_creator as cc
+        created_by_kg: dict[str, list] = {}
+        if not batches:
+            return created_by_kg
+        profile = cc._resolved_profile(
+            tool_config("card_creator"),
+            self._notetype.currentText().strip()
+            if self._notetype is not None else "")
+        nt = cc.resolve_notetype(profile)
+        if nt is None:
+            return created_by_kg
+        for group, cards in batches:
+            try:
+                ids = cc.commit_cards(cards, ctx=group.commit_ctx(profile),
+                                      deck_name=group.deck_name or deck,
+                                      notetype=nt)
+            except Exception as e:
+                log.error(f"work through: committing '{group.title}' failed: {e}")
+                continue
+            created_by_kg[group.kg_id] = ids
+            try:
+                cc._append_session(
+                    mode="topic", source=f"work-through:{self._gen_batch_id}",
+                    topic=group.title, cards_proposed=group.count_total(),
+                    cards_created=len(ids), card_ids=ids)
+            except Exception as e:
+                log.warn(f"work through: session log failed: {e}")
+        # Only once the writing has actually finished: clearing a batch that
+        # still has jobs running would delete work in flight.
+        if not self._gen_active:
+            try:
+                from .. import create_jobs
+                create_jobs.remove_batch(self._gen_batch_id)
+            except Exception as e:
+                log.warn(f"work through: couldn't clear the job batch: {e}")
+        return created_by_kg
+
     def _continue_to_create(self) -> None:
+        """The old two-window hand-off. Only reached when the writing half is
+        switched off on the plan page \u2014 otherwise the cards are written into
+        the bottom of the results screen and committed with the found ones."""
         if self._closed:
             return
         payload = self._create_payload()
@@ -1204,6 +1907,14 @@ class BulkSearchDialog(QDialog):
     # ── misc ─────────────────────────────────────────────────────────────────
 
     def _on_back(self) -> None:
+        # Once cards have been written FOR this search, going back and running a
+        # different one would leave a batch of cards attached to results that no
+        # longer exist. Close and start again instead — the jobs are on disk, so
+        # nothing written is lost either way.
+        if self._gen_batch_id:
+            tooltip("The cards below were written for this search. Close this "
+                    "window and start again to search different gaps.")
+            return
         self._stack.setCurrentIndex(0)
         self._back_btn.setVisible(False)
         self._read_btn.setVisible(True)
@@ -1270,7 +1981,41 @@ class BulkSearchDialog(QDialog):
                         period=4000)
                 return
             self._on_stop()
+        if self._gen_active:
+            if askUser(
+                "Cards are still being written for these gaps.\n\n"
+                "Yes \u2014 keep writing in the background; this window hides and "
+                "reopens by itself when they're ready.\n"
+                "No \u2014 stop writing and close.",
+                defaultno=False,
+            ):
+                self._backgrounded = True
+                ev.ignore()
+                self.hide()
+                tooltip("Still writing \u2014 this window will reopen when it's done.",
+                        period=4000)
+                return
+            try:
+                from .. import create_jobs
+                create_jobs.cancel_batch(self._gen_batch_id)
+            except Exception as e:
+                log.warn(f"work through: couldn't cancel the batch: {e}")
+            self._gen_active = False
+        elif self._gen_groups and not self._applied:
+            pending = sum(g.count_approved() for g in self._gen_groups)
+            if pending and not askUser(
+                    f"{pending} written card(s) haven't been added yet.\n\n"
+                    "Close anyway? They stay in AI Create's job list, so you can "
+                    "reopen the batch there \u2014 but the found cards on this "
+                    "screen are not committed either.",
+                    defaultno=True):
+                ev.ignore()
+                return
         self._closed = True
+        try:
+            self._poll.stop()
+        except RuntimeError:
+            pass
         ev.accept()
         self.deleteLater()
 
@@ -1466,8 +2211,10 @@ class _SendToCreateDialog(QDialog):
 
 
 def open_unified(kgs: list[dict], parent=None) -> None:
-    """Search AND create, in one pass — the same dialog with the hand-off
-    automated. See BulkSearchDialog.__init__ for what "unified" changes."""
+    """Search AND create, on ONE screen: the deck is searched for every gap, the
+    points it can't cover are written as cards into the bottom of the same
+    results page, and one button commits both under one checkpoint. See
+    BulkSearchDialog._build_results_page."""
     open_bulk_search(kgs, parent=parent, unified=True)
 
 

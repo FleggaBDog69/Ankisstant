@@ -1420,7 +1420,7 @@ class _KGGroup(QFrame):
         head.addWidget(self._head_lbl)
         head.addStretch(1)
 
-        failed = job.get("status") == create_jobs.ERROR
+        failed = job.get("status") in (create_jobs.ERROR, create_jobs.INTERRUPTED)
         if failed:
             retry = QPushButton("Retry")
             retry.clicked.connect(lambda: self._on_retry(self.job_id))
@@ -1435,7 +1435,11 @@ class _KGGroup(QFrame):
         v.addLayout(head)
 
         if failed:
-            err = QLabel(f"⚠️ {job.get('error') or 'Generation failed.'}")
+            err = QLabel("⚠️ " + str(
+                job.get("error")
+                or ("Stopped before this one was written."
+                    if job.get("status") == create_jobs.INTERRUPTED
+                    else "Generation failed.")))
             err.setWordWrap(True)
             err.setStyleSheet("color: #c0392b;")
             v.addWidget(err)
@@ -1604,8 +1608,11 @@ class _KGGroup(QFrame):
 
     def _refresh_head(self) -> None:
         n = self.count_total()
-        if self.job.get("status") == create_jobs.ERROR:
-            self._head_lbl.setText(f"{self.title} — failed")
+        st = self.job.get("status")
+        if st in (create_jobs.ERROR, create_jobs.INTERRUPTED):
+            self._head_lbl.setText(
+                f"{self.title} — "
+                + ("stopped" if st == create_jobs.INTERRUPTED else "failed"))
             return
         self._head_lbl.setText(
             f"{self.title}    {n} card(s) · {self.count_approved()} approved")
