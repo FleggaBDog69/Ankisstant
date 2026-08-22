@@ -500,13 +500,22 @@ class _GroupAssignDialog(QDialog):
 
 
 class _GroupEditDialog(QDialog):
-    """Rename a group, and/or override the tag segment it files under.
+    """Rename a group, and choose where in the tag tree it files.
 
     Two separate things that both belong to "the group", which is why they share
-    one dialog: the NAME is what you read in the list, the SEGMENT is where the
-    cards land in the tag tree. They are derived from each other by default
-    (SRS 4 -> SRS::04) but nothing forces them to stay that way — a group can
-    read "SRS 4 (cardio)" and still file under Cardio::SRS::04."""
+    one dialog: the NAME is what you read in the list, the TAG is where the
+    cards land. They are derived from each other by default (SRS 4 -> SRS::04)
+    but nothing forces them to stay that way.
+
+    The dial that matters is WHERE:
+
+      Inside the auto-tag base   !!Fleg::KG::SRS::04::System::Sub::Topic
+      Its own branch             !!Curtanki::Year_3::SRS::02::System::Sub::Topic
+
+    "Its own branch" exists because one global base is the wrong shape for a
+    collection that already has a tag tree. Without it, a group can only ever be
+    a copy of your system nested inside the add-on's prefix, which is no use to
+    the system itself."""
 
     def __init__(self, name: str, n_gaps: int = 0, n_cards: int = 0,
                  existing: list[str] | None = None, parent=None):
@@ -535,17 +544,43 @@ class _GroupEditDialog(QDialog):
         self._name.setToolTip("What the group is called in the list and the chips.")
         form.addWidget(self._name, 0, 1)
 
-        form.addWidget(QLabel("Tag segment"), 1, 0)
-        self._seg = QLineEdit(autotag.group_segment_override(name))
-        self._seg.setPlaceholderText(
-            autotag.derive_group_segment(name) or "(from the name)")
-        self._seg.setToolTip(
-            "Leave blank to keep deriving the segment from the name. Type one "
-            "to file this group somewhere else in the tag tree — '::' makes "
-            "sub-levels."
+        saved = autotag.group_override(name)
+        base = (auto_tag_base() or "").rstrip(":")
+
+        form.addWidget(QLabel("Where"), 1, 0)
+        self._where = QComboBox()
+        self._where.addItem(
+            f"Inside {base or 'the auto-tag base'}  —  a segment in the shared tree",
+            False)
+        self._where.addItem("Its own branch  —  a full tag path", True)
+        self._where.setCurrentIndex(1 if (saved and saved["absolute"]) else 0)
+        self._where.setToolTip(
+            "Inside the base: this group is one segment of the add-on's tag "
+            f"tree ({base or '(none set)'}::Type::…).\n\n"
+            "Its own branch: the group owns the path you type, outright — the "
+            "base and the gap-type segment aren't used at all. This is how a "
+            "group joins a tag tree you already had."
         )
-        form.addWidget(self._seg, 1, 1)
+        form.addWidget(self._where, 1, 1)
+
+        form.addWidget(QLabel("Tag"), 2, 0)
+        self._seg = QLineEdit(saved["path"] if saved else "")
+        # A full path is the case you cannot type from memory — the completer is
+        # reading the tags that actually exist in the collection.
+        attach_tag_completer(self._seg, multi=False)
+        form.addWidget(self._seg, 2, 1)
         root.addLayout(form)
+
+        self._levels = QCheckBox(
+            "Add the gap's system / subsystem / topic underneath")
+        self._levels.setChecked(saved["levels"] if saved else True)
+        self._levels.setStyleSheet("font-size: 11px;")
+        self._levels.setToolTip(
+            "On: !!Curtanki::Year_3::SRS::02::Repro::Penis::Peyronie_disease\n"
+            "Off: every card in this group gets exactly the path above, and "
+            "nothing after it."
+        )
+        root.addWidget(self._levels)
 
         self._preview = QLabel("")
         self._preview.setStyleSheet("color: gray; font-size: 11px;")
@@ -560,6 +595,8 @@ class _GroupEditDialog(QDialog):
 
         self._name.textChanged.connect(self._refresh_preview)
         self._seg.textChanged.connect(self._refresh_preview)
+        self._where.currentIndexChanged.connect(self._refresh_preview)
+        self._levels.toggled.connect(self._refresh_preview)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -570,41 +607,75 @@ class _GroupEditDialog(QDialog):
         self._refresh_preview()
         self.resize(460, self.sizeHint().height())
 
+    def _absolute(self) -> bool:
+        return bool(self._where.currentData())
+
     def _refresh_preview(self, *_a) -> None:
         name = self._name.text().strip()
         typed = self._seg.text().strip()
+        path = autotag.clean_segment_path(typed)
         derived = autotag.derive_group_segment(name)
-        seg = autotag.clean_segment_path(typed) if typed else derived
+        absolute = self._absolute()
         base = (auto_tag_base() or "").rstrip(":")
+        esc = _html.escape
+
+        self._levels.setVisible(absolute)
+        self._seg.setPlaceholderText(
+            "e.g. !!Curtanki::Year_3::SRS::02" if absolute
+            else (derived or "(from the name)"))
+
         if not name:
             self._preview.setText("")
+        elif absolute:
+            if not path:
+                self._preview.setText(
+                    "Type the full tag path this group should own — start "
+                    "typing and it will complete from your existing tags.")
+            elif self._levels.isChecked():
+                self._preview.setText(
+                    f"Tags land under <code>{esc(path)}</code>::System::"
+                    "Subsystem::Topic<br>&nbsp;&nbsp;(its own branch"
+                    + (f" — <b>not</b> under {esc(base)}" if base else "") + ")")
+            else:
+                self._preview.setText(
+                    f"Every card in this group is tagged exactly "
+                    f"<code>{esc(path)}</code> — nothing after it.")
         elif not base:
             self._preview.setText(
-                f"Segment: <code>{_html.escape(seg)}</code> — no auto-tag base "
-                "is set, so nothing is tagged yet.")
+                f"Segment: <code>{esc(path or derived)}</code> — no auto-tag "
+                "base is set, so nothing is tagged yet. Switch to “its own "
+                "branch” to tag without one.")
         else:
-            source = "your override" if typed else "derived from the name"
+            source = "your override" if path else "derived from the name"
             self._preview.setText(
-                f"Tags land under <code>{_html.escape(base)}::*::"
-                f"{_html.escape(seg)}</code> &nbsp;({source})")
+                f"Tags land under <code>{esc(base)}::*::"
+                f"{esc(path or derived)}</code> &nbsp;({source})")
+
         msgs = []
         if not name:
             msgs.append("A group needs a name.")
         elif name != self._original and name in self._existing:
             msgs.append(
                 f"“{name}” already exists — saving merges this group into it.")
-        if typed and not seg:
-            msgs.append("That segment has nothing usable in it.")
+        if typed and not path:
+            msgs.append("That path has nothing usable in it.")
+        if absolute and not path:
+            msgs.append("A branch of its own needs a path to live at.")
         self._warn.setText("  ".join(msgs))
         if self._ok is not None:
-            self._ok.setEnabled(bool(name) and not (typed and not seg))
+            self._ok.setEnabled(
+                bool(name) and not (typed and not path)
+                and not (absolute and not path))
 
-    def values(self) -> tuple[str, str]:
-        """(name, segment override) — the override is '' when it should keep
-        deriving from the name."""
-        typed = self._seg.text().strip()
-        return self._name.text().strip(), (
-            autotag.clean_segment_path(typed) if typed else "")
+    def values(self) -> tuple[str, dict | None]:
+        """(name, override) — the override is None when the group should keep
+        deriving its segment from the name and filing under the base."""
+        path = autotag.clean_segment_path(self._seg.text().strip())
+        name = self._name.text().strip()
+        if not path:
+            return name, None
+        return name, {"path": path, "absolute": self._absolute(),
+                      "levels": bool(self._levels.isChecked())}
 
 
 class _GroupManagerDialog(QDialog):
@@ -712,9 +783,17 @@ class _GroupManagerDialog(QDialog):
                      str(st["open"] + st["in_progress"]), str(st["done"]), state]
             for c, text in enumerate(cells):
                 it = QTableWidgetItem(text)
-                if c == 1 and autotag.group_segment_override(n):
-                    it.setToolTip("Overridden — not derived from the name.")
-                    it.setText(text + "  (set)")
+                if c == 1:
+                    ov = autotag.group_override(n)
+                    if ov and ov["absolute"]:
+                        it.setToolTip(
+                            "Its own branch — tagged outside the auto-tag base."
+                            + ("" if ov["levels"] else
+                               " Exact tag; no levels underneath."))
+                        it.setText(text + "  (own branch)")
+                    elif ov:
+                        it.setToolTip("Overridden — not derived from the name.")
+                        it.setText(text + "  (set)")
                 if c == 0:
                     it.setToolTip(
                         f"Last touched: {st['last'][:10] or 'unknown'}")
@@ -2532,12 +2611,14 @@ class KnowledgeGapsPanel(QWidget):
         self.refresh_list()
 
     def _planned_retag(self, members: list[dict], group_name: str,
-                       seg: str) -> tuple[list[tuple[dict, str, str]], int]:
-        """What retagging these gaps under `seg` would change, without doing it.
+                       plan: dict) -> tuple[list[tuple[dict, str, str]], int]:
+        """What retagging these gaps under `plan` would change, without doing it.
 
         Split out from _retag_group because renaming a group has to preview the
-        SAME thing for a name/segment that isn't saved yet — hence the explicit
-        segment rather than resolving it from the group."""
+        SAME thing for a name/path/mode that isn't saved yet — hence the
+        explicit plan rather than resolving it from the group. Passing the whole
+        plan (not just a segment) is what stops a rename from silently dragging
+        an own-branch group back under the auto-tag base."""
         changes: list[tuple[dict, str, str]] = []
         skipped = 0
         for kg in members:
@@ -2547,7 +2628,7 @@ class KnowledgeGapsPanel(QWidget):
                 continue
             new = autotag.tag_from_levels(
                 levels, kg_type_key=(kg.get("type") or "kg"),
-                group=group_name, group_seg=seg)
+                group=group_name, group_plan=plan)
             old = str(kg_store.field(kg, "auto_tag") or "").strip()
             if new and new != old:
                 changes.append((kg, old, new))
@@ -2598,7 +2679,7 @@ class KnowledgeGapsPanel(QWidget):
             return
 
         changes, skipped = self._planned_retag(
-            members, name, autotag.group_segment(name))
+            members, name, autotag.group_tag_plan(name))
         if not changes:
             showWarning(
                 f"Nothing to retag in “{name}”.\n\n"
@@ -2648,11 +2729,18 @@ class KnowledgeGapsPanel(QWidget):
         except Exception:
             return []
 
+    _KEEP_OVERRIDE = object()      # "don't touch it", as distinct from "clear it"
+
     def _write_group_meta(self, old_name: str, new_name: str,
-                          seg_override: str | None = None) -> None:
-        """Move a group's UI state across a rename, and set/clear its segment
+                          override=_KEEP_OVERRIDE) -> None:
+        """Move a group's UI state across a rename, and set/clear its tag
         override — in ONE read-modify-write, because three separate saves of the
-        same config slice is three chances to drop the others on the floor."""
+        same config slice is three chances to drop the others on the floor.
+
+        `override` is a dict to set, anything falsy to clear, and the
+        _KEEP_OVERRIDE sentinel to leave whatever is saved alone. Three states,
+        because "no override" and "don't change the override" are different
+        answers and conflating them is how a rename loses a group's branch."""
         try:
             cfg = tool_config("knowledge_gaps")
             for key in ("collapsed_groups", "archived_groups"):
@@ -2663,11 +2751,14 @@ class KnowledgeGapsPanel(QWidget):
                     cur = list(dict.fromkeys(cur))
                 cfg[key] = cur
             overrides = dict(cfg.get("group_tag_overrides") or {})
+            carried = overrides.get(old_name)
             if old_name != new_name:
                 overrides.pop(old_name, None)
-            if seg_override is not None:
-                if seg_override:
-                    overrides[new_name] = seg_override
+                if override is self._KEEP_OVERRIDE and carried is not None:
+                    overrides[new_name] = carried
+            if override is not self._KEEP_OVERRIDE:
+                if override:
+                    overrides[new_name] = override
                 else:
                     overrides.pop(new_name, None)
             cfg["group_tag_overrides"] = overrides
@@ -2712,12 +2803,13 @@ class KnowledgeGapsPanel(QWidget):
                                existing=kg_store.groups(), parent=self.window())
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return False
-        new_name, seg_override = dlg.values()
+        new_name, override = dlg.values()
         if not new_name:
             return False
-        old_override = autotag.group_segment_override(name)
+        old_override = autotag.group_override(name)
+        new_override = autotag.normalise_override(override)
         renaming = new_name != name
-        if not renaming and seg_override == old_override:
+        if not renaming and new_override == old_override:
             tooltip("No change.")
             return False
         if renaming and new_name in kg_store.groups():
@@ -2727,8 +2819,12 @@ class KnowledgeGapsPanel(QWidget):
                 defaultno=True, title="Merge groups"):
                 return False
 
-        seg = seg_override or autotag.derive_group_segment(new_name)
-        changes, skipped = self._planned_retag(members, new_name, seg)
+        # The plan for the values on screen, which are not saved yet — so the
+        # preview below is of what OK would actually write.
+        plan = new_override or {
+            "path": autotag.derive_group_segment(new_name),
+            "absolute": False, "levels": True}
+        changes, skipped = self._planned_retag(members, new_name, plan)
         if changes:
             what = (f"Rename “{name}” to “{new_name}”"
                     if renaming else f"Retag “{name}”")
@@ -2744,7 +2840,7 @@ class KnowledgeGapsPanel(QWidget):
             # The snapshots in `changes` go stale only in their "group" key, and
             # _apply_retag writes fields/tags by id — so they stay usable.
             kg_store.set_group([str(kg.get("id")) for kg in members], new_name)
-        self._write_group_meta(name, new_name, seg_override)
+        self._write_group_meta(name, new_name, new_override)
         moved = self._apply_retag(changes) if changes else 0
         self.refresh_list()
         bits = []

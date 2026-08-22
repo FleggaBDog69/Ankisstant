@@ -194,30 +194,116 @@ def clean_segment_path(text: str) -> str:
     return "::".join(p for p in parts if p)
 
 
+# ── where a group's tags live ────────────────────────────────────────────────
+#
+# A group tags in one of TWO ways, and the difference is the whole reason this
+# is more than a string:
+#
+#   RELATIVE (the default)  the group is one segment inside the shared auto-tag
+#                           base:  !!Fleg::KG::SRS::04::System::Sub::Topic
+#   ABSOLUTE                the group owns a branch of its own, and the base and
+#                           the type segment are not used at all:
+#                           !!Curtanki::Year_3::SRS::02::System::Sub::Topic
+#
+# Absolute exists because a single global base is the wrong shape for a real
+# collection. A study system that predates this add-on already has its own tree,
+# and forcing every group under one prefix means the add-on's gaps can never
+# join it. The base stays the default because it's the right answer for a group
+# that has no home of its own yet.
+#
+# Config accepts two shapes per group, so nothing written before this survives
+# as anything other than what it already meant:
+#
+#   "Cardio::SRS4"                                      relative segment
+#   {"path": "...", "absolute": bool, "levels": bool}    the full form
+#
+# `levels` (absolute only) says whether the gap's system/subsystem/topic are
+# appended underneath the path, or whether the path IS the whole tag.
+
+_PLAN_DEFAULTS = {"path": "", "absolute": False, "levels": True}
+
+
 def group_tag_overrides() -> dict:
-    """The user's per-group segment overrides, {label: segment}. Never raises —
-    a broken/absent config means "no overrides", not a dead tag."""
+    """The raw per-group override map, {label: str | dict}. Never raises — a
+    broken or absent config means "no overrides", not a dead tag."""
     try:
         raw = tool_config("knowledge_gaps").get("group_tag_overrides") or {}
     except Exception:
         return {}
     if not isinstance(raw, dict):
         return {}
-    return {str(k): str(v or "").strip() for k, v in raw.items()}
+    return {str(k): v for k, v in raw.items()}
+
+
+def normalise_override(raw) -> dict | None:
+    """One config entry -> {"path", "absolute", "levels"}, or None when it says
+    nothing. Fail-open on every unexpected shape: an override that can't be read
+    must fall back to the derived segment, never to a broken tag."""
+    if isinstance(raw, str):
+        path = clean_segment_path(raw)
+        return dict(_PLAN_DEFAULTS, path=path) if path else None
+    if isinstance(raw, dict):
+        # "segment" is the key the first version of this used for a plain path.
+        path = clean_segment_path(raw.get("path") or raw.get("segment") or "")
+        if not path:
+            return None
+        return {"path": path,
+                "absolute": bool(raw.get("absolute")),
+                "levels": bool(raw.get("levels", True))}
+    return None
+
+
+def group_override(name: str) -> dict | None:
+    """This group's saved override, normalised, or None if it uses the derived
+    segment inside the base."""
+    try:
+        return normalise_override(
+            group_tag_overrides().get(str(name or "").strip()))
+    except Exception:
+        return None
+
+
+def group_tag_plan(name: str, *, path: str | None = None,
+                   absolute: bool | None = None,
+                   levels: bool | None = None) -> dict:
+    """How this group tags, resolved: {"path", "absolute", "levels"}.
+
+    THE single answer every tag-building caller goes through. The keyword
+    arguments override the saved values one field at a time, which is what lets
+    the edit dialog preview a path the user hasn't saved yet without touching
+    config to do it."""
+    plan = group_override(name) or dict(
+        _PLAN_DEFAULTS, path=derive_group_segment(name))
+    if path is not None:
+        cleaned = clean_segment_path(path)
+        plan = dict(plan, path=cleaned or derive_group_segment(name))
+    if absolute is not None:
+        plan = dict(plan, absolute=bool(absolute))
+    if levels is not None:
+        plan = dict(plan, levels=bool(levels))
+    return plan
 
 
 def group_segment_override(name: str) -> str:
-    """The explicit segment set for this group, or '' if it uses the derived
-    one. Cleaned the same way a derived segment is, so an override can't put a
-    space or a stray slash into a tag."""
-    raw = group_tag_overrides().get(str(name or "").strip(), "")
-    return clean_segment_path(raw) if raw else ""
+    """The explicit path set for this group, or '' if it uses the derived one.
+    Cleaned the same way a derived segment is, so an override can't put a space
+    or a stray slash into a tag."""
+    ov = group_override(name)
+    return ov["path"] if ov else ""
+
+
+def group_is_absolute(name: str) -> bool:
+    """True when this group owns its tag branch outright — the auto-tag base and
+    the type segment are not used for it."""
+    ov = group_override(name)
+    return bool(ov and ov["absolute"])
 
 
 def group_segment(name: str) -> str:
-    """The tag segment for a group: the user's override if they set one, else
-    the derived rule. This is what every tag-building caller goes through."""
-    return group_segment_override(name) or derive_group_segment(name)
+    """The tag path for a group: the user's override if they set one, else the
+    derived rule. For an absolute group this is the whole branch, not a
+    segment — see group_tag_plan for which it is."""
+    return group_tag_plan(name)["path"]
 
 
 def derive_group_segment(name: str) -> str:
@@ -259,37 +345,78 @@ def derive_group_segment(name: str) -> str:
 def group_tag_prefix(group: str) -> str:
     """The tag branch a group's cards live under, as an Anki search pattern.
 
-    A group spans types — an SRS batch holds MQ, KG and LO gaps alike — and the
-    type segment sits above the group in the tag, so there is no single literal
-    prefix covering all of them. The '*' is doing real work here:
+    For a RELATIVE group, a batch spans types — an SRS batch holds MQ, KG and LO
+    gaps alike — and the type segment sits above the group in the tag, so there
+    is no single literal prefix covering all of them. The '*' is doing real work:
 
         !!Fleg::*::SRS::04
 
+    An ABSOLUTE group has no type segment above it, so its prefix is the branch
+    itself and needs no wildcard at all:
+
+        !!Curtanki::Year_3::SRS::02
+
     Feed it to matcher.scope_query("tag", ...) to get a scope query. Returns ''
-    when there's no base or no group, which every caller treats as no scope."""
-    base = auto_tag_base()
-    seg = group_segment(group)
-    if not base or not seg:
+    when there's nothing to scope to, which every caller treats as no scope."""
+    plan = group_tag_plan(group)
+    if not plan["path"]:
         return ""
-    return f"{base.rstrip(':')}::*::{seg}"
+    if plan["absolute"]:
+        return plan["path"]
+    base = auto_tag_base()
+    if not base:
+        return ""
+    return f"{base.rstrip(':')}::*::{plan['path']}"
 
 
 def tag_from_levels(levels: dict | None, kg_type_key: str | None = None,
                     type_meta: dict | None = None, group: str = "",
-                    group_seg: str | None = None) -> str:
-    """Format {system, subsystem, topic} levels into the shared hierarchical tag
-    under the configured base + the KG type's segment + (optionally) the KG's
-    group segment. Returns '' when unusable (no base, no levels, or it collapses
-    to just the base). Pass either a type key OR the resolved type_meta dict.
+                    group_seg: str | None = None,
+                    group_plan: dict | None = None) -> str:
+    """Format {system, subsystem, topic} levels into this KG's hierarchical tag.
 
-    `group` is the KG's raw group LABEL ("SRS 4"), not a segment — the
-    normalisation lives in group_segment() so every caller gets the same answer.
-    Default '' renders exactly what this function rendered before groups
-    existed.
+    Two shapes, decided by the group (see group_tag_plan):
 
-    `group_seg` is the escape hatch: pass a segment to use it verbatim instead
-    of resolving `group` through group_segment(). The Groups manager needs it to
-    preview what a NEW name or override would produce before it saves either."""
+      RELATIVE  {base}::{type}::{group}::{system}::{subsystem}::{topic}
+      ABSOLUTE  {group path}::{system}::{subsystem}::{topic}   — the base and
+                the type segment are not used, because the group owns its own
+                branch. With `levels` off, the path IS the tag.
+
+    Returns '' when unusable (nothing to build from, or it collapses to just the
+    base). Pass either a type key OR the resolved type_meta dict.
+
+    `group` is the KG's raw group LABEL ("SRS 4"), not a path — the
+    normalisation lives in group_tag_plan() so every caller gets the same
+    answer. Default '' renders exactly what this rendered before groups existed.
+
+    `group_plan` and `group_seg` are the preview escape hatches: pass either to
+    use it verbatim instead of resolving `group`. The Groups manager needs them
+    to show what a name/path/mode the user hasn't saved yet would produce.
+    `group_seg` is the older, relative-only form and is kept for callers that
+    only ever meant "this segment, inside the base"."""
+    if group_plan is not None:
+        plan = dict(_PLAN_DEFAULTS, **{k: v for k, v in group_plan.items()
+                                       if k in _PLAN_DEFAULTS})
+        plan["path"] = clean_segment_path(plan["path"])
+    elif group_seg is not None:
+        plan = dict(_PLAN_DEFAULTS, path=clean_segment_path(group_seg))
+    else:
+        plan = group_tag_plan(group)
+
+    levels = levels or {}
+
+    # ── absolute: the group's branch, standing on its own ────────────────────
+    if plan["absolute"] and plan["path"]:
+        if not plan["levels"] or not levels:
+            return plan["path"]
+        # Rendered through the SAME template as everything else, with the path
+        # standing in for the base and no type segment — so a customised
+        # template still shapes the levels the way the user set it up.
+        tag = format_hierarchical_tag(plan["path"], levels, type_seg="",
+                                      group_seg="")
+        return tag or plan["path"]
+
+    # ── relative: one segment inside the shared base ─────────────────────────
     base = auto_tag_base()
     if not base or not levels:
         return ""
@@ -297,9 +424,8 @@ def tag_from_levels(levels: dict | None, kg_type_key: str | None = None,
         type_seg = type_meta.get("name") or type_meta.get("key") or ""
     else:
         type_seg, _enabled = kg_type_info((kg_type_key or default_type_key()))
-    seg = group_segment(group) if group_seg is None else str(group_seg or "")
     tag = format_hierarchical_tag(base, levels, type_seg=type_seg,
-                                  group_seg=seg)
+                                  group_seg=plan["path"])
     if not tag or tag == base:
         return ""
     return tag

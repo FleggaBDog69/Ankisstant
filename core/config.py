@@ -279,13 +279,25 @@ DEFAULTS: dict = {
             # Group headers the user has collapsed on the KG page. Derived UI
             # state, written by the page rather than the settings screen.
             "collapsed_groups": [],
-            # Per-group tag segment overrides: {"SRS 4": "Cardio::SRS4"}.
-            # The segment is normally DERIVED from the group label
-            # (autotag.derive_group_segment), which is a guess; this is the
-            # escape hatch for a group whose label reads well in the list but
-            # should file somewhere else in the tag tree. Empty/missing = use
-            # the derived one. Keyed by the group's label, so renaming a group
-            # migrates the key.
+            # Per-group tag overrides, keyed by the group's LABEL (so renaming
+            # a group migrates the key). Two accepted shapes:
+            #
+            #   "SRS 4": "Cardio::SRS4"
+            #       a segment INSIDE the auto-tag base:
+            #       !!Fleg::KG::Cardio::SRS4::System::Sub::Topic
+            #
+            #   "SRS 2": {"path": "!!Curtanki::Year_3::SRS::02",
+            #             "absolute": True, "levels": True}
+            #       the group owns its own branch — the base and the type
+            #       segment are not used at all. `levels` says whether the
+            #       gap's system/subsystem/topic go underneath the path or
+            #       whether the path IS the whole tag.
+            #
+            # Absolute exists because one global base is the wrong shape for a
+            # collection that already has its own tag tree: without it, the
+            # add-on's gaps can never join the system they belong to.
+            # Empty/missing = derive the segment from the label
+            # (autotag.derive_group_segment) and file it under the base.
             "group_tag_overrides": {},
             # Groups put away from the main list ("SRS 1, finished in March").
             # The gaps are untouched — archiving only hides them from the list
