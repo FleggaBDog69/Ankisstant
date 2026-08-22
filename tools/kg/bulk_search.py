@@ -110,6 +110,20 @@ def create_record_for(kg: dict, concept: str, points: list[dict]) -> dict:
     }
 
 
+def _parse_terms(text: str) -> list[str]:
+    """A typed 'a, b; c' into search terms, deduped, order preserved.
+
+    Semicolons count as separators too — they are what you reach for when a
+    term itself contains a comma, and treating them as literal text would put a
+    stray ';' into a deck search."""
+    out: list[str] = []
+    for raw in str(text or "").replace(";", ",").split(","):
+        term = " ".join(raw.split())
+        if term and term.lower() not in {t.lower() for t in out}:
+            out.append(term)
+    return out
+
+
 def _short(text: str, n: int) -> str:
     text = " ".join((text or "").split())
     return text if len(text) <= n else text[:n - 1].rstrip() + "…"
@@ -290,13 +304,28 @@ class BulkSearchDialog(QDialog):
         # already a review step; on when the batch is worth the extra minute —
         # a rogue point costs a wasted search AND, in unified mode, a wasted
         # card, so it is the one thing worth checking before the run starts.
+        gate_row = QHBoxLayout()
         self._lp_gate_cb = QCheckBox("Review the learning points before searching")
         self._lp_gate_cb.setStyleSheet("font-size: 11px;")
         self._lp_gate_cb.setToolTip(
             "After the read, show every point the AI split these gaps into so "
             "you can edit or drop them. Per-run — it isn't remembered."
         )
-        col.addWidget(self._lp_gate_cb)
+        gate_row.addWidget(self._lp_gate_cb)
+        gate_row.addStretch(1)
+        # The same screen, on demand. Without this the points — the only thing
+        # that actually steers the search — were unreachable unless you had
+        # ticked the box BEFORE the read, which is before you know whether the
+        # read needs correcting.
+        self._lp_btn = QPushButton("Review points…")
+        self._lp_btn.setAutoDefault(False)
+        self._lp_btn.setEnabled(False)
+        self._lp_btn.setToolTip(
+            "Edit the points and their SEARCH TERMS — the terms are what is "
+            "actually looked up in your deck.")
+        self._lp_btn.clicked.connect(self._open_lp_gate)
+        gate_row.addWidget(self._lp_btn)
+        col.addLayout(gate_row)
         if self._unified:
             col.addLayout(self._build_write_strip())
         return w
@@ -629,7 +658,9 @@ class BulkSearchDialog(QDialog):
         can_read = (bool(self._checked_rows()) and not self._busy
                     and provider_configured() and not is_manual_provider())
         self._read_btn.setEnabled(can_read)
+        has_points = any(p.points for p in self._active_plans())
         self._search_btn.setEnabled(bool(self._active_plans()) and not self._busy)
+        self._lp_btn.setEnabled(has_points and not self._busy)
 
     # ── stage 1: the read ────────────────────────────────────────────────────
 
@@ -701,15 +732,18 @@ class BulkSearchDialog(QDialog):
         """Show every point the read produced, editable, before anything runs.
 
         Dropping a point here drops it from the search AND from anything that
-        falls through to generation, because both read the same plan."""
+        falls through to generation, because both read the same plan. This is
+        also the ONLY place the search terms can be changed — the plan table's
+        reading does not feed the search."""
         plans = [p for p in self._plans if p.ok and p.included]
         if not plans:
+            tooltip("Read the gaps first — there are no points yet.")
             return
         dlg = _PointApprovalDialog(plans, parent=self)
         if not dlg.exec():
             self._set_status("Left the points as they were.")
             return
-        kept = dlg.apply()
+        kept, termless = dlg.apply()
         dropped = 0
         for p in self._plans:
             if p.ok and p.included and not p.points:
@@ -719,8 +753,11 @@ class BulkSearchDialog(QDialog):
         self._refresh_title()
         self._set_status(
             f"{kept} point(s) kept"
-            + (f"; {dropped} gap(s) left with none and were unticked." if dropped
-               else "."))
+            + (f"; {dropped} gap(s) left with none and were unticked" if dropped
+               else "")
+            + (f"; {termless} point(s) have no search terms and can only be "
+               "matched by tag" if termless else "")
+            + ".")
 
     def _render_plan_table(self) -> None:
         self._table.blockSignals(True)
@@ -757,9 +794,12 @@ class BulkSearchDialog(QDialog):
                 reading.setFlags(reading.flags() & ~Qt.ItemFlag.ItemIsEditable)
             else:
                 reading.setToolTip(
-                    "Edit if the AI misread your shorthand. This is what the tag "
-                    "is built from. (The search terms it already wrote aren't "
-                    "regenerated — re-read the gaps if you need those changed.)")
+                    "How the AI understood this gap.\n\n"
+                    "Editing it does NOT change the search. The search runs on "
+                    "the learning points below it and, specifically, on their "
+                    "SEARCH TERMS — use “Review points…” to change those.\n\n"
+                    "What this text does affect: it becomes the topic any cards "
+                    "written for this gap are generated from.")
             self._table.setItem(row, C_READ, reading)
 
             if unread:
@@ -2126,16 +2166,24 @@ class _PointApprovalDialog(QDialog):
         col.setContentsMargins(14, 12, 14, 12)
         col.setSpacing(8)
         head = QLabel(
-            "Untick a point to drop it, or double-click to reword it. What you "
-            "leave here is exactly what gets searched for — and, if nothing in "
-            "your deck covers it, exactly what gets written."
+            "Untick a point to drop it, or double-click to edit either column.<br>"
+            "<b>Search terms are what is actually looked up in your deck</b> — "
+            "the point's wording only decides whether a card that came back is "
+            "judged relevant. If a search is missing cards you know you have, "
+            "add the words those cards actually use. Comma-separated."
         )
+        head.setTextFormat(Qt.TextFormat.RichText)
         head.setWordWrap(True)
         col.addWidget(head)
 
         self._tree = QTreeWidget()
-        self._tree.setColumnCount(1)
-        self._tree.setHeaderLabels(["Gap  ·  learning point"])
+        self._tree.setColumnCount(2)
+        self._tree.setHeaderLabels(["Gap  ·  learning point", "Search terms"])
+        th = self._tree.header()
+        th.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        th.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        th.setStretchLastSection(False)
+        self._tree.setColumnWidth(1, 260)
         self._tree.setAlternatingRowColors(True)
         self._tree.setEditTriggers(
             QAbstractItemView.EditTrigger.DoubleClicked
@@ -2155,16 +2203,16 @@ class _PointApprovalDialog(QDialog):
             for pt in plan.points:
                 leaf = QTreeWidgetItem(top)
                 leaf.setText(0, pt.concept)
+                leaf.setText(1, ", ".join(pt.terms))
                 leaf.setFlags(leaf.flags() | Qt.ItemFlag.ItemIsUserCheckable
                               | Qt.ItemFlag.ItemIsEditable)
                 leaf.setCheckState(0, Qt.CheckState.Checked)
-                bits = []
-                if pt.terms:
-                    bits.append("search terms: " + ", ".join(pt.terms))
                 levels = " › ".join(x for x in (pt.system, pt.subsystem, pt.topic) if x)
-                if levels:
-                    bits.append(levels)
-                leaf.setToolTip(0, "\n".join([pt.concept] + bits))
+                leaf.setToolTip(0, "\n".join([pt.concept] + ([levels] if levels else [])))
+                leaf.setToolTip(1, "The words looked up in your deck, comma-"
+                                   "separated. Edit freely — a term that returns "
+                                   "nothing is the single biggest cause of a "
+                                   "false gap.")
                 self._items.append((plan, pt, leaf))
             top.setExpanded(True)
 
@@ -2191,11 +2239,16 @@ class _PointApprovalDialog(QDialog):
         for _plan, _pt, item in self._items:
             item.setCheckState(0, state)
 
-    def apply(self) -> int:
-        """Write the ticks and edits back onto the plans. Returns how many
-        points survived. A plan can come out with none — the caller unticks it
-        rather than searching a gap with nothing to search for."""
+    def apply(self) -> tuple[int, int]:
+        """Write the ticks and edits back onto the plans.
+
+        Returns (points kept, points left with no search terms). A plan can come
+        out with none — the caller unticks it rather than searching a gap with
+        nothing to search for. A point with no terms is kept, not corrected:
+        it can still be reached by the tag leg, and silently reinstating the
+        terms the user just deleted would be worse than saying so."""
         keep: dict[int, list] = {}
+        termless = 0
         for plan, pt, item in self._items:
             if item.checkState(0) != Qt.CheckState.Checked:
                 continue
@@ -2203,12 +2256,15 @@ class _PointApprovalDialog(QDialog):
             if not text:
                 continue           # edited down to nothing = dropped
             pt.concept = text
+            pt.terms = _parse_terms(item.text(1))
+            if not pt.terms:
+                termless += 1
             keep.setdefault(id(plan), []).append(pt)
         total = 0
         for plan in self._plans:
             plan.points = keep.get(id(plan), [])
             total += len(plan.points)
-        return total
+        return total, termless
 
 
 class _SendToCreateDialog(QDialog):
