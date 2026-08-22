@@ -36,7 +36,8 @@ from __future__ import annotations
 from aqt import mw
 from aqt.qt import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QMenu, QPlainTextEdit, QProgressBar,
+    QHeaderView, QLabel, QLineEdit, QMenu, QMessageBox, QPlainTextEdit,
+    QProgressBar,
     QPushButton, QSpinBox, QStackedWidget, Qt, QTableWidget, QTableWidgetItem,
     QTimer, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
@@ -124,6 +125,15 @@ def _parse_terms(text: str) -> list[str]:
     return out
 
 
+def _card_back(card: dict) -> str:
+    """The back of a generated card.
+
+    Every producer (generation, split, one-by-one, regenerate) writes "extra",
+    and commit_cards reads "extra". "back" only turns up on hand-edited dicts,
+    so it is a fallback, never the primary."""
+    return str((card or {}).get("extra") or (card or {}).get("back") or "")
+
+
 def _short(text: str, n: int) -> str:
     text = " ".join((text or "").split())
     return text if len(text) <= n else text[:n - 1].rstrip() + "…"
@@ -137,6 +147,8 @@ class BulkSearchDialog(QDialog):
     ROLE_KIND = Qt.ItemDataRole.UserRole          # "gap" | "point" | "note"
     ROLE_KEY = Qt.ItemDataRole.UserRole + 1       # kg_id | point index | nid
     ROLE_CARD = Qt.ItemDataRole.UserRole + 2      # the written card dict itself
+    ROLE_CONCEPT = Qt.ItemDataRole.UserRole + 3   # a point row's concept text
+    ROLE_KG = Qt.ItemDataRole.UserRole + 4        # owning gap, carried by leaves
 
     def __init__(self, kgs: list[dict], parent=None, *, unified: bool = False):
         super().__init__(parent or mw)
@@ -1029,6 +1041,12 @@ class BulkSearchDialog(QDialog):
                 node = QTreeWidgetItem(top)
                 node.setData(0, self.ROLE_KIND, "point")
                 node.setData(0, self.ROLE_KEY, pi)
+                # The join key for written cards: the model attributes a card to
+                # a point NUMBER, that number indexes the job's mass_points, and
+                # mass_points are these concepts verbatim. Matching on the text
+                # keeps it exact rather than relying on two lists staying aligned.
+                node.setData(0, self.ROLE_CONCEPT, m.point.concept)
+                node.setData(0, self.ROLE_KG, plan.kg_id)
                 node.setFlags(node.flags() | Qt.ItemFlag.ItemIsAutoTristate
                               | Qt.ItemFlag.ItemIsUserCheckable)
                 node.setCheckState(0, Qt.CheckState.Unchecked)
@@ -1173,27 +1191,142 @@ class BulkSearchDialog(QDialog):
         if not isinstance(card, dict):
             return
         dlg = _WrittenCardDialog(card, self._gen_profile, parent=self)
-        if not dlg.exec():
+        res = dlg.exec()
+        if res == _WrittenCardDialog.SPLIT:
+            # Splitting produces more rows than a single-card dialog can show,
+            # so it happens against the tree — keeping the edits made so far.
+            leaf.setData(0, self.ROLE_CARD, dlg.values())
+            self._card_action(leaf, "split")
             return
-        card.update(dlg.values())
+        if not res:
+            return
+        card = dlg.values()
         leaf.setData(0, self.ROLE_CARD, card)
         self._label_written(leaf, card, None, [], 0)
         self._refresh_gen_head()
 
     def _on_tree_context_menu(self, pos) -> None:
-        """Retry lives here: a failed gap is a row in the tree now, so the
-        action that fixes it should be on that row."""
+        """The per-card actions, on the card.
+
+        AI Create lays Split / One-by-one / Rewrite out as a button strip beside
+        every row; a tree row has no strip, so the same actions hang off the
+        right-click and off the edit dialog. Same functions underneath \u2014
+        cc.split_card and cc.one_by_one_rewrite \u2014 so a card reshaped here is
+        reshaped exactly as it would be there."""
         item = self._tree.itemAt(pos)
-        if item is None or item.data(0, self.ROLE_KIND) != "written":
+        if item is None:
             return
-        kg_id = item.data(0, self.ROLE_KEY)
-        job = self._gen_jobs.get(kg_id) or {}
+        kind = item.data(0, self.ROLE_KIND)
+        menu = QMenu(self._tree)
+
+        if kind == "newcard":
+            ticked = item.checkState(0) == Qt.CheckState.Checked
+            menu.addAction("Edit this card\u2026", lambda: self._edit_written(item))
+            menu.addAction("\u21ba  Rewrite with AI\u2026",
+                           lambda: self._card_action(item, "rewrite"))
+            menu.addAction("\u2702\ufe0f  Split into atomic cards",
+                           lambda: self._card_action(item, "split"))
+            menu.addAction("1\ufe0f\u20e3  One-by-one",
+                           lambda: self._card_action(item, "obo"))
+            menu.addSeparator()
+            menu.addAction("Don\u2019t add this card" if ticked else "Add this card",
+                           lambda: item.setCheckState(
+                               0, Qt.CheckState.Unchecked if ticked
+                               else Qt.CheckState.Checked))
+            menu.exec(self._tree.mapToGlobal(pos))
+            return
+
+        # Retry: a failed gap is a row in the tree, so the action that fixes it
+        # belongs on that row — or on any row belonging to the same gap, since
+        # the failure may be showing on the point rather than the folder.
+        kg_id = (item.data(0, self.ROLE_KG)
+                 or (item.data(0, self.ROLE_KEY) if kind in ("gap", "written")
+                     else None))
+        job = self._gen_jobs.get(str(kg_id or "")) or {}
         if job.get("status") not in ("error", "interrupted"):
             return
-        menu = QMenu(self._tree)
         menu.addAction("Retry writing this gap",
                        lambda: self._on_gen_retry(job.get("id") or ""))
         menu.exec(self._tree.mapToGlobal(pos))
+
+    def _card_action(self, leaf, what: str) -> None:
+        """Rewrite / split / one-by-one on a single written card.
+
+        Synchronous with a wait cursor, like the same actions in AI Create: it
+        is one short call about one card, and the alternative is a row that
+        silently changes some seconds after you stopped looking at it."""
+        from .. import card_creator as cc
+        from ...core.config import tool_model_for
+        card = leaf.data(0, self.ROLE_CARD)
+        if not isinstance(card, dict):
+            return
+        hint = ""
+        if what == "rewrite":
+            from aqt.qt import QInputDialog
+            hint, ok = QInputDialog.getText(self, "Rewrite this card",
+                                            "What was wrong with it? (optional)")
+            if not ok:
+                return
+            hint = hint.strip()
+        profile = self._gen_profile or {}
+        self._set_status({"rewrite": "Rewriting that card\u2026",
+                          "split": "Splitting that card\u2026",
+                          "obo": "Rewriting that card one-by-one\u2026"}[what])
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        QApplication.processEvents()
+        try:
+            if what == "rewrite":
+                out = cc._regenerate_one(card, hint, profile, "",
+                                         tool_model_for("card_creation"))
+            elif what == "obo":
+                out = cc.one_by_one_rewrite(card, profile)
+            else:
+                out = cc.split_card(card, profile)
+        except Exception as e:
+            log.error(f"work through: {what} failed: {e}")
+            self._set_status(f"That didn\u2019t work: {e}")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        if not out:
+            self._set_status("The AI didn\u2019t return a replacement \u2014 "
+                             "the card is unchanged.")
+            return
+
+        self._tree.blockSignals(True)
+        try:
+            if what == "split" and isinstance(out, list):
+                parent = leaf.parent()
+                kg_id = str(leaf.data(0, self.ROLE_KG) or "")
+                row = parent.indexOfChild(leaf)
+                parent.removeChild(leaf)
+                for i, c in enumerate(out):
+                    new_leaf = QTreeWidgetItem()
+                    new_leaf.setData(0, self.ROLE_KIND, "newcard")
+                    new_leaf.setData(0, self.ROLE_KEY, i)
+                    new_leaf.setData(0, self.ROLE_CARD, dict(c))
+                    new_leaf.setData(0, self.ROLE_KG, kg_id)
+                    new_leaf.setFlags(new_leaf.flags()
+                                      | Qt.ItemFlag.ItemIsUserCheckable)
+                    new_leaf.setCheckState(0, Qt.CheckState.Checked)
+                    parent.insertChild(row + i, new_leaf)
+                    self._label_written(new_leaf, dict(c), None, [], 0)
+                parent.setExpanded(True)
+                self._set_status(f"Split into {len(out)} card(s) \u2014 still "
+                                 "nothing added until you press Apply.")
+            else:
+                new = out[0] if isinstance(out, list) else out
+                card.update({"front": str(new.get("front") or ""),
+                             "extra": str(new.get("extra")
+                                          or new.get("back") or "")})
+                leaf.setData(0, self.ROLE_CARD, card)
+                self._label_written(leaf, card, None, [], 0)
+                self._set_status("Rewritten \u2014 still nothing added until you "
+                                 "press Apply.")
+        finally:
+            self._tree.blockSignals(False)
+        self._refresh_gen_head()
 
     def _ticked(self) -> dict[str, dict]:
         """{kg_id: {"nids": [...], "covered_points": n, "total_points": n}} from
@@ -1506,7 +1639,8 @@ class BulkSearchDialog(QDialog):
         records = gen_prompt.build_batch(
             plans=plans, gaps_by_id=gaps_by_id, deck_name=deck_name,
             notetype_name=notetype_name, base_tags=base_tags,
-            tags_by_kg=tags_by_kg, model=tool_model_for("card_creation"))
+            tags_by_kg=tags_by_kg, model=tool_model_for("card_creation"),
+            origin="work-through")
         if not records:
             self._show_written_ui()
             self._gen_note.setText(
@@ -1621,68 +1755,177 @@ class BulkSearchDialog(QDialog):
         folder.setFont(0, f)
         return folder
 
+    def _point_node(self, kg_id: str, concept: str):
+        """The point row under `kg_id` whose concept is `concept`, or None."""
+        top = self._gap_item(kg_id)
+        if top is None or not concept:
+            return None
+        want = " ".join(str(concept).split()).casefold()
+        for i in range(top.childCount()):
+            ch = top.child(i)
+            if ch.data(0, self.ROLE_KIND) != "point":
+                continue
+            got = " ".join(str(ch.data(0, self.ROLE_CONCEPT) or "").split())
+            if got.casefold() == want:
+                return ch
+        return None
+
+    def _point_concepts(self, job: dict) -> list:
+        return [str(c or "") for c in (job.get("mass_points") or [])]
+
+    def _card_home(self, kg_id: str, job: dict, card: dict):
+        """Where a written card's row belongs: under the point it answers when
+        the model said which one and that point is on screen, otherwise under
+        the gap's own written folder.
+
+        Unattributed is a real answer, not a failure — a card covering something
+        the decomposition didn't name has no point to sit under, and inventing
+        one would file it under a claim it isn't about."""
+        try:
+            n = int(card.get("point"))
+        except (TypeError, ValueError):
+            n = 0
+        concepts = self._point_concepts(job)
+        if 1 <= n <= len(concepts):
+            node = self._point_node(kg_id, concepts[n - 1])
+            if node is not None:
+                return node
+        return self._written_folder(kg_id, create=True)
+
     def _written_items(self) -> list:
-        """[(QTreeWidgetItem, card dict)] for every written card on screen."""
+        """[(QTreeWidgetItem, card dict)] for every written card on screen.
+
+        A full walk, not two fixed levels: written rows sit under their point
+        when the model attributed one and under the gap's folder when it didn't,
+        so depth is not something this can assume."""
         out = []
-        for i in range(self._tree.topLevelItemCount()):
-            top = self._tree.topLevelItem(i)
-            for j in range(top.childCount()):
-                folder = top.child(j)
-                if folder.data(0, self.ROLE_KIND) != "written":
-                    continue
-                for k in range(folder.childCount()):
-                    leaf = folder.child(k)
-                    card = leaf.data(0, self.ROLE_CARD)
+
+        def walk(item):
+            for i in range(item.childCount()):
+                ch = item.child(i)
+                if ch.data(0, self.ROLE_KIND) == "newcard":
+                    card = ch.data(0, self.ROLE_CARD)
                     if isinstance(card, dict):
-                        out.append((leaf, card))
+                        out.append((ch, card))
+                walk(ch)
+
+        for i in range(self._tree.topLevelItemCount()):
+            walk(self._tree.topLevelItem(i))
         return out
 
-    def _render_written_placeholders(self, records: list[dict]) -> None:
-        """A row per gap the moment generation starts.
+    def _written_rows_under(self, node) -> list:
+        """Written rows directly under one node — used to clear a point's old
+        placeholder without disturbing the found cards beside it."""
+        return [node.child(i) for i in range(node.childCount())
+                if node.child(i).data(0, self.ROLE_KIND) in ("newcard", "pending")]
 
-        Deliberately BEFORE any card exists: the tree must not silently grow new
-        branches under you while you are reading it. The row says what is being
-        written, and is replaced in place by the cards themselves."""
+    _PENDING_TEXT = {
+        "queued": "\u270d\ufe0e  queued \u2014 a card will be written for this",
+        "running": "\u270d\ufe0e  writing a card for this\u2026",
+        "ready": "\u270d\ufe0e  written \u2014 see below",
+        "error": "\u26a0\ufe0f  couldn\u2019t write a card for this",
+        "interrupted": "\u26d4  stopped before this was written",
+    }
+
+    def _pending_row(self, node, kg_id: str, text: str):
+        """The 'a card is being written for this' row under ONE point.
+
+        Placed before any card exists, deliberately: the tree must not silently
+        grow branches under you while you are reading it, and an uncovered point
+        that shows nothing at all reads as 'nothing is happening here'."""
+        for ch in self._written_rows_under(node):
+            if ch.data(0, self.ROLE_KIND) == "pending":
+                ch.setText(0, text)
+                return ch
+        row = QTreeWidgetItem(node)
+        row.setData(0, self.ROLE_KIND, "pending")
+        row.setData(0, self.ROLE_KG, kg_id)
+        row.setFlags(row.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+        f = row.font(0)
+        f.setItalic(True)
+        row.setFont(0, f)
+        row.setText(0, text)
+        node.setExpanded(True)
+        return row
+
+    def _clear_pending(self, kg_id: str) -> None:
+        top = self._gap_item(kg_id)
+        if top is None:
+            return
+        stack = [top]
+        while stack:
+            it = stack.pop()
+            for i in reversed(range(it.childCount())):
+                ch = it.child(i)
+                if ch.data(0, self.ROLE_KIND) == "pending":
+                    it.removeChild(ch)
+                else:
+                    stack.append(ch)
+
+    def _render_written_placeholders(self, records: list[dict]) -> None:
+        """Mark every point that is about to have a card written for it.
+
+        One row under each such POINT rather than one lump under the gap, so the
+        answer to 'what is being done about this point' sits with the point."""
         self._tree.blockSignals(True)
         for rec in records:
             kg_id = str(rec.get("kg_id") or "")
-            folder = self._written_folder(kg_id, create=True)
-            if folder is None:
-                continue
-            n = len(rec.get("mass_points") or [])
-            folder.setText(0, f"\u270d\ufe0e  queued \u2014 writing {n} card(s) "
-                              "for the points above that nothing covered")
-            top = folder.parent()
+            unplaced = 0
+            for concept in self._point_concepts(rec):
+                node = self._point_node(kg_id, concept)
+                if node is None:
+                    unplaced += 1
+                    continue
+                self._pending_row(node, kg_id, self._PENDING_TEXT["queued"])
+            top = self._gap_item(kg_id)
             if top is not None:
                 top.setExpanded(True)
+            if unplaced:
+                folder = self._written_folder(kg_id, create=True)
+                if folder is not None:
+                    folder.setText(
+                        0, f"\u270d\ufe0e  queued \u2014 {unplaced} more card(s) "
+                           "to write for this gap")
         self._tree.blockSignals(False)
 
     def _update_written_placeholders(self, jobs: list[dict]) -> None:
         self._tree.blockSignals(True)
         for j in jobs:
-            folder = self._written_folder(str(j.get("kg_id") or ""))
-            if folder is None:
-                continue
-            n = len(j.get("mass_points") or [])
-            st = j.get("status")
-            folder.setText(0, {
-                "queued": f"\u270d\ufe0e  queued \u2014 {n} card(s) to write",
-                "running": f"\u23f3  writing {n} card(s)\u2026",
-                "ready": f"\u2705  written",
-                "error": "\u26a0\ufe0f  couldn\u2019t write these \u2014 "
-                         + str(j.get("error") or "generation failed"),
-                "interrupted": "\u26d4  stopped before these were written",
-            }.get(st, str(st)))
+            kg_id = str(j.get("kg_id") or "")
+            st = str(j.get("status") or "")
+            text = self._PENDING_TEXT.get(st, st)
+            if st == "error":
+                text += " \u2014 " + str(j.get("error") or "generation failed")
+            for concept in self._point_concepts(j):
+                node = self._point_node(kg_id, concept)
+                if node is not None:
+                    self._pending_row(node, kg_id, text)
+            folder = self._written_folder(kg_id)
+            if folder is not None:
+                n = len(j.get("mass_points") or [])
+                folder.setText(0, {
+                    "queued": f"\u270d\ufe0e  queued \u2014 {n} card(s) to write",
+                    "running": f"\u23f3  writing {n} card(s)\u2026",
+                    # NOT a tick. A tick next to a card that has not been added
+                    # to the collection reads as "done" — and nothing here has
+                    # touched the deck until Apply.
+                    "ready": "\u270d\ufe0e  written \u2014 not added yet",
+                    "error": "\u26a0\ufe0f  couldn\u2019t write these \u2014 "
+                             + str(j.get("error") or "generation failed"),
+                    "interrupted": "\u26d4  stopped before these were written",
+                }.get(st, st))
         self._tree.blockSignals(False)
 
     def _render_generated(self, jobs: list[dict]) -> None:
         """The written cards, as rows under the gap they were written for.
 
-        Per GAP, not per point: one job writes the whole gap\u2019s residue and the
-        model returns N cards without saying which point each answers. Guessing
-        that mapping would put a card under a point it may not be about, and the
-        thing being verified here \u2014 does this new card cover what my deck
-        didn\u2019t \u2014 is a judgement about the gap anyway."""
+        Filed under the POINT each card answers, so the deck's attempt at a
+        point and the card written to replace it are adjacent rows. The model
+        states the attribution itself (gen_prompt asks for a "point" number);
+        it is never inferred from position, because one point legitimately
+        splits into two cards and every later card would then be off by one.
+        A card the model attributed to nothing falls back to a folder on the
+        gap \u2014 unattributed is an answer, not a failure."""
         from .. import card_creator as cc
         from .mass_create import _norm_front
 
@@ -1718,12 +1961,13 @@ class BulkSearchDialog(QDialog):
         idx = 0
         for j in jobs:
             kg_id = str(j.get("kg_id") or "")
-            folder = self._written_folder(kg_id, create=True)
-            if folder is None:
+            if self._gap_item(kg_id) is None:
                 idx += len(j.get("cards") or [])
                 continue
-            while folder.childCount():
-                folder.removeChild(folder.child(0))
+            self._clear_pending(kg_id)
+            folder = self._written_folder(kg_id, create=True)
+            for leaf in list(self._written_rows_under(folder)):
+                folder.removeChild(leaf)
             cards = list(j.get("cards") or [])
             verdicts = list(j.get("verdicts") or [])
             if not cards:
@@ -1736,19 +1980,35 @@ class BulkSearchDialog(QDialog):
                     else "\u2014  the AI returned no cards for this gap")
                 idx += 1
                 continue
-            folder.setText(
-                0, f"\u270d\ufe0e  {len(cards)} card(s) written for what your "
-                   "deck didn\u2019t have \u2014 ticked ones are added on Apply")
+            n_at_gap = 0
             for i, card in enumerate(cards):
-                leaf = QTreeWidgetItem(folder)
+                home = self._card_home(kg_id, j, card)
+                if home is folder:
+                    n_at_gap += 1
+                leaf = QTreeWidgetItem(home)
                 leaf.setData(0, self.ROLE_KIND, "newcard")
                 leaf.setData(0, self.ROLE_KEY, i)
                 leaf.setData(0, self.ROLE_CARD, card)
+                # The gap is carried on the LEAF, not read off its parent: a row
+                # filed under a point has the point as its parent, and the commit
+                # needs to know which gap's tag box governs it.
+                leaf.setData(0, self.ROLE_KG, kg_id)
                 leaf.setFlags(leaf.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 leaf.setCheckState(0, Qt.CheckState.Checked)
                 self._label_written(leaf, card, dups.get(idx), verdicts, i)
+                home.setExpanded(True)
                 idx += 1
-            folder.setExpanded(True)
+            if n_at_gap:
+                folder.setText(
+                    0, f"\u270d\ufe0e  {n_at_gap} more card(s) written for this "
+                       "gap \u2014 not added until you press Apply")
+                folder.setExpanded(True)
+            else:
+                # Every card found a point to sit under, so the catch-all folder
+                # has nothing left to hold.
+                parent = folder.parent()
+                if parent is not None:
+                    parent.removeChild(folder)
         self._tree.blockSignals(False)
         self._gen_rendered = True
         self._show_written_ui()
@@ -1763,9 +2023,9 @@ class BulkSearchDialog(QDialog):
         from ...core import anki_utils
         try:
             front = anki_utils.strip_html(str(card.get("front") or ""))
-            back = anki_utils.strip_html(str(card.get("back") or ""))
+            back = anki_utils.strip_html(_card_back(card))
         except Exception:
-            front, back = str(card.get("front") or ""), str(card.get("back") or "")
+            front, back = str(card.get("front") or ""), _card_back(card)
         bits = []
         v = verdicts[i] if i < len(verdicts) and isinstance(verdicts[i], dict) else {}
         verdict = str(v.get("verdict") or "").upper()
@@ -1952,8 +2212,7 @@ class BulkSearchDialog(QDialog):
         for leaf, card in self._written_items():
             if leaf.checkState(0) != Qt.CheckState.Checked:
                 continue
-            folder = leaf.parent()
-            kg_id = str(folder.data(0, self.ROLE_KEY)) if folder is not None else ""
+            kg_id = str(leaf.data(0, self.ROLE_KG) or "")
             by_kg.setdefault(kg_id, []).append(card)
         return [(k, v) for k, v in by_kg.items() if v]
 
@@ -2299,14 +2558,40 @@ class BulkSearchDialog(QDialog):
             self._gen_active = False
         elif self._gen_rendered and not self._applied:
             pending = sum(len(c) for _k, c in self._approved_written())
-            if pending and not askUser(
-                    f"{pending} written card(s) haven't been added yet.\n\n"
-                    "Close anyway? They stay in AI Create's job list, so you can "
-                    "reopen the batch there \u2014 but the found cards on this "
-                    "screen are not committed either.",
-                    defaultno=True):
-                ev.ignore()
-                return
+            if pending:
+                # Three real answers, so three buttons. The old two-way question
+                # silently left the batch behind, and a leftover batch shows up
+                # in AI Create later looking like a create run the user never
+                # started \u2014 which is exactly how it was found.
+                box = QMessageBox(self)
+                box.setWindowTitle("Close without adding?")
+                box.setIcon(QMessageBox.Icon.Question)
+                box.setText(f"{pending} written card(s) haven\u2019t been added "
+                            "yet, and the found cards on this screen aren\u2019t "
+                            "committed either.")
+                box.setInformativeText(
+                    "Keep them and they wait in AI Create as a \u201cWork "
+                    "through gaps\u201d batch you can commit or discard there. "
+                    "The search results are not saved either way.")
+                keep = box.addButton("Close and keep the cards",
+                                     QMessageBox.ButtonRole.AcceptRole)
+                drop = box.addButton("Close and discard them",
+                                     QMessageBox.ButtonRole.DestructiveRole)
+                back = box.addButton("Stay here", QMessageBox.ButtonRole.RejectRole)
+                box.setDefaultButton(back)
+                box.exec()
+                clicked = box.clickedButton()
+                if clicked is back or clicked is None:
+                    ev.ignore()
+                    return
+                if clicked is drop:
+                    try:
+                        from .. import create_jobs
+                        create_jobs.remove_batch(self._gen_batch_id)
+                    except Exception as e:
+                        log.warn("work through: couldn't discard the batch: "
+                                 f"{e}")
+                _ = keep
         self._closed = True
         try:
             self._poll.stop()
@@ -2449,6 +2734,8 @@ class _WrittenCardDialog(QDialog):
     the back, and the one action that changes the card wholesale. Re-rolling a
     card repeatedly belongs in AI Create, where the whole batch is the subject."""
 
+    SPLIT = 2      # a third exec() outcome, beside accept (1) and reject (0)
+
     def __init__(self, card: dict, profile: dict, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Edit the written card")
@@ -2470,7 +2757,11 @@ class _WrittenCardDialog(QDialog):
         self._front.setMinimumHeight(140)
         col.addWidget(self._front, 2)
         col.addWidget(QLabel("<b>Back / Extra</b>"))
-        self._back = QPlainTextEdit(str(card.get("back") or ""))
+        # "extra" is the key the generator, the splitter, the one-by-one rewrite
+        # and commit_cards all use; "back" is only ever a stray. Reading "back"
+        # here showed an empty box for every card and writing it back put the
+        # edit somewhere nothing reads.
+        self._back = QPlainTextEdit(_card_back(card))
         self._back.setMinimumHeight(90)
         col.addWidget(self._back, 1)
 
@@ -2480,12 +2771,23 @@ class _WrittenCardDialog(QDialog):
         col.addWidget(self._status)
 
         row = QHBoxLayout()
-        regen = QPushButton("\u21ba  Rewrite with AI\u2026")
-        regen.setAutoDefault(False)
-        regen.setToolTip("Write this card again, optionally with a note on what "
-                         "was wrong with it.")
-        regen.clicked.connect(self._on_regen)
-        row.addWidget(regen)
+        for text, tip, fn in (
+            ("\u21ba  Rewrite with AI\u2026",
+             "Write this card again, optionally with a note on what was wrong "
+             "with it.", self._on_regen),
+            ("1\ufe0f\u20e3  One-by-one",
+             "Rewrite as one note with sibling {{c1}} clozes, for AnKing\u2019s "
+             "One-by-one reveal. Same rewrite as AI Create\u2019s button.",
+             self._on_obo),
+            ("\u2702\ufe0f  Split",
+             "Break this into the smallest set of atomic single-cloze cards. "
+             "They replace this row in the results tree.", self._on_split),
+        ):
+            b = QPushButton(text)
+            b.setAutoDefault(False)
+            b.setToolTip(tip)
+            b.clicked.connect(fn)
+            row.addWidget(b)
         row.addStretch(1)
         cancel = QPushButton("Cancel")
         cancel.setAutoDefault(False)
@@ -2519,14 +2821,41 @@ class _WrittenCardDialog(QDialog):
         if not new:
             self._status.setText("The AI didn't return a replacement.")
             return
+        self._apply_new(new, "Rewritten \u2014 read it before you keep it.")
+
+    def _apply_new(self, new: dict, msg: str) -> None:
         self._front.setPlainText(str(new.get("front") or ""))
-        self._back.setPlainText(str(new.get("back") or ""))
-        self._status.setText("Rewritten \u2014 read it before you keep it.")
+        self._back.setPlainText(_card_back(new))
+        self._status.setText(msg)
+
+    def _on_obo(self) -> None:
+        """Same rewrite AI Create\u2019s One-by-one button runs, same function."""
+        from .. import card_creator as cc
+        self._status.setText("Rewriting one-by-one\u2026")
+        QApplication.processEvents()
+        try:
+            new = cc.one_by_one_rewrite(self.values(), self._profile)
+        except Exception as e:
+            log.error(f"work through: one-by-one failed: {e}")
+            self._status.setText(f"Couldn\u2019t rewrite it: {e}")
+            return
+        if not new:
+            self._status.setText("The AI didn\u2019t return a usable card.")
+            return
+        self._apply_new(new, "Rewritten as sibling clozes \u2014 read it before "
+                             "you keep it.")
+
+    def _on_split(self) -> None:
+        """Splitting makes MORE cards than this dialog can hold, so it is done
+        on the tree row instead \u2014 which is where the extra rows have to
+        appear anyway."""
+        self.done(self.SPLIT)
 
     def values(self) -> dict:
         out = dict(self._card)
         out["front"] = self._front.toPlainText().strip()
-        out["back"] = self._back.toPlainText().strip()
+        out["extra"] = self._back.toPlainText().strip()
+        out.pop("back", None)
         return out
 
 

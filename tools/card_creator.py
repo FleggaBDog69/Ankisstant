@@ -2236,19 +2236,49 @@ class CreatorPanel(QWidget):
             ready = sum(1 for j in jobs if j.get("status") == "ready")
             errs = sum(1 for j in jobs if j.get("status") == "error")
             row = QHBoxLayout()
-            bits = f"Mass AI Create — {len(jobs)} gap(s) ({ready} ready"
+            # A work-through batch is NOT a Mass AI Create run, and labelling it
+            # as one is how a leftover batch reads as "a create run I apparently
+            # started". Its search results aren't on disk, so this is a salvage
+            # route to the written cards, not a way back into the run.
+            work = str(jobs[0].get("origin") or "") == "work-through"
+            name = "Work through gaps" if work else "Mass AI Create"
+            bits = f"{name} — {len(jobs)} gap(s) ({ready} ready"
             bits += f", {errs} failed)" if errs else ")"
             lbl = QLabel(bits)
+            if work:
+                lbl.setToolTip(
+                    "Cards written during a Work-through run that were never "
+                    "added. The found cards from that search are gone (they "
+                    "were never saved), so opening this shows only the written "
+                    "cards — review and commit them here, or discard them.")
             row.addWidget(lbl)
             row.addStretch(1)
-            btn = QPushButton("Open ▶")
+            btn = QPushButton("Open in AI Create ▶" if work else "Open ▶")
             btn.setAutoDefault(False)
             btn.clicked.connect(lambda _c=False, b=bid: self._open_batch(b))
             row.addWidget(btn)
+            if work:
+                dis = QPushButton("Discard")
+                dis.setAutoDefault(False)
+                dis.setToolTip("Throw these written cards away. Nothing in your "
+                               "collection changes.")
+                dis.clicked.connect(lambda _c=False, b=bid: self._discard_batch(b))
+                row.addWidget(dis)
             holder = QWidget()
             holder.setLayout(row)
             self.batch_layout.addWidget(holder)
         box.setVisible(bool(batches))
+
+    def _discard_batch(self, batch_id: str) -> None:
+        from aqt.utils import askUser
+        from . import create_jobs
+        jobs = create_jobs.by_batch(batch_id)
+        n = sum(len(j.get("cards") or []) for j in jobs)
+        if not askUser(f"Discard {n} written card(s) from that Work-through run?"
+                       "\n\nNothing in your collection changes."):
+            return
+        create_jobs.remove_batch(batch_id)
+        self.refresh_ready_lists()
 
     def _open_batch(self, batch_id: str) -> None:
         from .kg.mass_create import open_mass_create

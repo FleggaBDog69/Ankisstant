@@ -310,7 +310,7 @@ class _Runner:
             print(f"[ankisstant] job {job_id} failed: {e}")
             update(job_id, status=ERROR, error=str(e))
             outcome = "error"
-        _toast_outcome(outcome, n_cards)
+        _toast_outcome(outcome, n_cards, (get(job_id) or {}).get("origin", ""))
         _refresh_ui()
         self.pump()
 
@@ -564,7 +564,13 @@ def _apply_result_main_thread(job_id: str, result: dict) -> None:
                 # Topic/source auto-tag: no gap to cache on — pure format under
                 # the resolved (or default) KG type segment.
                 auto_tag = cc._topic_tag_from_levels(levels, type_meta) or ""
-        if auto_tag and auto_tag not in tags_raw:
+        # Case-insensitively, because Anki matches tags that way. The tag box on
+        # the work-through screen derives its topic segment from the point's own
+        # slug ("…::KGs::smegma") while the post-generation auto-tag derives it
+        # from the levels the model returned ("…::KGs::Smegma"). Both are the
+        # same tag to Anki, so appending the second only puts two spellings of
+        # one tag on every note.
+        if auto_tag and auto_tag.lower() not in {t.lower() for t in tags_raw}:
             tags_raw.append(auto_tag)
     except Exception as e:
         print(f"[ankisstant] job {job_id} auto-tag skipped: {e}")
@@ -590,9 +596,14 @@ def _apply_result_main_thread(job_id: str, result: dict) -> None:
 
 # ── notify (main thread): outcome toast + badge + panel refresh ─────────────────
 
-def _toast_outcome(outcome: str, n_cards: int) -> None:
+def _toast_outcome(outcome: str, n_cards: int, origin: str = "") -> None:
     if outcome == "cancelled":
         return  # user-initiated; no toast
+    if origin == "work-through":
+        # That run has its own screen open, showing each card land under the
+        # point it was written for. Telling the user to "open AI Create" points
+        # them at a second, redundant copy of the same batch.
+        return
     try:
         from aqt.utils import tooltip
         if outcome == "error":

@@ -92,7 +92,19 @@ def _points_block(points: list, n_cards: int = 0) -> str:
     else:
         head = ("\nCover these specific points — write at least one card for each, "
                 "and do NOT write two cards testing the same claim:\n")
-    return head + lines + "\n"
+    # ATTRIBUTION. Without this the reply is N cards with no statement of which
+    # point each answers, and the review screen can only file them under the gap
+    # as a lump. Position is not a substitute: one point legitimately splits into
+    # two cards (a "symptoms" point becoming a genital card and a urinary card),
+    # after which every later card is off by one. So the model is asked to say it
+    # — one integer, from the list above — and anything unattributed still falls
+    # back to the gap. An unknown extra key is ignored everywhere downstream
+    # (resolve_card_validity only requires front/extra), so this cannot break a
+    # reply from a model that omits it.
+    tail = ("\nAdd a \"point\" key to every card object: the NUMBER from the list "
+            "above that the card answers (e.g. \"point\": 2). If a card covers a "
+            "point not on the list, use 0.\n")
+    return head + lines + tail
 
 
 def build_generation_request(*, kg: dict, plan, profile: dict, cfg: dict,
@@ -298,7 +310,7 @@ def build_job_record(*, req: dict, kg: dict, plan, batch_id: str,
 
 def build_batch(*, plans, gaps_by_id: dict, deck_name: str, notetype_name: str,
                 base_tags: list[str], tags_by_kg: dict, model: str | None,
-                focus: str = "") -> list[dict]:
+                focus: str = "", origin: str = "mass-create") -> list[dict]:
     """Every included, runnable plan turned into a job record.
 
     Fail-soft per gap: one gap whose prompt can't be built (a broken KG type, a
@@ -321,10 +333,17 @@ def build_batch(*, plans, gaps_by_id: dict, deck_name: str, notetype_name: str,
             req = build_generation_request(kg=kg, plan=plan, profile=profile,
                                            cfg=cfg, focus=focus)
             tags = _merge_tags(base_tags, tags_by_kg.get(plan.kg_id), kg)
-            records.append(build_job_record(
+            rec = build_job_record(
                 req=req, kg=kg, plan=plan, batch_id=batch_id,
                 deck_name=deck_name, notetype_name=notetype_name,
-                tags_raw=tags, model=model))
+                tags_raw=tags, model=model)
+            # Which dialog owns this batch. AI Create shows every live batch so
+            # one survives a restart, but a work-through batch belongs to a
+            # screen that also holds the SEARCH results — offering it as an
+            # ordinary "Mass AI Create" run is how the same gaps ended up being
+            # generated a second time.
+            rec["origin"] = origin
+            records.append(rec)
         except Exception as e:
             log.error(f"mass create: couldn't build a request for "
                       f"'{str(kg.get('title') or '')[:40]}': {e}")
@@ -341,8 +360,12 @@ def _merge_tags(base_tags, row_tag, kg: dict) -> list[str]:
     order preserved. The auto-tag is NOT added here — it's resolved after
     generation (the model returns the tag levels), and create_jobs folds it in."""
     out: list[str] = []
+    seen: set[str] = set()
     for t in list(base_tags or []) + [row_tag] + list(kg.get("tags") or []):
         t = str(t or "").strip()
-        if t and t not in out:
+        # Anki matches tags case-insensitively, so two spellings of one tag are
+        # one tag with twice the clutter. First spelling wins.
+        if t and t.lower() not in seen:
+            seen.add(t.lower())
             out.append(t)
     return out
