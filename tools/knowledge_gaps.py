@@ -2875,6 +2875,17 @@ class KnowledgeGapsPanel(QWidget):
         menu = QMenu(self._list)
         n = len(ids)
         label = "1 gap" if n == 1 else f"{n} gaps"
+        # The unified pass. First in the menu because it is the one that ends
+        # with the gap actually closed: search and create were always two halves
+        # of one question ("is this in my deck, and if not, write it").
+        work = menu.addAction(f"⚡ Work through {label}…",
+                              lambda: self._work_through(ids))
+        work.setToolTip(
+            "One pass: read the gaps, search your deck for each point, commit "
+            "the cards that already cover them, and write cards for the points "
+            "nothing covered — without going back to the queue in between."
+        )
+        menu.addSeparator()
         # Bulk search runs the whole selection through AI Lecture's engine in one
         # pass, sized per gap — as opposed to Browse, which works one at a time.
         bulk = menu.addAction(f"🔍 Bulk search {label}",
@@ -2936,6 +2947,9 @@ class KnowledgeGapsPanel(QWidget):
         if not ids:
             menu.exec(self._list.mapToGlobal(pos))
             return
+        menu.addAction(f"⚡ Work through {label} ({n})…",
+                       lambda: self._work_through(ids))
+        menu.addSeparator()
         menu.addAction(f"🔍 Bulk search {label} ({n})",
                        lambda: self._bulk_search(ids))
         menu.addAction(f"⚡ Mass AI Create {label} ({n})…",
@@ -3012,6 +3026,25 @@ class KnowledgeGapsPanel(QWidget):
             tooltip("Those gaps are no longer in the list.")
             return
         open_bulk_search(kgs, parent=self.window())
+
+    def _work_through(self, ids: list[str]) -> None:
+        """Search AND create, in one continuous pass.
+
+        The same dialog as Bulk search, in unified mode: committing the found
+        cards rolls straight on into Mass AI Create carrying the points the deck
+        turned out not to have. Bulk search and Mass AI Create stay on the menu
+        underneath it — this adds a path, it doesn't replace either."""
+        try:
+            from .kg.bulk_search import open_unified
+        except Exception as e:
+            print(f"[ankisstant] unified pass unavailable: {e}")
+            showWarning(f"Couldn't open the unified pass:\n\n{e}")
+            return
+        kgs = [kg for kg in (kg_store.get(i) for i in ids) if kg]
+        if not kgs:
+            tooltip("Those gaps are no longer in the list.")
+            return
+        open_unified(kgs, parent=self.window())
 
     def _mass_create(self, ids: list[str]) -> None:
         """Open the mass-create dialog on this selection. Deliberately does NOT

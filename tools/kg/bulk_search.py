@@ -62,9 +62,15 @@ class BulkSearchDialog(QDialog):
     ROLE_KIND = Qt.ItemDataRole.UserRole          # "gap" | "point" | "note"
     ROLE_KEY = Qt.ItemDataRole.UserRole + 1       # kg_id | point index | nid
 
-    def __init__(self, kgs: list[dict], parent=None):
+    def __init__(self, kgs: list[dict], parent=None, *, unified: bool = False):
         super().__init__(parent or mw)
-        self.setWindowTitle("Bulk search — knowledge gaps")
+        # UNIFIED MODE is the same dialog with the hand-off automated: instead of
+        # stopping at "these gaps aren't covered, send them to Create yourself",
+        # committing rolls straight on into Mass AI Create carrying the points
+        # your deck turned out not to have. One pass, one decision per gap.
+        self._unified = bool(unified)
+        self.setWindowTitle("Work through knowledge gaps" if unified
+                            else "Bulk search — knowledge gaps")
         self.setMinimumSize(940, 660)
         self.resize(1180, 760)
         # NOT WA_DeleteOnClose: closing while a search runs HIDES this window and
@@ -194,6 +200,18 @@ class BulkSearchDialog(QDialog):
         self._table_hint.setStyleSheet("color: gray; font-size: 11px;")
         self._table_hint.setWordWrap(True)
         col.addWidget(self._table_hint)
+
+        # The learning-point gate. Off by default because the plan table is
+        # already a review step; on when the batch is worth the extra minute —
+        # a rogue point costs a wasted search AND, in unified mode, a wasted
+        # card, so it is the one thing worth checking before the run starts.
+        self._lp_gate_cb = QCheckBox("Review the learning points before searching")
+        self._lp_gate_cb.setStyleSheet("font-size: 11px;")
+        self._lp_gate_cb.setToolTip(
+            "After the read, show every point the AI split these gaps into so "
+            "you can edit or drop them. Per-run — it isn't remembered."
+        )
+        col.addWidget(self._lp_gate_cb)
         return w
 
     def _build_results_page(self) -> QWidget:
@@ -383,6 +401,33 @@ class BulkSearchDialog(QDialog):
                     concept="", included=False)
             self._plans.append(p)
         self._render_plan_table()
+        if self._lp_gate_cb.isChecked():
+            self._open_lp_gate()
+
+    def _open_lp_gate(self) -> None:
+        """Show every point the read produced, editable, before anything runs.
+
+        Dropping a point here drops it from the search AND from anything that
+        falls through to generation, because both read the same plan."""
+        plans = [p for p in self._plans if p.ok and p.included]
+        if not plans:
+            return
+        dlg = _PointApprovalDialog(plans, parent=self)
+        if not dlg.exec():
+            self._set_status("Left the points as they were.")
+            return
+        kept = dlg.apply()
+        dropped = 0
+        for p in self._plans:
+            if p.ok and p.included and not p.points:
+                p.included = False
+                dropped += 1
+        self._render_plan_table()
+        self._refresh_title()
+        self._set_status(
+            f"{kept} point(s) kept"
+            + (f"; {dropped} gap(s) left with none and were unticked." if dropped
+               else "."))
 
     def _render_plan_table(self) -> None:
         self._table.blockSignals(True)
@@ -810,8 +855,20 @@ class BulkSearchDialog(QDialog):
             "marked done — the rest stay open, and those are the ones worth "
             "making cards for."
         )
-        self._commit_btn.setEnabled(n > 0)
         uncovered = len(partial) + len(empty)
+        if self._unified:
+            # One button, one decision: commit what the deck already had and go
+            # straight on to writing what it didn't. It stays enabled with zero
+            # ticked, because "my deck covers none of this" is a valid answer
+            # and the run should continue rather than dead-end.
+            self._commit_btn.setEnabled(True)
+            self._commit_btn.setText(
+                (f"Commit {n} found, then write {uncovered} gap(s)  ▶"
+                 if n else f"Write the missing cards for {uncovered} gap(s)  ▶")
+                if uncovered else f"Commit {n} found card(s)")
+            self._send_create_btn.setVisible(False)
+            return
+        self._commit_btn.setEnabled(n > 0)
         self._send_create_btn.setText(
             f"→  Send gaps to AI Create…  ({uncovered} uncovered)"
             if uncovered else "→  Send gaps to AI Create…")
@@ -825,6 +882,11 @@ class BulkSearchDialog(QDialog):
         ticked = self._ticked()
         all_nids = sorted({nid for rec in ticked.values() for nid in rec["nids"]})
         if not all_nids:
+            # In unified mode "nothing ticked" is a real outcome, not a mistake:
+            # the deck covered none of it, and the whole batch goes to Create.
+            if self._unified:
+                self._continue_to_create()
+                return
             tooltip("Nothing ticked.")
             return
         full, partial, empty = self._outcome_split()
@@ -901,7 +963,7 @@ class BulkSearchDialog(QDialog):
                + (f", {unsuspended} card(s) unsuspended" if do_unsuspend else "")
                + f", {closed} gap(s) closed.")
         left = len(partial) + len(empty)
-        if left:
+        if left and not self._unified:
             msg += (f" {left} gap(s) stay open — send them to AI Create to make "
                     "the cards your deck is missing.")
         self._status.setText(msg)
@@ -911,6 +973,72 @@ class BulkSearchDialog(QDialog):
             mw.reset()
         except Exception:
             pass
+        if self._unified:
+            # Deferred a tick so the commit's tooltip and the deck reset land
+            # before a second dialog opens over the top of them.
+            QTimer.singleShot(0, self._continue_to_create)
+
+    # ── unified: the hand-off into generation ────────────────────────────────
+
+    def _create_payload(self) -> list[dict]:
+        """The gaps your deck didn't cover, as KG records carrying ONLY their
+        uncovered points.
+
+        This is the same shape _on_send_to_create writes onto the queue, minus
+        the queue: Mass AI Create's _fill_plan_table calls
+        triage.plan_from_queued_gap on every record it's given, so a record with
+        `points` on it arrives already planned and is never re-read. The points
+        are the ones your own deck was just measured against — re-reading them
+        would cost a call to throw that measurement away."""
+        missing_by_kg = self._uncovered_points()
+        plans_by_id = {p.kg_id: p for p in self._run_plans}
+        out: list[dict] = []
+        for kg_id, missing in missing_by_kg.items():
+            if not missing:
+                continue
+            plan = plans_by_id.get(kg_id)
+            kg = kg_store.get(kg_id)
+            if plan is None or not kg:
+                continue
+            rec = dict(kg)
+            rec["concept"] = plan.concept or str(kg.get("title") or "")
+            rec["points"] = [
+                {"concept": m.point.concept, "terms": list(m.point.terms),
+                 "system": m.point.system, "subsystem": m.point.subsystem,
+                 "topic": m.point.topic}
+                for m in missing
+            ]
+            # One card per uncovered point is the honest default: the point IS
+            # the thing the deck is missing.
+            rec["target_cards"] = max(1, len(missing))
+            out.append(rec)
+        return out
+
+    def _continue_to_create(self) -> None:
+        if self._closed:
+            return
+        payload = self._create_payload()
+        if not payload:
+            msg = ("Every point was covered by a card you already have — "
+                   "nothing left to write.")
+            self._set_status(msg)
+            tooltip(msg, period=5000)
+            return
+        pts = sum(len(k["points"]) for k in payload)
+        if not askUser(
+            f"Write cards for the {pts} point(s) your deck didn't cover, "
+            f"across {len(payload)} gap(s)?\n\n"
+            "Mass AI Create opens with them already planned — you review every "
+            "card before anything is added to your collection.",
+            title="Work through gaps"):
+            self._set_status(
+                f"Stopped after the search. {len(payload)} gap(s) stay open — "
+                "run them through AI Create when you want the cards.")
+            return
+        parent = self.parent()
+        self.close()
+        from .mass_create import open_mass_create
+        open_mass_create(payload, parent=parent)
 
     def _tag_text(self, kg_id: str) -> str:
         edit = self._tag_edits.get(kg_id)
@@ -1152,6 +1280,109 @@ class BulkSearchDialog(QDialog):
         self.close()
 
 
+class _PointApprovalDialog(QDialog):
+    """Every learning point the read produced, editable, before anything runs.
+
+    The plan table reviews GAPS; this reviews what each gap was split INTO,
+    which is the level the search and the generation both actually work at. A
+    point that misreads the gap costs a wasted search and — in unified mode — a
+    wasted card, and it is invisible until you look at the points themselves."""
+
+    def __init__(self, plans, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Review the learning points")
+        self.setMinimumSize(760, 520)
+        self._plans = list(plans)
+
+        col = QVBoxLayout(self)
+        col.setContentsMargins(14, 12, 14, 12)
+        col.setSpacing(8)
+        head = QLabel(
+            "Untick a point to drop it, or double-click to reword it. What you "
+            "leave here is exactly what gets searched for — and, if nothing in "
+            "your deck covers it, exactly what gets written."
+        )
+        head.setWordWrap(True)
+        col.addWidget(head)
+
+        self._tree = QTreeWidget()
+        self._tree.setColumnCount(1)
+        self._tree.setHeaderLabels(["Gap  ·  learning point"])
+        self._tree.setAlternatingRowColors(True)
+        self._tree.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked
+            | QAbstractItemView.EditTrigger.SelectedClicked
+            | QAbstractItemView.EditTrigger.EditKeyPressed)
+        col.addWidget(self._tree, 1)
+
+        self._items: list[tuple] = []        # (plan, point, QTreeWidgetItem)
+        for plan in self._plans:
+            top = QTreeWidgetItem(self._tree)
+            top.setText(0, f"{plan.title or '(untitled)'}      "
+                           f"{len(plan.points)} point(s)")
+            top.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            f = top.font(0)
+            f.setBold(True)
+            top.setFont(0, f)
+            for pt in plan.points:
+                leaf = QTreeWidgetItem(top)
+                leaf.setText(0, pt.concept)
+                leaf.setFlags(leaf.flags() | Qt.ItemFlag.ItemIsUserCheckable
+                              | Qt.ItemFlag.ItemIsEditable)
+                leaf.setCheckState(0, Qt.CheckState.Checked)
+                bits = []
+                if pt.terms:
+                    bits.append("search terms: " + ", ".join(pt.terms))
+                levels = " › ".join(x for x in (pt.system, pt.subsystem, pt.topic) if x)
+                if levels:
+                    bits.append(levels)
+                leaf.setToolTip(0, "\n".join([pt.concept] + bits))
+                self._items.append((plan, pt, leaf))
+            top.setExpanded(True)
+
+        row = QHBoxLayout()
+        for label, state in (("Tick all", Qt.CheckState.Checked),
+                             ("Untick all", Qt.CheckState.Unchecked)):
+            b = QPushButton(label)
+            b.setAutoDefault(False)
+            b.clicked.connect(lambda _c=False, st=state: self._set_all(st))
+            row.addWidget(b)
+        row.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.setAutoDefault(False)
+        cancel.clicked.connect(self.reject)
+        row.addWidget(cancel)
+        ok = QPushButton("Use these points  ▶")
+        ok.setDefault(True)
+        ok.clicked.connect(self.accept)
+        row.addWidget(ok)
+        col.addLayout(row)
+        theme_dialog(self)
+
+    def _set_all(self, state) -> None:
+        for _plan, _pt, item in self._items:
+            item.setCheckState(0, state)
+
+    def apply(self) -> int:
+        """Write the ticks and edits back onto the plans. Returns how many
+        points survived. A plan can come out with none — the caller unticks it
+        rather than searching a gap with nothing to search for."""
+        keep: dict[int, list] = {}
+        for plan, pt, item in self._items:
+            if item.checkState(0) != Qt.CheckState.Checked:
+                continue
+            text = " ".join(item.text(0).split())
+            if not text:
+                continue           # edited down to nothing = dropped
+            pt.concept = text
+            keep.setdefault(id(plan), []).append(pt)
+        total = 0
+        for plan in self._plans:
+            plan.points = keep.get(id(plan), [])
+            total += len(plan.points)
+        return total
+
+
 class _SendToCreateDialog(QDialog):
     """Pick which searched gaps go to AI Create, and see exactly what each one
     would ask for.
@@ -1234,14 +1465,20 @@ class _SendToCreateDialog(QDialog):
         return out
 
 
-def open_bulk_search(kgs: list[dict], parent=None) -> None:
+def open_unified(kgs: list[dict], parent=None) -> None:
+    """Search AND create, in one pass — the same dialog with the hand-off
+    automated. See BulkSearchDialog.__init__ for what "unified" changes."""
+    open_bulk_search(kgs, parent=parent, unified=True)
+
+
+def open_bulk_search(kgs: list[dict], parent=None, *, unified: bool = False) -> None:
     """Entry point. `kgs` are full KG records from tools/kg/store.py."""
     kgs = [k for k in (kgs or []) if isinstance(k, dict)
            and str(k.get("title") or "").strip()]
     if not kgs:
         tooltip("No knowledge gaps to search.")
         return
-    dlg = BulkSearchDialog(kgs, parent=parent)
+    dlg = BulkSearchDialog(kgs, parent=parent, unified=unified)
     dlg.show()
     dlg.raise_()
     dlg.activateWindow()

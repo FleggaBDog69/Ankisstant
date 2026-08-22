@@ -430,7 +430,7 @@ class GapAnalyserPanel(QWidget):
             }
             for gap_text in approved
         ]
-        kg_store.add_many(kg_items)
+        added = kg_store.add_many(kg_items)
 
         # If the KG panel is currently open, tell it to refresh.
         try:
@@ -447,6 +447,34 @@ class GapAnalyserPanel(QWidget):
         )
         tooltip(f"Queued {len(approved)} gap(s) to Knowledge Gaps"
                 + (f" in \u201c{group}\u201d." if group else "."))
+        self._offer_work_through(added)
+
+    def _offer_work_through(self, added: list) -> None:
+        """Hand a fresh audit straight to the unified pass.
+
+        What this panel produces is a list of gaps the AI *believes* aren't
+        covered, from reading a sample of the cards under a tag — it never
+        searched the deck. The unified pass is what actually measures them: it
+        searches every point, shows you the cards that already cover them, and
+        only writes the residue. Offering it here is the difference between an
+        audit that ends in a to-do list and one that ends in a closed gap."""
+        added = [k for k in (added or []) if isinstance(k, dict)]
+        if not added:
+            return
+        if not askUser(
+            f"Work through the {len(added)} new gap(s) now?\n\n"
+            "This searches your deck for each one and writes cards only for "
+            "what nothing covers. You review everything before it commits.\n\n"
+            "Say no and they just sit on the Knowledge Gaps page.",
+            title="Analyse knowledge gaps"):
+            return
+        try:
+            from .kg.bulk_search import open_unified
+        except Exception as e:
+            print(f"[ankisstant] unified pass unavailable: {e}")
+            showWarning(f"Couldn't open the unified pass:\n\n{e}")
+            return
+        open_unified(added, parent=self.window())
 
 
 # ── Tool contract ────────────────────────────────────────────────────────────
