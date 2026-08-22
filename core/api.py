@@ -32,7 +32,8 @@ import urllib.request
 from aqt.utils import tooltip
 
 from .config import (
-    PROVIDER_MODELS, PROVIDER_OF, default_model_for, family_for, load_config,
+    FREE_TIER_GEMINI, PROVIDER_MODELS, PROVIDER_OF, default_model_for,
+    family_for, load_config,
 )
 
 
@@ -113,6 +114,17 @@ CLI_EXEC_NAMES = ["claude.cmd", "claude.exe", "claude"] if _IS_WIN else ["claude
 
 class ClaudeError(Exception):
     pass
+
+
+class NoFreeQuota(ClaudeError):
+    """The chosen model exists but this key has no quota for it at all.
+
+    Its own class because it is the one API failure with a mechanical fix —
+    use a different model — so the caller can act instead of just reporting."""
+
+    def __init__(self, message: str, model: str = ""):
+        super().__init__(message)
+        self.model = model
 
 
 class ClaudeCancelled(ClaudeError):
@@ -535,11 +547,12 @@ def _http_post_json(url: str, headers: dict, body: dict, timeout: int,
         # the one action that fixes it.
         low = detail.lower()
         if e.code == 429 and ("limit: 0" in low or "free_tier" in low or "free tier" in low):
-            raise ClaudeError(
-                f"{provider_label} rejected this model: your key's free tier has "
-                "no quota for it. Open Ankisstant Settings → AI and switch the "
-                "model to Gemini 3.5 Flash (the most reliable free-tier Gemini "
-                "model), or add billing to your Google AI Studio account for Pro/2.0."
+            raise NoFreeQuota(
+                f"{provider_label} has no quota on your key for this model. "
+                f"Ankisstant retried on {FREE_TIER_GEMINI} and that failed too — "
+                "open Settings → AI and set the model for this tool to "
+                f"{FREE_TIER_GEMINI}, or add billing to your Google AI Studio "
+                "account to use Pro and the 2.x models."
             )
         if e.code == 429:
             raise ClaudeError(
@@ -582,9 +595,26 @@ def _call_gemini(api_key: str, model: str, system: str, user: str,
     }
     if system:
         body["system_instruction"] = {"parts": [{"text": system}]}
-    url = GEMINI_URL.format(model=model)
     headers = {"content-type": "application/json", "x-goog-api-key": api_key}
-    data = _http_post_json(url, headers, body, timeout=180, provider_label="Gemini")
+    try:
+        data = _http_post_json(GEMINI_URL.format(model=model), headers, body,
+                               timeout=180, provider_label="Gemini")
+    except NoFreeQuota:
+        # ONE retry on the model that reliably has free-tier quota. A stored
+        # model ID with no quota fails identically on every call, so a batch of
+        # twelve gaps burns twelve round trips to learn the same thing — and the
+        # user sees a wall of quota errors rather than cards. Retrying is not a
+        # silent downgrade: it is logged, and if it fails too the error says
+        # both models were tried and names the setting to change.
+        if model == FREE_TIER_GEMINI:
+            raise
+        from . import log as _log
+        _log.warn(f"gemini: no quota for {model!r}; retrying on "
+                  f"{FREE_TIER_GEMINI!r} — set it in Settings \u2192 AI to stop "
+                  "paying for this retry on every call")
+        data = _http_post_json(GEMINI_URL.format(model=FREE_TIER_GEMINI),
+                               headers, body, timeout=180,
+                               provider_label="Gemini")
     cands = data.get("candidates") or []
     if not cands:
         fb = (data.get("promptFeedback") or {}).get("blockReason")

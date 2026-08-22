@@ -310,7 +310,8 @@ def build_job_record(*, req: dict, kg: dict, plan, batch_id: str,
 
 def build_batch(*, plans, gaps_by_id: dict, deck_name: str, notetype_name: str,
                 base_tags: list[str], tags_by_kg: dict, model: str | None,
-                focus: str = "", origin: str = "mass-create") -> list[dict]:
+                focus: str = "", origin: str = "mass-create",
+                batch_id: str = "") -> list[dict]:
     """Every included, runnable plan turned into a job record.
 
     Fail-soft per gap: one gap whose prompt can't be built (a broken KG type, a
@@ -319,7 +320,10 @@ def build_batch(*, plans, gaps_by_id: dict, deck_name: str, notetype_name: str,
     """
     cfg = tool_config("card_creator")
     profile = _profile_for(cfg, notetype_name)
-    batch_id = uuid.uuid4().hex[:12]
+    # An explicit id joins these records to a batch already on screen — a
+    # second write for one point, asked for after unticking the cards the
+    # search found. A new batch would poll separately and render nowhere.
+    batch_id = batch_id or uuid.uuid4().hex[:12]
 
     records: list[dict] = []
     for plan in plans:

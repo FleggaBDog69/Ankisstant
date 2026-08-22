@@ -91,24 +91,34 @@ def _load_types() -> list[dict]:
         name = str(t.get("name", "") or "").strip()
         if not key or not name:
             continue
-        cleaned.append({
-            "key":         key,
-            "name":        name,
-            "color":       str(t.get("color", "") or "#6b7280"),
-            "description": str(t.get("description", "") or ""),
-        })
+        cleaned.append(_type_row(t, key, name))
     if not cleaned:
         # Single source of truth: fall back to the config DEFAULTS type list
         # (with its full field schema) rather than a second hardcoded copy.
         from ..core.config import DEFAULTS
         for t in DEFAULTS["tools"]["knowledge_gaps"]["types"]:
-            cleaned.append({
-                "key":         str(t.get("key", "")),
-                "name":        str(t.get("name", "")),
-                "color":       str(t.get("color", "") or "#6b7280"),
-                "description": str(t.get("description", "") or ""),
-            })
+            cleaned.append(_type_row(t, str(t.get("key", "")),
+                                     str(t.get("name", ""))))
     return cleaned
+
+
+def _type_row(t: dict, key: str, name: str) -> dict:
+    """One configured type, whole.
+
+    It used to be rebuilt from four hand-picked keys, which silently dropped
+    "fields" — so _schema_for_type looked the type up, found no fields, and
+    every KG's detail pane said "This type has no fields configured" even
+    though the notes field was right there in the config. Copy the record and
+    normalise the keys that are read positionally; don't enumerate what to
+    keep, or the next key added to a type is lost the same way."""
+    out = dict(t)
+    out["key"] = key
+    out["name"] = name
+    out["color"] = str(t.get("color", "") or "#6b7280")
+    out["description"] = str(t.get("description", "") or "")
+    fields = t.get("fields")
+    out["fields"] = list(fields) if isinstance(fields, list) else []
+    return out
 
 
 def _type_meta(key: str) -> dict:

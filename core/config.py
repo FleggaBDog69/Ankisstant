@@ -45,6 +45,11 @@ PROVIDER_OF: dict[str, str] = {
 # quota/availability errors on the free tier, where 3.5-flash has been more
 # reliable. Pro and the older 2.x models stay selectable in the picker for
 # users who prefer them or are on a paid plan.
+# The Gemini model that reliably has free-tier quota. Named once: it is the
+# migration target, the runtime fallback when a model comes back with no quota,
+# and what the error message tells the user to pick.
+FREE_TIER_GEMINI = "gemini-3.5-flash"
+
 _FAST_MODELS:  dict[str, str] = {"anthropic": "claude-haiku-4-5-20251001", "gemini": "gemini-3.5-flash", "openai": "gpt-4o-mini", "ollama": "llama3.1"}
 _SMART_MODELS: dict[str, str] = {"anthropic": "claude-sonnet-4-6",          "gemini": "gemini-3.5-flash", "openai": "gpt-4o",      "ollama": "llama3.1"}
 
@@ -789,7 +794,12 @@ def _migrate_dead_gemini_models(cfg: dict) -> bool:
 
     Returns True if anything (including the guard flag) changed."""
     pro_done = bool(cfg.get("gemini_freetier_migrated"))
-    dead = {"gemini-2.0-flash": "gemini-2.5-flash"}
+    dead = {
+        "gemini-2.0-flash": "gemini-2.5-flash",
+        # Not a Google model ID at all — it reaches the API and comes back
+        # 429 "limit: 0", which reads as a quota problem rather than a typo.
+        "gemini-3-flash": FREE_TIER_GEMINI,
+    }
     if not pro_done:
         dead["gemini-2.5-pro"] = "gemini-2.5-flash"
 
@@ -820,6 +830,16 @@ def _migrate_dead_gemini_models(cfg: dict) -> bool:
     cc = tools.get("card_creator")
     if isinstance(cc, dict) and isinstance(cc.get("quality_pass"), dict):
         fix(cc["quality_pass"], "grader_model")
+
+    # ai_matrix is where model choices actually live since the AI-tab
+    # consolidation; the per-tool keys above are the legacy fallbacks. Missing
+    # this made the whole migration a no-op for anyone already on the matrix —
+    # which is how a dead model ID sat in card_creation failing every run.
+    matrix = cfg.get("ai_matrix")
+    if isinstance(matrix, dict):
+        for entry in matrix.values():
+            if isinstance(entry, dict):
+                fix(entry, "model")
 
     if not pro_done:
         cfg["gemini_freetier_migrated"] = True

@@ -2257,13 +2257,17 @@ class CreatorPanel(QWidget):
             btn.setAutoDefault(False)
             btn.clicked.connect(lambda _c=False, b=bid: self._open_batch(b))
             row.addWidget(btn)
-            if work:
-                dis = QPushButton("Discard")
-                dis.setAutoDefault(False)
-                dis.setToolTip("Throw these written cards away. Nothing in your "
-                               "collection changes.")
-                dis.clicked.connect(lambda _c=False, b=bid: self._discard_batch(b))
-                row.addWidget(dis)
+            # EVERY batch gets a way out, not just work-through ones. A batch
+            # you don't want has to be opened, then rejected card by card, then
+            # committed-with-nothing — so in practice they just sit there
+            # forever, and the panel fills with runs from weeks ago.
+            dis = QPushButton("Discard")
+            dis.setAutoDefault(False)
+            dis.setToolTip("Throw this batch's written cards away without "
+                           "opening it. Nothing in your collection changes — "
+                           "these cards were never added.")
+            dis.clicked.connect(lambda _c=False, b=bid: self._discard_batch(b))
+            row.addWidget(dis)
             holder = QWidget()
             holder.setLayout(row)
             self.batch_layout.addWidget(holder)
@@ -2274,9 +2278,22 @@ class CreatorPanel(QWidget):
         from . import create_jobs
         jobs = create_jobs.by_batch(batch_id)
         n = sum(len(j.get("cards") or []) for j in jobs)
-        if not askUser(f"Discard {n} written card(s) from that Work-through run?"
-                       "\n\nNothing in your collection changes."):
+        live = sum(1 for j in jobs
+                   if j.get("status") in (create_jobs.QUEUED, create_jobs.RUNNING))
+        what = (f"{n} written card(s)" if n else f"{len(jobs)} job(s)")
+        extra = (f"\n\n{live} of them are still generating and will be "
+                 "cancelled." if live else "")
+        if not askUser(f"Discard {what} from that batch?{extra}\n\n"
+                       "Nothing in your collection changes — these cards were "
+                       "never added. This can't be undone.", defaultno=True):
             return
+        if live:
+            # Cancel first: removing the records out from under a running
+            # worker leaves it writing cards into a batch nothing reads.
+            try:
+                create_jobs.cancel_batch(batch_id)
+            except Exception as e:
+                print(f"[ankisstant] couldn't cancel batch {batch_id}: {e}")
         create_jobs.remove_batch(batch_id)
         self.refresh_ready_lists()
 

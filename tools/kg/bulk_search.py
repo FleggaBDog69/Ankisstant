@@ -191,12 +191,19 @@ class BulkSearchDialog(QDialog):
         self._notetype = None
         self._write_cb = None
         self._gen_batch_id = ""
-        self._gen_jobs: dict = {}            # kg_id -> the create_jobs record
+        # job_id -> the create_jobs record. Keyed by JOB, not by gap: a gap
+        # gets a second write when you untick its found cards and ask for one,
+        # and a dict keyed by gap silently dropped the first job on the floor.
+        self._gen_jobs: dict = {}
         self._gen_profile: dict = {}         # the notetype profile cards commit under
         self._gen_active = False             # jobs still running
         self._gen_rendered = False           # the written cards are on screen
-        self._gen_shown: set = set()         # kg_ids whose cards are rendered
+        self._gen_shown: set = set()         # job_ids whose cards are rendered
         self._gen_seen: dict = {}            # normalised front -> gap that has it
+        # kg_id -> (what the search found, cards it chose, total points).
+        # Kept beside the tree so a gap row can be relabelled from live ticks
+        # while still being able to say what the search originally concluded.
+        self._search_finding: dict = {}
         self._applied = False
         self._poll = QTimer(self)
         self._poll.setInterval(750)
@@ -1110,6 +1117,7 @@ class BulkSearchDialog(QDialog):
             top.setExpanded(True)
 
         self._tree.blockSignals(False)
+        self._relabel_gaps()
 
         full, partial, empty = self._outcome_split()
         self._gap_hint.setText(
@@ -1221,6 +1229,37 @@ class BulkSearchDialog(QDialog):
         kind = item.data(0, self.ROLE_KIND)
         menu = QMenu(self._tree)
 
+        if kind == "point":
+            # The action for "these cards don't actually answer this".
+            act = menu.addAction("\u270d\ufe0e  Write a card for this point",
+                                 lambda: self._write_for_point(item))
+            act.setToolTip(
+                "Generate a card for this point specifically. Use it when the "
+                "cards found above don\u2019t really answer it \u2014 untick "
+                "them, then ask for one that does.")
+            ticked = any(
+                item.child(i).checkState(0) == Qt.CheckState.Checked
+                and item.child(i).data(0, self.ROLE_KIND) == "note"
+                for i in range(item.childCount()))
+            if ticked:
+                menu.addAction(
+                    "Untick this point\u2019s found cards",
+                    lambda: self._untick_point(item))
+            menu.exec(self._tree.mapToGlobal(pos))
+            return
+
+        if kind == "note":
+            parent = item.parent()
+            if parent is not None and parent.data(0, self.ROLE_KIND) == "point":
+                menu.addAction(
+                    "Untick this and write a card for the point instead",
+                    lambda: self._untick_and_write(parent))
+                menu.addSeparator()
+            menu.addAction("Open in the Anki browser",
+                           lambda: self._on_tree_double_clicked(item, 0))
+            menu.exec(self._tree.mapToGlobal(pos))
+            return
+
         if kind == "newcard":
             ticked = item.checkState(0) == Qt.CheckState.Checked
             menu.addAction("Edit this card\u2026", lambda: self._edit_written(item))
@@ -1250,6 +1289,22 @@ class BulkSearchDialog(QDialog):
         menu.addAction("Retry writing this gap",
                        lambda: self._on_gen_retry(job.get("id") or ""))
         menu.exec(self._tree.mapToGlobal(pos))
+
+    def _untick_point(self, node) -> None:
+        """Clear the ticks on one point's found cards."""
+        self._tree.blockSignals(True)
+        for i in range(node.childCount()):
+            ch = node.child(i)
+            if ch.data(0, self.ROLE_KIND) == "note":
+                ch.setCheckState(0, Qt.CheckState.Unchecked)
+        self._tree.blockSignals(False)
+        self._update_selection_count()
+
+    def _untick_and_write(self, node) -> None:
+        """The whole gesture in one action: these cards don't answer the point,
+        so drop them and ask for one that does."""
+        self._untick_point(node)
+        self._write_for_point(node)
 
     def _card_action(self, leaf, what: str) -> None:
         """Rewrite / split / one-by-one on a single written card.
@@ -1371,8 +1426,61 @@ class BulkSearchDialog(QDialog):
                 partial.append(kg_id)
         return full, partial, empty
 
+    def _relabel_gaps(self) -> None:
+        """Rewrite each gap row from what is TICKED right now.
+
+        The row used to be written once, from the allocator's picks, and never
+        again — so unticking every card under a gap left the header still
+        announcing "3 card(s)", which is the opposite of what the screen was
+        being used to decide. The search's own conclusion isn't lost; it moves
+        to the tooltip, where a claim about the past belongs."""
+        for i in range(self._tree.topLevelItemCount()):
+            top = self._tree.topLevelItem(i)
+            kg_id = top.data(0, self.ROLE_KEY)
+            title = top.data(0, self.ROLE_TITLE)
+            if title is None:
+                continue
+            found, n_found, total = self._search_finding.get(kg_id, ("", 0, 0))
+
+            n_ticked = 0
+            pts_ticked = 0
+            n_written = 0
+            for pi in range(top.childCount()):
+                node = top.child(pi)
+                if node.data(0, self.ROLE_KIND) != "point":
+                    continue
+                hits = 0
+                for ci in range(node.childCount()):
+                    leaf = node.child(ci)
+                    if leaf.checkState(0) != Qt.CheckState.Checked:
+                        continue
+                    kind = leaf.data(0, self.ROLE_KIND)
+                    if kind == "note":
+                        hits += 1
+                    elif kind == "newcard":
+                        n_written += 1
+                if hits:
+                    pts_ticked += 1
+                    n_ticked += hits
+            for leaf, _card in self._written_items():
+                if str(leaf.data(0, self.ROLE_KG) or "") == kg_id \
+                        and leaf.parent() is not None \
+                        and leaf.parent().data(0, self.ROLE_KIND) == "written" \
+                        and leaf.checkState(0) == Qt.CheckState.Checked:
+                    n_written += 1
+
+            bits = []
+            if total:
+                bits.append(f"{pts_ticked}/{total} point(s) ticked")
+            bits.append("no cards ticked" if not n_ticked
+                        else f"{n_ticked} existing card(s)")
+            if n_written:
+                bits.append(f"{n_written} new card(s)")
+            top.setText(0, f"{title}      " + "  \u00b7  ".join(bits))
+
     def _update_selection_count(self) -> None:
         ticked = self._ticked()
+        self._relabel_gaps()
         n = len({nid for rec in ticked.values() for nid in rec["nids"]})
         self._sel_lbl.setText(f"{n} card(s) ticked")
         full, partial, empty = self._outcome_split()
@@ -1672,6 +1780,100 @@ class BulkSearchDialog(QDialog):
         self._poll.start()
         self._on_gen_poll()
 
+    def _write_for_point(self, node) -> None:
+        """Write a card for ONE point, on demand.
+
+        The case this exists for: the search found cards for a point, you read
+        them, and they don't actually answer it — so you untick them and want a
+        card that does. Nothing else on the screen could express that, because
+        generation only ever ran on what the search declared uncovered, and by
+        then it had already decided this point was fine.
+
+        It joins the existing batch rather than starting its own, so it shares
+        the progress bar, the Stop button, the one Apply and the one undo."""
+        kg_id = str(node.data(0, self.ROLE_KG) or "")
+        concept = str(node.data(0, self.ROLE_CONCEPT) or "")
+        if not kg_id or not concept:
+            return
+        if not provider_configured() or is_manual_provider():
+            showWarning("Writing a card needs a CLI or API provider — set one "
+                        "up in Ankisstant Settings.")
+            return
+        notetype_name = (self._notetype.currentText().strip()
+                         if self._notetype is not None else "")
+        if not notetype_name:
+            showWarning("No notetype is set, so there's nothing to write the "
+                        "card as. Settings → AI Create adds notetype profiles.")
+            return
+
+        plan = next((p for p in self._run_plans if p.kg_id == kg_id), None)
+        kg = kg_store.get(kg_id)
+        if plan is None or not kg:
+            return
+        # Coverage splits into covered/gaps; a point you are asking about is by
+        # definition on the covered side (the gaps were written for already).
+        members = (list(self._coverage.covered) + list(self._coverage.gaps)
+                   if self._coverage is not None else [])
+        point = next((m.point for m in members
+                      if m.point.kg_id == kg_id and m.point.concept == concept),
+                     None)
+        if point is None:
+            log.warn(f"work through: no point matching {concept!r} on {kg_id}")
+            return
+
+        from ...core.config import tool_model_for
+        from .. import create_jobs
+        from . import gen_prompt
+        try:
+            autotag.refresh_vocab_cache()
+        except Exception as e:
+            log.warn(f"work through: vocab cache refresh failed: {e}")
+
+        rec = create_record_for(kg, plan.concept, [{
+            "concept": point.concept, "terms": list(point.terms),
+            "system": point.system, "subsystem": point.subsystem,
+            "topic": point.topic}])
+        one = kg_triage.plan_from_queued_gap(rec)
+        if one is None:
+            showWarning("Couldn't turn that point into a generation plan — "
+                        "see the log.")
+            return
+
+        cc_cfg = tool_config("card_creator")
+        base_tags = [t.strip() for t in (cc_cfg.get("default_tags") or [])
+                     if str(t).strip()]
+        audit = (cc_cfg.get("audit_tag") or "").strip()
+        if audit and audit not in base_tags:
+            base_tags.append(audit)
+        records = gen_prompt.build_batch(
+            plans=[one], gaps_by_id={kg_id: rec},
+            deck_name=((self._deck.currentText().strip()
+                        if self._deck is not None else "") or "Default"),
+            notetype_name=notetype_name, base_tags=base_tags,
+            tags_by_kg={kg_id: self._tag_text(kg_id)},
+            model=tool_model_for("card_creation"), origin="work-through",
+            batch_id=self._gen_batch_id)
+        if not records:
+            showWarning("Couldn't build a generation request for that point — "
+                        "see the log.")
+            return
+
+        self._gen_batch_id = records[0]["batch_id"]
+        self._gen_active = True
+        create_jobs.enqueue_batch(records)
+        self._mark_in_progress([kg_id])
+        self._tree.blockSignals(True)
+        row = self._pending_row(node, kg_id, self._WRITING)
+        row.setData(0, self.ROLE_KEY, str(records[0].get("id") or ""))
+        self._tree.blockSignals(False)
+        self._show_written_ui()
+        self._progress.setRange(0, 100)
+        self._progress.setVisible(True)
+        self._stop_btn.setVisible(True)
+        self._stop_btn.setEnabled(True)
+        self._poll.start()
+        self._update_selection_count()
+
     def _mark_in_progress(self, kg_ids) -> None:
         """Handed to a tool, so no longer untouched \u2014 same rule the KG page
         follows when it queues a gap."""
@@ -1780,6 +1982,14 @@ class BulkSearchDialog(QDialog):
     def _point_concepts(self, job: dict) -> list:
         return [str(c or "") for c in (job.get("mass_points") or [])]
 
+    def _job_for_kg(self, kg_id: str) -> dict:
+        """A representative job for a gap, for the things every job of that gap
+        shares: the deck it writes into and the tag base it commits under."""
+        for j in self._gen_jobs.values():
+            if str(j.get("kg_id") or "") == str(kg_id):
+                return j
+        return {}
+
     def _card_home(self, kg_id: str, job: dict, card: dict):
         """Where a written card's row belongs: under the point it answers when
         the model said which one and that point is on screen, otherwise under
@@ -1855,6 +2065,7 @@ class BulkSearchDialog(QDialog):
         row = QTreeWidgetItem(node)
         row.setData(0, self.ROLE_KIND, "pending")
         row.setData(0, self.ROLE_KG, kg_id)
+        row.setData(0, self.ROLE_KEY, "")
         row.setFlags(row.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
         f = row.font(0)
         f.setItalic(True)
@@ -1863,19 +2074,39 @@ class BulkSearchDialog(QDialog):
         node.setExpanded(True)
         return row
 
-    def _clear_pending(self, kg_id: str) -> None:
+    def _clear_pending(self, kg_id: str, concepts=None, *,
+                       kinds=("pending",), job_id: str = "") -> None:
+        """Drop this gap's transient rows.
+
+        `concepts` scopes it to the points ONE job is responsible for, because a
+        gap can have two jobs in flight — the batch write, and an on-demand
+        write for a single point you asked for after unticking its cards. A
+        blanket clear would delete the other one's row."""
         top = self._gap_item(kg_id)
         if top is None:
             return
-        stack = [top]
+        want = None
+        if concepts is not None:
+            want = {" ".join(str(c).split()).casefold() for c in concepts}
+        stack = [(top, None)]
         while stack:
-            it = stack.pop()
+            it, concept = stack.pop()
             for i in reversed(range(it.childCount())):
                 ch = it.child(i)
-                if ch.data(0, self.ROLE_KIND) == "pending":
-                    it.removeChild(ch)
-                else:
-                    stack.append(ch)
+                kind = ch.data(0, self.ROLE_KIND)
+                if kind == "point":
+                    stack.append((ch, ch.data(0, self.ROLE_CONCEPT)))
+                    continue
+                if kind not in kinds:
+                    stack.append((ch, concept))
+                    continue
+                if job_id and str(ch.data(0, self.ROLE_KEY) or "") != job_id \
+                        and kind == "pending":
+                    continue
+                if want is not None and concept is not None \
+                        and " ".join(str(concept).split()).casefold() not in want:
+                    continue
+                it.removeChild(ch)
 
     def _render_written_placeholders(self, records: list[dict]) -> None:
         """Mark every point that is about to have a card written for it.
@@ -1907,7 +2138,7 @@ class BulkSearchDialog(QDialog):
         self._tree.blockSignals(True)
         for j in jobs:
             kg_id = str(j.get("kg_id") or "")
-            if kg_id in self._gen_shown:
+            if str(j.get("id") or "") in self._gen_shown:
                 continue          # its cards are on screen; nothing to promise
             st = str(j.get("status") or "")
             text = self._PENDING_TEXT.get(st, st)
@@ -1916,7 +2147,8 @@ class BulkSearchDialog(QDialog):
             for concept in self._point_concepts(j):
                 node = self._point_node(kg_id, concept)
                 if node is not None:
-                    self._pending_row(node, kg_id, text)
+                    row = self._pending_row(node, kg_id, text)
+                    row.setData(0, self.ROLE_KEY, str(j.get("id") or ""))
             folder = self._written_folder(kg_id)
             if folder is not None:
                 n = len(j.get("mass_points") or [])
@@ -1945,7 +2177,7 @@ class BulkSearchDialog(QDialog):
         from .. import card_creator as cc
         from .mass_create import _norm_front
 
-        self._gen_jobs = {str(j.get("kg_id") or ""): j for j in jobs}
+        self._gen_jobs = {str(j.get("id") or ""): j for j in jobs}
 
         # PER GAP, as each one lands. Waiting for the whole batch meant a gap
         # that finished in twenty seconds sat behind one that took three
@@ -1953,7 +2185,7 @@ class BulkSearchDialog(QDialog):
         # rendered once and then left alone.
         fresh = [j for j in jobs
                  if str(j.get("status") or "") in ("ready", "error", "interrupted")
-                 and str(j.get("kg_id") or "") not in self._gen_shown]
+                 and str(j.get("id") or "") not in self._gen_shown]
         if not fresh:
             return          # nothing new landed this tick; don't redo the work
 
@@ -1989,24 +2221,36 @@ class BulkSearchDialog(QDialog):
         idx = 0
         for j in fresh:
             kg_id = str(j.get("kg_id") or "")
-            self._gen_shown.add(kg_id)
+            self._gen_shown.add(str(j.get("id") or ""))
             if self._gap_item(kg_id) is None:
                 idx += len(j.get("cards") or [])
                 continue
-            self._clear_pending(kg_id)
+            # Only THIS job's own pending rows. A gap can have a second job
+            # running (an on-demand write for one point) and clearing the whole
+            # gap would wipe the row telling you about it.
+            self._clear_pending(kg_id, self._point_concepts(j))
             folder = self._written_folder(kg_id, create=True)
-            for leaf in list(self._written_rows_under(folder)):
-                folder.removeChild(leaf)
             cards = list(j.get("cards") or [])
             verdicts = list(j.get("verdicts") or [])
+            concepts = self._point_concepts(j)
             if not cards:
                 st = j.get("status")
-                folder.setText(0, (
-                    "\u26a0\ufe0f  nothing was written for this gap \u2014 "
-                    + str(j.get("error") or "the AI returned no cards")
-                    + " \u00b7 right-click to retry")
-                    if st in ("error", "interrupted")
-                    else "\u2014  the AI returned no cards for this gap")
+                why = str(j.get("error") or "the AI returned no cards")
+                msg = (f"\u26a0\ufe0f  nothing was written \u2014 {why} "
+                       "\u00b7 right-click to retry"
+                       if st in ("error", "interrupted")
+                       else "\u2014  the AI returned no cards \u00b7 "
+                            "right-click to retry")
+                # A single-point job failed for THAT point, so say so there
+                # rather than on the gap, where it would read as the whole gap
+                # having failed.
+                node = (self._point_node(kg_id, concepts[0])
+                        if len(concepts) == 1 else None)
+                if node is not None:
+                    row = self._pending_row(node, kg_id, msg)
+                    row.setData(0, self.ROLE_KEY, str(j.get("id") or ""))
+                else:
+                    folder.setText(0, msg)
                 idx += 1
                 continue
             n_at_gap = 0
@@ -2105,8 +2349,8 @@ class BulkSearchDialog(QDialog):
         # Only gaps that have actually finished. A queued job has no cards yet,
         # and counting it as "came back with no cards" reports a failure that
         # hasn't happened.
-        blank = [kg_id for kg_id, j in self._gen_jobs.items()
-                 if kg_id in self._gen_shown and not (j.get("cards") or [])]
+        blank = [jid for jid, j in self._gen_jobs.items()
+                 if jid in self._gen_shown and not (j.get("cards") or [])]
         if blank:
             note = ((note + "  ") if note else "") + (
                 f"{len(blank)} gap(s) came back with no cards \u2014 right-click "
@@ -2127,7 +2371,8 @@ class BulkSearchDialog(QDialog):
         full, _partial, _empty = self._outcome_split()
         covered = set(full)
         names = []
-        for kg_id, j in self._gen_jobs.items():
+        for _jid, j in self._gen_jobs.items():
+            kg_id = str(j.get("kg_id") or "")
             if kg_id not in covered or not (j.get("cards") or []):
                 continue
             folder = self._written_folder(kg_id)
@@ -2147,6 +2392,16 @@ class BulkSearchDialog(QDialog):
         from .. import create_jobs
         if not job_id:
             return
+        # retry_job REUSES the job id, so a job already in _gen_shown would
+        # never be drawn again. Forget it, and take its rows with it.
+        job = self._gen_jobs.get(job_id) or {}
+        kg_id = str(job.get("kg_id") or "")
+        self._gen_shown.discard(job_id)
+        if kg_id:
+            self._tree.blockSignals(True)
+            self._clear_pending(kg_id, self._point_concepts(job),
+                                kinds=("pending", "newcard"))
+            self._tree.blockSignals(False)
         create_jobs.retry_job(job_id)
         self._gen_active = True
         self._progress.setRange(0, 100)
@@ -2270,7 +2525,7 @@ class BulkSearchDialog(QDialog):
         if nt is None:
             return created_by_kg
         for kg_id, cards in batches:
-            job = self._gen_jobs.get(kg_id) or {}
+            job = self._job_for_kg(kg_id)
             # The gap's tag box governs BOTH halves. Re-read it now rather than
             # trusting what the job was enqueued with, so editing the tag after
             # generation moves the written cards along with the found ones —
