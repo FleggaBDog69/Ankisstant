@@ -3548,6 +3548,7 @@ class CreatorPanel(QWidget):
                     kg_store.update(kg_id, status="done")
                     from . import knowledge_gaps
                     knowledge_gaps._refresh_open_panel()
+                    knowledge_gaps.maybe_sync_to_things()
             except Exception as e:
                 print(f"[ankisstant] mark KG done failed: {e}")
             # Only the modal path reaches here, and only on accept — so unlike
@@ -3703,6 +3704,7 @@ class CreatorPanel(QWidget):
                     kg_store.update(kg_id, status="done")
                     from . import knowledge_gaps
                     knowledge_gaps._refresh_open_panel()
+                    knowledge_gaps.maybe_sync_to_things()
             except Exception as e:
                 print(f"[ankisstant] mark KG done (job) failed: {e}")
         self.refresh_ready_lists()

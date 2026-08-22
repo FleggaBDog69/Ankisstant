@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import tempfile
 
 from ...core import log
@@ -182,6 +183,144 @@ def _fetch(con, tag: str, include_done: bool) -> list[dict]:
             "area": str(area or ""),
         })
     return out
+
+
+# ── writing back ────────────────────────────────────────────────────────────
+#
+# Reads go through SQLite; writes go through AppleScript, and the asymmetry is
+# deliberate. Things syncs its store through Things Cloud and keeps its own
+# change log; writing a completion straight into the database would tick the
+# to-do off on this Mac and then be overwritten, or worse, desync the store.
+# AppleScript hands the change to Things itself, which is the only thing that
+# knows how to record it.
+
+_APP = "Things3"
+
+# One osascript for the whole set, not one per to-do: each launch is ~100ms of
+# Apple-events setup, and a fifty-gap sync would spend five seconds doing
+# nothing else. Each id is tried independently so one stale id (the to-do was
+# deleted in Things after the import) can't take the rest of the batch down.
+_COMPLETE_SCRIPT = """
+on run argv
+    set doneCount to 0
+    set missingCount to 0
+    tell application "%s"
+        repeat with theId in argv
+            set tid to theId as text
+            try
+                set td to to do id tid
+                if status of td is open then
+                    set status of td to completed
+                    set doneCount to doneCount + 1
+                end if
+            on error
+                set missingCount to missingCount + 1
+            end try
+        end repeat
+    end tell
+    return (doneCount as text) & "|" & (missingCount as text)
+end run
+""" % _APP
+
+
+def app_installed() -> bool:
+    return os.path.isdir("/Applications/%s.app" % _APP)
+
+
+def complete_in_things(uuids: list, *, timeout: int = 60) -> tuple:
+    """Tick these to-dos off in Things. Returns (completed, missing, error).
+
+    Never raises. A to-do that is ALREADY completed is counted as neither — it
+    needed nothing — so re-running a sync reports zero rather than re-reporting
+    work it did last time. An id Things no longer knows about is counted as
+    `missing`, which is information (that to-do was deleted over there), not a
+    failure."""
+    # `if u` before str(): str(None) is the four-character string "None", which
+    # would sail through a truthiness check on the converted value and be sent
+    # to Things as a to-do id.
+    ids = [str(u).strip() for u in (uuids or []) if u and str(u).strip()]
+    if not ids:
+        return 0, 0, ""
+    if not app_installed():
+        return 0, 0, "%s isn't installed on this Mac." % _APP
+    try:
+        proc = subprocess.run(
+            ["osascript", "-", *ids], input=_COMPLETE_SCRIPT,
+            capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return 0, 0, ("%s didn't respond within %ss. It may be showing a "
+                      "dialog, or syncing." % (_APP, timeout))
+    except Exception as e:
+        return 0, 0, "Couldn't talk to %s: %s" % (_APP, e)
+    if proc.returncode != 0:
+        err = (proc.stderr or "").strip()
+        # The first run asks macOS for permission to control Things. Denied, it
+        # comes back as -1743, which as raw AppleScript noise tells the user
+        # nothing about the checkbox they actually need to tick.
+        if "-1743" in err or "Not authorized" in err or "not allowed" in err:
+            return 0, 0, (
+                "macOS blocked Anki from controlling Things. Allow it in "
+                "System Settings → Privacy & Security → Automation → Anki, "
+                "then try again.")
+        return 0, 0, err or ("%s refused the change." % _APP)
+    out = (proc.stdout or "").strip()
+    try:
+        done_s, missing_s = out.split("|", 1)
+        return int(done_s), int(missing_s), ""
+    except ValueError:
+        log.warn("things: unexpected write-back reply %r" % out)
+        return 0, 0, ""
+
+
+def open_uuids(uuids) -> set:
+    """Of these Things ids, the ones still OPEN in Things right now.
+
+    Read before writing so a sync reports what it actually changed, and so a
+    to-do already ticked off by hand isn't counted as work this did."""
+    wanted = {str(u).strip() for u in (uuids or []) if u and str(u).strip()}
+    if not wanted:
+        return set()
+    path = db_path()
+    if not path:
+        return set()
+    snap = ""
+    try:
+        snap = _snapshot(path)
+        con = sqlite3.connect(snap)
+        try:
+            out = set()
+            ids = list(wanted)
+            for chunk in (ids[i:i + 400] for i in range(0, len(ids), 400)):
+                marks = ",".join("?" * len(chunk))
+                out.update(str(r[0]) for r in con.execute(
+                    "select uuid from TMTask where uuid in (%s) "
+                    "and status = %d and trashed = 0" % (marks, _OPEN), chunk))
+            return out
+        finally:
+            con.close()
+    except Exception as e:
+        log.warn("things: couldn't check open state: %s" % e)
+        return set()
+    finally:
+        _cleanup(snap)
+
+
+def linked_uuid(kg: dict) -> str:
+    return str(((kg or {}).get("fields") or {}).get("things_uuid") or "").strip()
+
+
+def pending_writeback(kgs: list) -> list:
+    """KGs finished here that are still open over there.
+
+    BOTH halves are checked: done in Ankisstant AND open in Things. Skipping
+    the second read would make every sync re-send every gap ever completed."""
+    candidates = [(k, linked_uuid(k)) for k in (kgs or [])]
+    candidates = [(k, u) for k, u in candidates
+                  if u and str(k.get("status") or "") == "done"]
+    if not candidates:
+        return []
+    still_open = open_uuids([u for _k, u in candidates])
+    return [k for k, u in candidates if u in still_open]
 
 
 # ── markdown ────────────────────────────────────────────────────────────────

@@ -311,6 +311,21 @@ def remove(item_id: str) -> None:
     save_all([it for it in load_all() if it.get("id") != item_id])
 
 
+def remove_many(item_ids) -> int:
+    """Drop several at once. ONE read-modify-write, not one per id: save_all
+    rewrites the whole file, so a loop of remove() over forty gaps is forty
+    full rewrites and forty chances for a concurrent write to lose the rest."""
+    wanted = {str(i) for i in (item_ids or []) if i}
+    if not wanted:
+        return 0
+    items = load_all()
+    keep = [it for it in items if str(it.get("id")) not in wanted]
+    removed = len(items) - len(keep)
+    if removed:
+        save_all(keep)
+    return removed
+
+
 def count(filter_fn: Callable[[dict], bool] | None = None) -> int:
     items = load_all()
     if filter_fn is None:

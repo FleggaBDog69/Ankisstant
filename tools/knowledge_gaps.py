@@ -22,7 +22,8 @@ from aqt.qt import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
     QDialogButtonBox, QFileDialog, QFont, QFontMetrics, QFrame, QGridLayout,
     QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
-    QColor, QListWidgetItem, QMenu, QPlainTextEdit, QPushButton, QRect,
+    QColor, QListWidgetItem, QMenu, QMessageBox, QPlainTextEdit, QPushButton,
+    QRect,
     QScrollArea,
     QSizePolicy, QSplitter, QStyle, QStyledItemDelegate, QStyleOptionViewItem,
     QHeaderView, QTableWidget, QTableWidgetItem,
@@ -771,9 +772,24 @@ class _GroupManagerDialog(QDialog):
         self._archive_btn = QPushButton("Archive")
         self._archive_btn.setAutoDefault(False)
         self._archive_btn.clicked.connect(self._toggle_archive)
-        for b in (self._open_btn, self._edit_btn, self._retag_btn, self._archive_btn):
+        self._delete_btn = QPushButton("Delete…")
+        self._delete_btn.setAutoDefault(False)
+        self._delete_btn.setToolTip(
+            "Remove this group. You choose whether its gaps go with it — "
+            "cards already in your collection are never touched.")
+        self._delete_btn.clicked.connect(self._delete)
+        for b in (self._open_btn, self._edit_btn, self._retag_btn,
+                  self._archive_btn, self._delete_btn):
             row.addWidget(b)
         row.addStretch(1)
+        sweep = QPushButton("Forget empty groups")
+        sweep.setAutoDefault(False)
+        sweep.setToolTip(
+            "Clear out groups with no gaps left, and the saved tag settings of "
+            "groups that no longer exist — which is what makes an old name "
+            "come back with its old tag branch attached.")
+        sweep.clicked.connect(self._delete_empty)
+        row.addWidget(sweep)
         close = QPushButton("Close")
         close.setAutoDefault(True)
         close.clicked.connect(self.accept)
@@ -789,6 +805,20 @@ class _GroupManagerDialog(QDialog):
     def _reload(self, *_a) -> None:
         stats = self._panel._group_stats()
         archived = set(self._panel._archived_groups())
+        # Groups that exist only in config — every gap gone, but an archive
+        # flag or a tag override still saved. They are invisible everywhere
+        # else, which is exactly why the one screen that manages groups has to
+        # show them: otherwise there is no way to get rid of them.
+        try:
+            cfg = tool_config("knowledge_gaps")
+            ghosts = (set(str(g) for g in (cfg.get("archived_groups") or []))
+                      | set(str(g) for g in
+                            (cfg.get("group_tag_overrides") or {}))) - set(stats)
+        except Exception:
+            ghosts = set()
+        for g in ghosts:
+            stats[g] = {"total": 0, "open": 0, "in_progress": 0, "done": 0,
+                        "last": ""}
         names = list(stats.keys())
         show_arch = self._show_archived.isChecked()
         if not show_arch:
@@ -810,6 +840,10 @@ class _GroupManagerDialog(QDialog):
                 "Finished" if finished else "Active")
             if n in archived and finished:
                 state = "Archived · finished"
+            if not st["total"]:
+                # In words, not by being greyed out: an empty row that merely
+                # looks faint reads as "disabled", not as "this has no gaps".
+                state = "Empty — no gaps left"
             cells = [n, autotag.group_segment(n), str(st["total"]),
                      str(st["open"] + st["in_progress"]), str(st["done"]), state]
             for c, text in enumerate(cells):
@@ -842,7 +876,8 @@ class _GroupManagerDialog(QDialog):
     def _refresh_buttons(self) -> None:
         name = self._selected()
         on = bool(name)
-        for b in (self._open_btn, self._edit_btn, self._retag_btn, self._archive_btn):
+        for b in (self._open_btn, self._edit_btn, self._retag_btn,
+                  self._archive_btn, self._delete_btn):
             b.setEnabled(on)
         archived = name and name in set(self._panel._archived_groups())
         self._archive_btn.setText("Restore" if archived else "Archive")
@@ -852,6 +887,125 @@ class _GroupManagerDialog(QDialog):
         )
 
     # ── actions ──────────────────────────────────────────────────────────────
+
+    def _delete(self) -> None:
+        """Delete a group. Two very different things go by that name.
+
+        Removing the label and removing the work are separate decisions, and a
+        single "Delete" that quietly did both would be the most destructive
+        button on the page. So it asks which, states the count for each, and
+        says plainly what it does NOT touch: the Anki notes. Cards already
+        tagged under this group's branch stay tagged — deleting a label here
+        must not reach into the collection."""
+        name = self._selected()
+        if not name:
+            return
+        ids = [k["id"] for k in kg_store.load_all()
+               if str(k.get("group") or "").strip() == name and k.get("id")]
+        seg = autotag.group_segment(name)
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Delete group")
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText(f"Delete the group “{name}”?")
+        box.setInformativeText(
+            (f"It holds {len(ids)} gap(s).\n\n" if ids else "It holds no gaps.\n\n")
+            + "Cards already in your collection are NOT touched either way — "
+            f"anything tagged under {seg} keeps that tag. Remove it in the "
+            "Anki browser if you want it gone.")
+        just = box.addButton("Delete the group only",
+                             QMessageBox.ButtonRole.AcceptRole)
+        both = None
+        if ids:
+            both = box.addButton(f"Delete the group and its {len(ids)} gap(s)",
+                                 QMessageBox.ButtonRole.DestructiveRole)
+        cancel = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel)
+        just.setToolTip("The gaps stay exactly where they are, without a group.")
+        if both is not None:
+            both.setToolTip("The gaps are removed from Ankisstant. This can't "
+                            "be undone.")
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is cancel or clicked is None:
+            return
+
+        if both is not None and clicked is both:
+            # Second confirm, because this is the one that destroys work and
+            # the first dialog's job was choosing BETWEEN two actions — a
+            # destructive choice shouldn't ride in on a decision about which.
+            if not askUser(f"Really delete {len(ids)} gap(s) in “{name}”?\n\n"
+                           "Their notes, resources and history go with them. "
+                           "This can't be undone.", defaultno=True):
+                return
+            try:
+                removed = kg_store.remove_many(ids)
+            except Exception as e:
+                showWarning(f"Couldn't delete those gaps: {e}")
+                return
+            what = f"Deleted “{name}” and {removed} gap(s)."
+        else:
+            try:
+                for kid in ids:
+                    kg_store.update(kid, group="")
+            except Exception as e:
+                showWarning(f"Couldn't ungroup those gaps: {e}")
+                return
+            what = (f"Deleted “{name}”. {len(ids)} gap(s) kept, now ungrouped."
+                    if ids else f"Deleted “{name}”.")
+
+        # The label is gone, so its UI state and tag override are dead weight —
+        # and a stale override would silently apply again to a NEW group that
+        # happened to reuse the name.
+        self._forget_group(name)
+        tooltip(what, period=5000)
+        self._reload()
+        self._panel.refresh_list()
+
+    def _forget_group(self, name: str) -> None:
+        try:
+            cfg = tool_config("knowledge_gaps")
+            for key in ("collapsed_groups", "archived_groups"):
+                cfg[key] = [g for g in (cfg.get(key) or []) if str(g) != name]
+            overrides = dict(cfg.get("group_tag_overrides") or {})
+            overrides.pop(name, None)
+            cfg["group_tag_overrides"] = overrides
+            save_tool_config("knowledge_gaps", cfg)
+        except Exception as e:
+            print(f"[ankisstant] couldn't forget group {name!r}: {e}")
+
+    def _delete_empty(self) -> None:
+        """Sweep up labels with nothing left in them.
+
+        A group only exists because a gap says it does, so an empty one is
+        already invisible on the list page — but its tag override and archive
+        state live on in config, and that is what makes a name you deleted
+        months ago come back with its old tag branch attached."""
+        stats = self._panel._group_stats()
+        empty = sorted(n for n, st in stats.items() if not st["total"])
+        cfg = tool_config("knowledge_gaps")
+        orphaned = sorted(
+            set(str(g) for g in (cfg.get("archived_groups") or []))
+            | set(str(g) for g in (cfg.get("group_tag_overrides") or {}))
+            - set(stats))
+        dead = sorted(set(empty) | set(orphaned))
+        if not dead:
+            tooltip("No empty groups — every group still has gaps in it.",
+                    period=4000)
+            return
+        shown = "\n".join(f"  • {n}" for n in dead[:15])
+        more = f"\n  … and {len(dead) - 15} more" if len(dead) > 15 else ""
+        if not askUser(f"Forget {len(dead)} empty group(s)?\n\n{shown}{more}\n\n"
+                       "These have no gaps left. Their saved tag settings and "
+                       "archive state are removed. No gaps and no cards are "
+                       "touched.", defaultno=True):
+            return
+        for n in dead:
+            self._forget_group(n)
+        tooltip(f"Forgot {len(dead)} empty group(s).", period=4000)
+        self._reload()
+        self._panel.refresh_list()
+
 
     def _open_in_list(self) -> None:
         name = self._selected()
@@ -1525,6 +1679,8 @@ class KGDetailPane(QWidget):
             if updated:
                 self._current = updated
                 self._parent_panel.refresh_list(preserve_selection=updated["id"])
+                if new_status == "done":
+                    maybe_sync_to_things()
         except Exception as e:
             print(f"[ankisstant] auto-save status change failed: {e}")
 
@@ -1867,6 +2023,7 @@ class KGDetailPane(QWidget):
         if dlg._done_cb.isChecked():
             try:
                 kg_store.update(kg["id"], status="done")
+                maybe_sync_to_things()
             except Exception as e:
                 log.warn(f"write-your-own: couldn't mark {kg.get('id')} done: {e}")
         tooltip(f"Added {n} card(s) — Ctrl+Z in the main window undoes the "
@@ -1892,6 +2049,101 @@ class KGDetailPane(QWidget):
             f"In “{name}” — tags as {autotag.group_segment(name)}. "
             "Click to move or remove it."
         )
+
+
+def sync_done_to_things(*, silent: bool = False, parent=None) -> int:
+    """Tick off, in Things, every imported gap that is finished here.
+
+    Called after anything that closes gaps, and from the KG page's own menu for
+    the backlog. Reads Things first, so it only ever writes the ones actually
+    still open over there — a sync run twice in a row does nothing the second
+    time and says so.
+
+    `silent` is for the automatic call: it reports what it changed but doesn't
+    interrupt with a dialog when there was nothing to do, because the automatic
+    path fires after every close and most closes have no Things link at all."""
+    if not importers.available():
+        return 0
+    try:
+        pending = importers.pending_writeback(kg_store.load_all())
+    except Exception as e:
+        log.warn(f"things: couldn't work out what to sync: {e}")
+        return 0
+    if not pending:
+        if not silent:
+            tooltip("Nothing to tick off — every imported gap that's done here "
+                    "is already done in Things.", period=4000)
+        return 0
+
+    titles = [str(k.get("title") or "?") for k in pending]
+    if not silent:
+        shown = "\n".join(f"  • {t}" for t in titles[:12])
+        more = f"\n  … and {len(titles) - 12} more" if len(titles) > 12 else ""
+        if not askUser(
+                f"Mark {len(pending)} to-do(s) completed in Things?\n\n"
+                f"{shown}{more}\n\n"
+                "These are gaps you've finished here that are still open over "
+                "there. Nothing is deleted — you can un-tick any of them in "
+                "Things."):
+            return 0
+
+    uuids = [importers.linked_uuid(k) for k in pending]
+    QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+    try:
+        done, missing, err = importers.complete_in_things(uuids)
+    finally:
+        QApplication.restoreOverrideCursor()
+
+    if err:
+        # Never silent: a permission prompt the user dismissed looks exactly
+        # like a feature that doesn't work, and the fix is two clicks away in
+        # System Settings.
+        showWarning(f"Couldn't tick those off in Things.\n\n{err}")
+        return 0
+    bits = [f"Ticked {done} to-do(s) off in Things"]
+    if missing:
+        bits.append(f"{missing} no longer exist there")
+    if done or missing or not silent:
+        tooltip(" · ".join(bits) + ".", period=4000)
+    return done
+
+
+_things_sync_pending = False
+
+
+def maybe_sync_to_things() -> None:
+    """The automatic half, debounced onto the next event loop turn.
+
+    Debounced because closing a gap happens inside loops — a twelve-gap
+    work-through calls this twelve times, and each call is an osascript launch
+    and a database snapshot. Coalescing them means one write for the whole
+    operation, which is also the only way the user sees ONE tooltip saying what
+    changed rather than twelve.
+
+    Never raises: it runs on the tail of operations whose real work already
+    succeeded, and a failed write-back must not be reported as a failed
+    commit."""
+    global _things_sync_pending
+    try:
+        if _things_sync_pending:
+            return
+        if not tool_config("knowledge_gaps").get("things_writeback", True):
+            return
+        if not importers.available():
+            return
+        _things_sync_pending = True
+        QTimer.singleShot(0, _run_pending_things_sync)
+    except Exception as e:
+        log.warn(f"things: write-back skipped: {e}")
+
+
+def _run_pending_things_sync() -> None:
+    global _things_sync_pending
+    _things_sync_pending = False
+    try:
+        sync_done_to_things(silent=True)
+    except Exception as e:
+        log.warn(f"things: write-back failed: {e}")
 
 
 class _WriteOwnCardDialog(QDialog):
@@ -2739,6 +2991,16 @@ class KnowledgeGapsPanel(QWidget):
         )
         self._clear_btn.clicked.connect(self._on_clear_completed)
         clear_row.addWidget(self._clear_btn)
+        if importers.available():
+            sync_btn = QPushButton("↻ Sync done → Things")
+            sync_btn.setAutoDefault(False)
+            sync_btn.setStyleSheet("font-size: 11px;")
+            sync_btn.setToolTip(
+                "Tick off, in Things, every imported gap you've finished here. "
+                "Shows you the list first. Runs by itself whenever a gap is "
+                "completed — this is for the backlog, or if you turned that off.")
+            sync_btn.clicked.connect(lambda: sync_done_to_things(parent=self))
+            clear_row.addWidget(sync_btn)
         clear_row.addStretch(1)
         lcol.addLayout(clear_row)
         splitter.addWidget(left)
@@ -3825,7 +4087,8 @@ class KnowledgeGapsPanel(QWidget):
             detail.append(f"{n_notes} bring their notes across.")
         if dupes:
             detail.append(f"{len(dupes)} already imported — skipped.")
-        detail.append("\nNothing in Things is changed.")
+        detail.append("\nThey stay OPEN in Things — each one is ticked off "
+                      "there when you finish it here.")
         if not askUser("\n".join(detail) + "\n\nImport them?"):
             return
         records = importers.to_store_records(

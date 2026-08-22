@@ -281,6 +281,11 @@ DEFAULTS: dict = {
             "tag_scheme_template": "{base}::{type}::{system}::{subsystem}::{topic}",
             # Two-line list rows: title, then the start of the gap's notes.
             "show_notes_in_list": True,
+            # Tick a Things to-do off once its gap is done here. Only ever
+            # touches to-dos this add-on imported (they carry a things_uuid),
+            # and only ones still open over there — so it can't resurrect or
+            # re-complete anything you handled in Things yourself.
+            "things_writeback": True,
             # Group headers the user has collapsed on the KG page. Derived UI
             # state, written by the page rather than the settings screen.
             "collapsed_groups": [],

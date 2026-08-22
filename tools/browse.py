@@ -1595,6 +1595,7 @@ class BrowsePanel(QWidget):
                 kg_store.update(done_id, status="done")
                 from . import knowledge_gaps
                 knowledge_gaps._refresh_open_panel()
+                knowledge_gaps.maybe_sync_to_things()
             except Exception as e:
                 print(f"[ankisstant] mark KG done from Browse failed: {e}")
             self._linked_kg_id = None

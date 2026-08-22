@@ -1185,6 +1185,11 @@ class MassCreateDialog(QDialog):
             except Exception as e:
                 log.warn(f"mass create: couldn't mark {kg_id} done: {e}")
         self._refresh_kg_panel()
+        try:
+            from .. import knowledge_gaps
+            knowledge_gaps.maybe_sync_to_things()
+        except Exception:
+            pass
         self._log_sessions(created_by_kg)
 
         create_jobs.remove_batch(self._batch_id)

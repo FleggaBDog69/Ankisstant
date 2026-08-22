@@ -63,7 +63,25 @@ EXTRA_CANDIDATES_PER_POINT = 6
 # Plan-table columns, named because the table is index-addressed in a dozen
 # places and inserting one by hand is how the scope combo ends up in the card
 # spinner's column.
-C_GAP, C_NOTES, C_READ, C_SCOPE, C_CARDS, C_PTS = range(6)
+# FIND and WRITE are separate columns rather than one "include" tick because
+# they are separate decisions: a gap you know your deck covers wants finding
+# and not writing, and a gap you know it doesn't wants writing without paying
+# for the search. Untick both and the gap sits the run out.
+C_GAP, C_FIND, C_WRITE, C_NOTES, C_READ, C_SCOPE, C_CARDS, C_PTS = range(8)
+
+
+class _AllPoints:
+    """A PointMatch stand-in for a gap that was never searched.
+
+    _create_payload reads `.point` off whatever _uncovered_points yields. A gap
+    with Find unticked has no matches at all, so its points are wrapped to walk
+    the same path rather than growing a second branch that builds the record a
+    slightly different way."""
+
+    __slots__ = ("point",)
+
+    def __init__(self, point):
+        self.point = point
 
 
 def create_record_for(kg: dict, concept: str, points: list[dict]) -> dict:
@@ -206,6 +224,8 @@ class BulkSearchDialog(QDialog):
         # Kept beside the tree so a gap row can be relabelled from live ticks
         # while still being able to say what the search originally concluded.
         self._search_finding: dict = {}
+        # kg_id -> (find, write), captured when the run starts.
+        self._wants: dict = {}
         self._applied = False
         self._poll = QTimer(self)
         self._poll.setInterval(750)
@@ -302,9 +322,17 @@ class BulkSearchDialog(QDialog):
         col = QVBoxLayout(w)
         col.setContentsMargins(0, 0, 0, 0)
 
-        self._table = QTableWidget(0, 6)
+        self._table = QTableWidget(0, 8)
         self._table.setHorizontalHeaderLabels(
-            ["Gap", "Your notes", "What the AI read it as", "Scope", "Cards", "Pts"])
+            ["Gap", "Find", "Write", "Your notes", "What the AI read it as",
+             "Scope", "Cards", "Pts"])
+        hdr = self._table.horizontalHeaderItem(C_FIND)
+        hdr.setToolTip("Search your deck for cards that already cover this gap.")
+        hdr = self._table.horizontalHeaderItem(C_WRITE)
+        hdr.setToolTip(
+            "Write cards for this gap. With Find on, only for the points the "
+            "search turned up nothing for. With Find off, for every point — "
+            "nothing measured them, so nothing can be assumed covered.")
         self._table.verticalHeader().setVisible(False)
         self._table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self._table.setWordWrap(True)
@@ -312,7 +340,7 @@ class BulkSearchDialog(QDialog):
         hh.setSectionResizeMode(C_GAP, QHeaderView.ResizeMode.Interactive)
         hh.setSectionResizeMode(C_NOTES, QHeaderView.ResizeMode.Stretch)
         hh.setSectionResizeMode(C_READ, QHeaderView.ResizeMode.Stretch)
-        for c in (C_SCOPE, C_CARDS, C_PTS):
+        for c in (C_FIND, C_WRITE, C_SCOPE, C_CARDS, C_PTS):
             hh.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
         self._table.setColumnWidth(C_GAP, 220)
         self._table.itemChanged.connect(self._on_table_item_changed)
@@ -545,6 +573,24 @@ class BulkSearchDialog(QDialog):
 
     # ── stage 1: the plan table ──────────────────────────────────────────────
 
+    def _tick_cell(self, on: bool, tip: str) -> QTableWidgetItem:
+        """A bare checkbox cell. No text: the column header names it, and a
+        repeated word down eighty rows is just noise beside the box."""
+        it = QTableWidgetItem("")
+        it.setFlags((it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    & ~Qt.ItemFlag.ItemIsEditable)
+        it.setCheckState(Qt.CheckState.Checked if on else Qt.CheckState.Unchecked)
+        it.setToolTip(tip)
+        it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        return it
+
+    def _row_wants(self, row: int) -> tuple:
+        """(find, write) for one row, read off the table."""
+        f = self._table.item(row, C_FIND)
+        w = self._table.item(row, C_WRITE)
+        return (f is not None and f.checkState() == Qt.CheckState.Checked,
+                w is not None and w.checkState() == Qt.CheckState.Checked)
+
     def _fill_plan_table(self) -> None:
         """Before the AI read, the table is just the gaps with their tick boxes;
         the scope/cards/points columns fill in once they've been read."""
@@ -559,6 +605,13 @@ class BulkSearchDialog(QDialog):
             notes = kg_store.field(kg, "notes")
             cell.setToolTip(f"{title}\n\n{notes[:400]}" if notes else title)
             self._table.setItem(row, C_GAP, cell)
+            self._table.setItem(row, C_FIND, self._tick_cell(
+                True, "Search your deck for cards covering this gap."))
+            self._table.setItem(row, C_WRITE, self._tick_cell(
+                self._unified,
+                "Write cards for this gap. Only for what the search doesn't "
+                "cover, unless Find is off — then for everything, because "
+                "nothing measured it."))
             self._table.setItem(row, C_NOTES, self._notes_cell(kg))
             hint = QTableWidgetItem("— not read yet —")
             hint.setFlags(hint.flags() & ~Qt.ItemFlag.ItemIsEditable)
@@ -612,11 +665,37 @@ class BulkSearchDialog(QDialog):
         if item.column() == C_NOTES:
             self._table.resizeRowToContents(item.row())
             return
-        if item.column() != C_GAP:
+        if item.column() not in (C_GAP, C_FIND, C_WRITE):
             return
         row = item.row()
+        if item.column() in (C_FIND, C_WRITE):
+            # Ticking either puts the gap back in the run; unticking both takes
+            # it out. The title tick stays the master switch.
+            find, write = self._row_wants(row)
+            gap = self._table.item(row, C_GAP)
+            if gap is not None:
+                want = Qt.CheckState.Checked if (find or write) \
+                    else Qt.CheckState.Unchecked
+                if gap.checkState() != want:
+                    self._table.blockSignals(True)
+                    gap.setCheckState(want)
+                    self._table.blockSignals(False)
+        elif 0 <= row < len(self._plans) or True:
+            # The master switch drives both, so unticking a gap can't leave it
+            # half in the run.
+            on = item.checkState() == Qt.CheckState.Checked
+            self._table.blockSignals(True)
+            for c in (C_FIND, C_WRITE):
+                cellw = self._table.item(row, c)
+                if cellw is not None and not on:
+                    cellw.setCheckState(Qt.CheckState.Unchecked)
+                elif cellw is not None and on and c == C_FIND:
+                    cellw.setCheckState(Qt.CheckState.Checked)
+            self._table.blockSignals(False)
         if 0 <= row < len(self._plans):
-            self._plans[row].included = item.checkState() == Qt.CheckState.Checked
+            gap = self._table.item(row, C_GAP)
+            self._plans[row].included = (
+                gap is not None and gap.checkState() == Qt.CheckState.Checked)
         self._refresh_buttons()
         self._refresh_title()
 
@@ -659,7 +738,24 @@ class BulkSearchDialog(QDialog):
         return changed
 
     def _active_plans(self) -> list:
+        """Every plan in the run at all — findable or writable."""
         return [p for p in self._plans if p.ok and p.included]
+
+    def _search_plans(self) -> list:
+        """The plans to actually SEARCH. A gap with Write on and Find off is in
+        the run but never searched: you already know your deck doesn't have
+        it, and paying for the search to be told so is the thing this column
+        exists to skip."""
+        wants = self._wants_by_kg()
+        return [p for p in self._active_plans()
+                if wants.get(p.kg_id, (True, False))[0]]
+
+    def _wants_by_kg(self) -> dict:
+        out = {}
+        for row in range(self._table.rowCount()):
+            if row < len(self._plans):
+                out[self._plans[row].kg_id] = self._row_wants(row)
+        return out
 
     def _refresh_buttons(self) -> None:
         can_read = (bool(self._checked_rows()) and not self._busy
@@ -786,6 +882,16 @@ class BulkSearchDialog(QDialog):
                     f"  · {pt.concept}   {pt.terms}" for pt in p.points))
             cell.setToolTip("\n\n".join(t for t in tip if t))
             self._table.setItem(row, C_GAP, cell)
+            # The read RE-RENDERS the table, so the Find/Write ticks have to be
+            # carried across it — otherwise reading the gaps silently resets
+            # every choice made before pressing it.
+            want_find, want_write = self._row_wants(row)
+            self._table.setItem(row, C_FIND, self._tick_cell(
+                want_find, "Search your deck for cards covering this gap."))
+            self._table.setItem(row, C_WRITE, self._tick_cell(
+                want_write,
+                "Write cards for this gap. Only for what the search doesn't "
+                "cover, unless Find is off — then for everything."))
             # Rebuilt from what's ON SCREEN, not from the store: the read
             # happens after _sync_notes, so the cell is already authoritative
             # and re-reading the record would undo an edit made mid-run.
@@ -902,15 +1008,26 @@ class BulkSearchDialog(QDialog):
             return
         self._sync_notes()
         self._sync_plans()
-        plans = self._active_plans()
+        # Remembered now, before the run: the table is re-rendered as results
+        # land, and the write half needs to know what was asked for.
+        self._wants = self._wants_by_kg()
+        plans = self._search_plans()
+        write_only = [p for p in self._active_plans() if p not in plans]
+        if not plans and not write_only:
+            tooltip("Nothing ticked — untick both boxes on every row and "
+                    "there's nothing to do.")
+            return
         if not plans:
-            tooltip("No gaps ticked — nothing to search.")
+            # Every gap is Write-only. Nothing to search, so go straight to
+            # writing rather than reporting an empty search as a failure.
+            self._run_plans = list(write_only)
+            self._skip_to_writing(write_only)
             return
         points = kg_triage.points_of(plans)
         if not points:
             showWarning("None of those gaps produced anything searchable.")
             return
-        self._run_plans = list(plans)
+        self._run_plans = list(plans) + list(write_only)
 
         import threading
         from ..lecture.panel import run_pipeline
@@ -987,6 +1104,65 @@ class BulkSearchDialog(QDialog):
         self._render_results()
 
     # ── stage 3: results, grouped by gap ─────────────────────────────────────
+
+    def _skip_to_writing(self, plans: list) -> None:
+        """Every gap is Write-only, so there is no search to render.
+
+        The results tree is still the surface — the written cards belong under
+        their gap and their points exactly as they would after a search. It is
+        just built from the plan rather than from matches, with each point
+        marked as unmeasured rather than as a gap, because nothing looked."""
+        self._matches, self._coverage = [], None
+        self._tree.blockSignals(True)
+        self._tree.clear()
+        self._tag_edits = {}
+        for plan in plans:
+            top = QTreeWidgetItem(self._tree)
+            top.setData(0, self.ROLE_KIND, "gap")
+            top.setData(0, self.ROLE_KEY, plan.kg_id)
+            top.setData(0, self.ROLE_TITLE, plan.title)
+            top.setFlags(top.flags() | Qt.ItemFlag.ItemIsAutoTristate
+                         | Qt.ItemFlag.ItemIsUserCheckable)
+            top.setCheckState(0, Qt.CheckState.Unchecked)
+            f = top.font(0)
+            f.setBold(True)
+            top.setFont(0, f)
+            self._search_finding[plan.kg_id] = ("not searched", 0,
+                                                len(plan.points))
+            tag_edit = QLineEdit()
+            tag_edit.setPlaceholderText("no tag — this gap's cards won't be tagged")
+            tag_edit.setText(plan.tags[0] if plan.tags else "")
+            attach_tag_completer(tag_edit, multi=False)
+            self._tree.setItemWidget(top, 1, tag_edit)
+            self._tag_edits[plan.kg_id] = tag_edit
+            for pi, pt in enumerate(plan.points):
+                node = QTreeWidgetItem(top)
+                node.setData(0, self.ROLE_KIND, "point")
+                node.setData(0, self.ROLE_KEY, pi)
+                node.setData(0, self.ROLE_CONCEPT, pt.concept)
+                node.setData(0, self.ROLE_KG, plan.kg_id)
+                node.setFlags(node.flags() | Qt.ItemFlag.ItemIsAutoTristate
+                              | Qt.ItemFlag.ItemIsUserCheckable)
+                node.setCheckState(0, Qt.CheckState.Unchecked)
+                node.setText(0, _short(pt.concept, 96)
+                             + "   — not searched; a card is being written")
+                node.setExpanded(True)
+            top.setExpanded(True)
+        self._tree.blockSignals(False)
+        self._relabel_gaps()
+        self._stack.setCurrentIndex(1)
+        self._back_btn.setVisible(True)
+        self._read_btn.setVisible(False)
+        self._search_btn.setVisible(False)
+        self._commit_btn.setVisible(True)
+        self._title.setText(f"<b>{len(plans)} gap(s)</b> · writing without "
+                            "searching")
+        self._gap_hint.setText(
+            "Find was unticked on every gap, so your deck wasn't searched. "
+            "Nothing is claimed to be covered — cards are being written for "
+            "every point.")
+        self._update_selection_count()
+        QTimer.singleShot(0, self._start_generation)
 
     def _render_results(self) -> None:
         from ..lecture import matcher
@@ -1536,7 +1712,11 @@ class BulkSearchDialog(QDialog):
         if self._gen_batch_id:
             self._on_apply_everything()
             return
-        if not anki_utils.require_col() or not self._coverage:
+        # `_coverage is None` is a write-only run (Find unticked everywhere),
+        # which has cards to commit even though nothing was searched.
+        if not anki_utils.require_col():
+            return
+        if self._coverage is None and not self._run_plans:
             return
         ticked = self._ticked()
         all_nids = sorted({nid for rec in ticked.values() for nid in rec["nids"]})
@@ -1661,9 +1841,22 @@ class BulkSearchDialog(QDialog):
         would cost a call to throw that measurement away."""
         missing_by_kg = self._uncovered_points()
         plans_by_id = {p.kg_id: p for p in self._run_plans}
+        # A gap with Find off was never measured, so every one of its points is
+        # uncovered as far as this run knows. Saying "your deck covers it"
+        # about a search that never ran would be inventing a result.
+        for kg_id, (find, write) in (self._wants or {}).items():
+            if write and not find and kg_id in plans_by_id:
+                missing_by_kg.setdefault(kg_id, [])
+                if not missing_by_kg[kg_id]:
+                    missing_by_kg[kg_id] = [
+                        _AllPoints(pt) for pt in plans_by_id[kg_id].points]
         out: list[dict] = []
         for kg_id, missing in missing_by_kg.items():
             if not missing:
+                continue
+            # Write unticked: found what your deck has, and that is all you
+            # asked for.
+            if self._wants and not self._wants.get(kg_id, (True, True))[1]:
                 continue
             plan = plans_by_id.get(kg_id)
             kg = kg_store.get(kg_id)
@@ -2475,7 +2668,11 @@ class BulkSearchDialog(QDialog):
 
         This is the whole reason the two halves share a screen: one decision,
         one confirm, and one Ctrl+Z that takes the entire pass back out."""
-        if not anki_utils.require_col() or not self._coverage:
+        # `_coverage is None` is a write-only run (Find unticked everywhere),
+        # which has cards to commit even though nothing was searched.
+        if not anki_utils.require_col():
+            return
+        if self._coverage is None and not self._run_plans:
             return
         if self._gen_active and not askUser(
                 "Cards are still being written for some of these gaps.\n\n"
@@ -2662,6 +2859,9 @@ class BulkSearchDialog(QDialog):
         try:
             from .. import knowledge_gaps
             knowledge_gaps._refresh_open_panel()
+            # Gaps that came from a Things to-do get ticked off there too.
+            # Debounced, so a twelve-gap close is one write, not twelve.
+            knowledge_gaps.maybe_sync_to_things()
         except Exception:
             pass
         return closed
@@ -2685,6 +2885,10 @@ class BulkSearchDialog(QDialog):
         'Graves + Tx' with 5 of 7 points already covered wants cards for the
         remaining 2, not another pass at the whole disease."""
         out: dict[str, list] = {}
+        if self._coverage is None:
+            # Write-only run: nothing was searched, so there is no coverage to
+            # subtract. _create_payload supplies every point instead.
+            return out
         by_kg: dict[str, list] = {}
         for m in list(self._coverage.covered) + list(self._coverage.gaps):
             by_kg.setdefault(getattr(m.point, "kg_id", ""), []).append(m)
@@ -2715,7 +2919,7 @@ class BulkSearchDialog(QDialog):
 
         Uses the same queue shape the KG page pushes, so AI Create can't tell
         where a queued gap came from."""
-        if not self._coverage:
+        if self._coverage is None:
             return
         main = self._main_window()
         if main is None:
