@@ -1,0 +1,1252 @@
+# Bulk knowledge-gap search — the popup.
+#
+# Launched from the AI Browse queue (and the Knowledge Gaps page), this works a
+# whole batch of gaps in one pass instead of one at a time. It owns the UI; all
+# the thinking is borrowed:
+#
+#   tools/kg/triage.py       reads the batch — scope, card target, decomposition
+#   tools/lecture/matcher.py finds and judges the cards (tag leg + term leg +
+#                            relevance judge + dedupe + budget allocation)
+#   tools/lecture/panel.py   run_pipeline(), entered with points= so it skips
+#                            ingest/extraction entirely
+#
+# A DIALOG, not a tab, on purpose: bulk work is occasional and dense, and the
+# Browse panel is already a busy single-topic surface. It opens over Browse,
+# does its job, and goes away.
+#
+# WHY THE RESULTS ARE GROUPED BY GAP, AND TAGGED PER GAP.
+# A lecture commits everything under one tag because everything came from one
+# lecture. A batch of gaps did not — they're unrelated, and one shared tag would
+# throw away the classification triage already did. So every gap gets its OWN
+# editable tag (prefilled with the hierarchical base::Type::System::Subsystem::
+# Topic tag, the same scheme AI Browse and AI Create use) and its own subtree in
+# the results, showing which of its points the deck covers and which it doesn't.
+
+from __future__ import annotations
+
+from aqt import mw
+from aqt.qt import (
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QHBoxLayout, QHeaderView,
+    QLabel, QLineEdit, QProgressBar, QPushButton, QSpinBox, QStackedWidget, Qt,
+    QTableWidget, QTableWidgetItem, QTimer, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
+    QWidget,
+)
+from aqt.utils import askUser, showWarning, tooltip
+
+from ...core import anki_utils, api as core_api, log
+from ...core.config import month_tag, tool_config
+from ...core.qt_utils import (
+    attach_tag_completer, is_manual_provider, provider_configured, theme_dialog,
+)
+from .. import autotag
+from . import store as kg_store, triage as kg_triage
+
+
+# How many judge-approved-but-not-chosen cards to offer per point, under the
+# ones the budget actually picked. The point is override room, not a second
+# results list: the allocator's choice is what's ticked, and this is the short
+# tail he can promote from if it got one wrong.
+EXTRA_CANDIDATES_PER_POINT = 6
+
+
+def _short(text: str, n: int) -> str:
+    text = " ".join((text or "").split())
+    return text if len(text) <= n else text[:n - 1].rstrip() + "…"
+
+
+class BulkSearchDialog(QDialog):
+    """Read a batch of gaps → search the deck for all of them → commit per gap."""
+
+    # Roles on the tree items, so the commit walk can tell the three row kinds
+    # apart without reparsing their labels.
+    ROLE_KIND = Qt.ItemDataRole.UserRole          # "gap" | "point" | "note"
+    ROLE_KEY = Qt.ItemDataRole.UserRole + 1       # kg_id | point index | nid
+
+    def __init__(self, kgs: list[dict], parent=None):
+        super().__init__(parent or mw)
+        self.setWindowTitle("Bulk search — knowledge gaps")
+        self.setMinimumSize(940, 660)
+        self.resize(1180, 760)
+        # NOT WA_DeleteOnClose: closing while a search runs HIDES this window and
+        # leaves the run going, and a deleted dialog would take the completion
+        # callback down with it. It's deleted explicitly once it really closes.
+
+        self._kgs = [k for k in kgs if isinstance(k, dict)]
+        self._plans: list = []          # triage.KGPlan, row-aligned with the table
+        self._run_plans: list = []      # the snapshot the current results came from
+        self._coverage = None
+        self._matches: list = []
+        self._cancel_ev = None
+        self._busy = False
+        # Set when the user closes the window mid-run and chose to let it finish:
+        # the dialog is hidden, not destroyed, and re-shows itself with results.
+        self._backgrounded = False
+        # Set once the window has really closed. A stopped run's callbacks still
+        # fire afterwards, and touching a deleted Qt widget from one is a crash.
+        self._closed = False
+        self._tag_edits: dict[str, QLineEdit] = {}   # kg_id -> its tag box
+
+        self._build()
+        self._fill_plan_table()
+        theme_dialog(self)
+
+    # ── construction ─────────────────────────────────────────────────────────
+
+    def _build(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 12, 14, 12)
+        root.setSpacing(8)
+
+        self._title = QLabel()
+        self._title.setTextFormat(Qt.TextFormat.RichText)
+        self._title.setWordWrap(True)
+        root.addWidget(self._title)
+
+        self._stack = QStackedWidget()
+        self._stack.addWidget(self._build_plan_page())     # 0
+        self._stack.addWidget(self._build_results_page())  # 1
+        root.addWidget(self._stack, 1)
+
+        self._progress = QProgressBar()
+        self._progress.setVisible(False)
+        root.addWidget(self._progress)
+        self._status = QLabel("")
+        self._status.setStyleSheet("color: gray; font-size: 11px;")
+        self._status.setWordWrap(True)
+        root.addWidget(self._status)
+
+        btn_row = QHBoxLayout()
+        self._back_btn = QPushButton("◀  Back to gaps")
+        self._back_btn.setVisible(False)
+        self._back_btn.clicked.connect(self._on_back)
+        btn_row.addWidget(self._back_btn)
+        btn_row.addStretch(1)
+
+        self._stop_btn = QPushButton("Stop")
+        self._stop_btn.setVisible(False)
+        self._stop_btn.clicked.connect(self._on_stop)
+        btn_row.addWidget(self._stop_btn)
+
+        self._close_btn = QPushButton("Close")
+        self._close_btn.setToolTip(
+            "Closing during a search offers to leave it running — this window "
+            "hides and comes back on its own when the results are in.")
+        self._close_btn.clicked.connect(self.close)
+        btn_row.addWidget(self._close_btn)
+
+        self._read_btn = QPushButton("🔎  Read gaps with AI")
+        self._read_btn.setMinimumHeight(32)
+        self._read_btn.setToolTip(
+            "One AI call reads every ticked gap: cleans up the shorthand, judges "
+            "how broad it is, splits it into searchable points and proposes how "
+            "many cards it should pull.\n\nYou review all of that before anything "
+            "touches your deck."
+        )
+        self._read_btn.clicked.connect(self._on_read)
+        btn_row.addWidget(self._read_btn)
+
+        self._search_btn = QPushButton("Search my deck  ▶")
+        self._search_btn.setMinimumHeight(32)
+        self._search_btn.setEnabled(False)
+        self._search_btn.clicked.connect(self._on_search)
+        btn_row.addWidget(self._search_btn)
+
+        self._commit_btn = QPushButton("Tag + Unsuspend")
+        self._commit_btn.setMinimumHeight(32)
+        self._commit_btn.setVisible(False)
+        self._commit_btn.clicked.connect(self._on_commit)
+        btn_row.addWidget(self._commit_btn)
+        root.addLayout(btn_row)
+
+        if not provider_configured():
+            self._read_btn.setEnabled(False)
+            self._status.setText("Set up an AI provider in Ankisstant Settings first.")
+        elif is_manual_provider():
+            self._read_btn.setEnabled(False)
+            self._status.setText(
+                "Bulk search needs a CLI or API provider — the copy/paste "
+                "provider would need a separate paste for every step.")
+
+    def _build_plan_page(self) -> QWidget:
+        w = QWidget()
+        col = QVBoxLayout(w)
+        col.setContentsMargins(0, 0, 0, 0)
+
+        self._table = QTableWidget(0, 5)
+        self._table.setHorizontalHeaderLabels(
+            ["Gap", "What the AI read it as", "Scope", "Cards", "Pts"])
+        self._table.verticalHeader().setVisible(False)
+        self._table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        hh = self._table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for c in (2, 3, 4):
+            hh.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
+        self._table.setColumnWidth(0, 250)
+        self._table.itemChanged.connect(self._on_row_toggled)
+        col.addWidget(self._table, 1)
+
+        self._table_hint = QLabel(
+            "Untick any gap to skip it. After reading, edit the reading or the "
+            "card count on any row — those numbers are what bounds the search. "
+            "Rows marked ⚠ are ones the AI wasn't sure it understood."
+        )
+        self._table_hint.setStyleSheet("color: gray; font-size: 11px;")
+        self._table_hint.setWordWrap(True)
+        col.addWidget(self._table_hint)
+        return w
+
+    def _build_results_page(self) -> QWidget:
+        w = QWidget()
+        col = QVBoxLayout(w)
+        col.setContentsMargins(0, 0, 0, 0)
+
+        self._tree = QTreeWidget()
+        self._tree.setColumnCount(2)
+        self._tree.setHeaderLabels(["Gap  ·  point  ·  card", "Tag"])
+        self._tree.setAlternatingRowColors(True)
+        self._tree.setUniformRowHeights(False)
+        # The card text is the thing being read and judged; the tag box is one
+        # short string per GAP row and was taking a quarter of the width for it.
+        # Column 0 takes everything left over, and the tag column is fixed narrow
+        # (drag it wider if a tag is genuinely long — the box scrolls anyway).
+        th = self._tree.header()
+        th.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        th.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        th.setStretchLastSection(False)
+        self._tree.setColumnWidth(1, 170)
+        self._tree.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self._tree.itemChanged.connect(self._on_tree_item_changed)
+        self._tree.itemDoubleClicked.connect(self._on_tree_double_clicked)
+        col.addWidget(self._tree, 1)
+
+        ctl = QHBoxLayout()
+        for label, fn in (("Expand all", lambda: self._tree.expandAll()),
+                          ("Collapse all", lambda: self._tree.collapseAll())):
+            b = QPushButton(label)
+            b.setAutoDefault(False)
+            b.clicked.connect(fn)
+            ctl.addWidget(b)
+        ctl.addSpacing(14)
+        self._unsuspend_cb = QCheckBox("Unsuspend the ticked cards")
+        self._unsuspend_cb.setChecked(True)
+        self._unsuspend_cb.setToolTip(
+            "The payoff — these cards are sitting suspended until something needs "
+            "them, and these gaps are what needs them.")
+        ctl.addWidget(self._unsuspend_cb)
+        ctl.addStretch(1)
+        self._sel_lbl = QLabel("")
+        self._sel_lbl.setStyleSheet("color: gray; font-size: 11px;")
+        ctl.addWidget(self._sel_lbl)
+        col.addLayout(ctl)
+
+        self._gap_hint = QLabel("")
+        self._gap_hint.setStyleSheet("color: gray; font-size: 11px;")
+        self._gap_hint.setWordWrap(True)
+        col.addWidget(self._gap_hint)
+
+        send_row = QHBoxLayout()
+        self._send_create_btn = QPushButton("→  Send gaps to AI Create…")
+        self._send_create_btn.setAutoDefault(False)
+        self._send_create_btn.setToolTip(
+            "Pick which gaps go to AI Create. Each one carries the specific "
+            "points your deck had nothing for, so a partly-covered gap asks for "
+            "cards on the residue rather than the whole topic again. They land "
+            "in AI Create's queue — nothing is generated yet.")
+        self._send_create_btn.clicked.connect(self._on_send_to_create)
+        send_row.addWidget(self._send_create_btn)
+        send_row.addStretch(1)
+        col.addLayout(send_row)
+        return w
+
+    # ── stage 1: the plan table ──────────────────────────────────────────────
+
+    def _fill_plan_table(self) -> None:
+        """Before the AI read, the table is just the gaps with their tick boxes;
+        the scope/cards/points columns fill in once they've been read."""
+        self._table.blockSignals(True)
+        self._table.setRowCount(len(self._kgs))
+        for row, kg in enumerate(self._kgs):
+            title = (kg.get("title") or "(untitled)").strip() or "(untitled)"
+            cell = QTableWidgetItem(title)
+            cell.setFlags((cell.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                          & ~Qt.ItemFlag.ItemIsEditable)
+            cell.setCheckState(Qt.CheckState.Checked)
+            notes = kg_store.field(kg, "notes")
+            cell.setToolTip(f"{title}\n\n{notes[:400]}" if notes else title)
+            self._table.setItem(row, 0, cell)
+            hint = QTableWidgetItem("— not read yet —")
+            hint.setFlags(hint.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self._table.setItem(row, 1, hint)
+            for c in (2, 3, 4):
+                blank = QTableWidgetItem("")
+                blank.setFlags(blank.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self._table.setItem(row, c, blank)
+        self._table.blockSignals(False)
+        self._refresh_title()
+
+    def _refresh_title(self) -> None:
+        n = len(self._kgs)
+        if self._plans:
+            active = self._active_plans()
+            pts = sum(len(p.points) for p in active)
+            budget = kg_triage.total_cards(active)
+            self._title.setText(
+                f"<b>{len(active)} of {n} gap(s)</b> · {pts} searchable point(s) "
+                f"· up to {budget} card(s)")
+        else:
+            self._title.setText(
+                f"<b>{n} knowledge gap(s)</b> — read them, then search your deck "
+                "for cards that already cover them.")
+
+    def _checked_rows(self) -> list[int]:
+        out = []
+        for row in range(self._table.rowCount()):
+            it = self._table.item(row, 0)
+            if it is not None and it.checkState() == Qt.CheckState.Checked:
+                out.append(row)
+        return out
+
+    def _on_row_toggled(self, item) -> None:
+        if item is None or item.column() != 0:
+            return
+        row = item.row()
+        if 0 <= row < len(self._plans):
+            self._plans[row].included = item.checkState() == Qt.CheckState.Checked
+        self._refresh_buttons()
+        self._refresh_title()
+
+    def _active_plans(self) -> list:
+        return [p for p in self._plans if p.ok and p.included]
+
+    def _refresh_buttons(self) -> None:
+        can_read = (bool(self._checked_rows()) and not self._busy
+                    and provider_configured() and not is_manual_provider())
+        self._read_btn.setEnabled(can_read)
+        self._search_btn.setEnabled(bool(self._active_plans()) and not self._busy)
+
+    # ── stage 1: the read ────────────────────────────────────────────────────
+
+    def _on_read(self) -> None:
+        rows = self._checked_rows()
+        if not rows:
+            tooltip("Tick at least one gap first.")
+            return
+        kgs = [self._kgs[r] for r in rows]
+        self._set_busy(True, f"Reading {len(kgs)} gap(s) with AI…")
+        from ...core.config import tool_model_for
+        model = tool_model_for("lecture_extract")
+
+        # A batch of gaps is one big reasoning call — measured at several minutes
+        # for 17 gaps. Without a running clock a static label reads as a hang.
+        from ..lecture.panel import _Heartbeat
+
+        def _report(msg, _pct=0):
+            mw.taskman.run_on_main(lambda m=msg: self._set_status(m))
+
+        def _bg():
+            with _Heartbeat(_report, f"Reading {len(kgs)} gap(s) with AI…", 0):
+                return kg_triage.triage(kgs, model=model)
+
+        mw.taskman.run_in_background(_bg, self._on_read_done, uses_collection=False)
+
+    def _on_read_done(self, fut) -> None:
+        if self._closed:
+            return
+        self._set_busy(False)
+        self._resurface()
+        try:
+            plans = fut.result()
+        except core_api.ClaudeCancelled:
+            self._status.setText("Stopped.")
+            return
+        except Exception as e:
+            import traceback
+            log.error(f"bulk search: triage failed: {e}\n{traceback.format_exc()}")
+            self._status.setText("")
+            friendly = getattr(e, "friendly", None) or str(e)
+            showWarning(f"Couldn't read those gaps:\n\n{friendly}")
+            return
+
+        # Re-key onto the full gap list: only the ticked rows were read, and the
+        # unticked ones must stay on the table (unread, unticked) rather than
+        # vanishing from a batch the user can still see.
+        by_id = {p.kg_id: p for p in plans}
+        self._plans = []
+        for kg in self._kgs:
+            kid = str(kg.get("id") or "")
+            p = by_id.get(kid)
+            if p is None:
+                p = kg_triage.KGPlan(
+                    kg_id=kid, title=(kg.get("title") or "").strip(),
+                    kg_type=str(kg.get("type") or "kg").lower(),
+                    concept="", included=False)
+            self._plans.append(p)
+        self._render_plan_table()
+
+    def _render_plan_table(self) -> None:
+        self._table.blockSignals(True)
+        self._table.setRowCount(len(self._plans))
+        for row, p in enumerate(self._plans):
+            unread = not p.concept and not p.points
+            shaky = (p.confidence == "low" or not p.ok) and not unread
+            title = ("⚠ " if shaky else "") + (p.title or "(untitled)")
+            cell = QTableWidgetItem(title)
+            cell.setFlags((cell.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                          & ~Qt.ItemFlag.ItemIsEditable)
+            cell.setCheckState(Qt.CheckState.Checked if p.included and p.ok
+                               else Qt.CheckState.Unchecked)
+            tip = [p.title or ""]
+            if p.note:
+                tip.append(p.note)
+            if p.points:
+                tip.append("Points:\n" + "\n".join(
+                    f"  · {pt.concept}   {pt.terms}" for pt in p.points))
+            cell.setToolTip("\n\n".join(t for t in tip if t))
+            self._table.setItem(row, 0, cell)
+
+            reading = QTableWidgetItem(
+                "— not read —" if unread else p.concept)
+            if unread:
+                reading.setFlags(reading.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            else:
+                reading.setToolTip(
+                    "Edit if the AI misread your shorthand. This is what the tag "
+                    "is built from. (The search terms it already wrote aren't "
+                    "regenerated — re-read the gaps if you need those changed.)")
+            self._table.setItem(row, 1, reading)
+
+            if unread:
+                for c in (2, 3, 4):
+                    blank = QTableWidgetItem("")
+                    blank.setFlags(blank.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                    self._table.setItem(row, c, blank)
+                self._table.removeCellWidget(row, 2)
+                self._table.removeCellWidget(row, 3)
+                continue
+
+            scope = QComboBox()
+            for key, meta in kg_triage.SCOPES.items():
+                scope.addItem(meta["label"], key)
+                scope.setItemData(scope.count() - 1, meta["hint"],
+                                  Qt.ItemDataRole.ToolTipRole)
+            si = scope.findData(p.scope)
+            scope.setCurrentIndex(si if si >= 0 else 0)
+            scope.currentIndexChanged.connect(lambda _i, r=row: self._on_scope_changed(r))
+            self._table.setCellWidget(row, 2, scope)
+
+            cards = QSpinBox()
+            cards.setRange(kg_triage.MIN_CARDS, kg_triage.MAX_CARDS)
+            cards.setValue(kg_triage.clamp_cards(p.cards))
+            cards.setToolTip("How many existing cards this gap should pull. "
+                             "Changing the scope resets it to that scope's default.")
+            cards.valueChanged.connect(lambda _v, r=row: self._on_cards_changed(r))
+            self._table.setCellWidget(row, 3, cards)
+
+            pts = QTableWidgetItem(str(len(p.points)))
+            pts.setFlags(pts.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            pts.setToolTip(
+                "How many searchable points this gap was split into. A broad gap "
+                "splits into several — that's what actually finds more cards, "
+                "since one point only matches cards about one thing.")
+            self._table.setItem(row, 4, pts)
+        self._table.blockSignals(False)
+        self._table.resizeRowsToContents()
+
+        n_ok = sum(1 for p in self._plans if p.ok)
+        n_shaky = sum(1 for p in self._plans if p.ok and p.confidence == "low")
+        msg = f"Read {n_ok} gap(s)."
+        if n_shaky:
+            msg += (f" {n_shaky} marked ⚠ — check the reading on those before "
+                    "you run them.")
+        self._status.setText(msg)
+        self._refresh_buttons()
+        self._refresh_title()
+
+    def _on_scope_changed(self, row: int) -> None:
+        """Re-scoping resets the card target to that scope's default: the two
+        mean the same thing, so a hand-typed 14 left sitting on a row just marked
+        'narrow' would be the confusing outcome."""
+        if not (0 <= row < len(self._plans)):
+            return
+        combo, spin = self._table.cellWidget(row, 2), self._table.cellWidget(row, 3)
+        if combo is None or spin is None:
+            return
+        scope = combo.currentData() or kg_triage.DEFAULT_SCOPE
+        self._plans[row].scope = scope
+        spin.setValue(kg_triage.clamp_cards(kg_triage.scope_meta(scope)["cards"]))
+
+    def _on_cards_changed(self, row: int) -> None:
+        if 0 <= row < len(self._plans):
+            spin = self._table.cellWidget(row, 3)
+            if spin is not None:
+                self._plans[row].cards = spin.value()
+        self._refresh_title()
+
+    def _sync_plans(self) -> None:
+        """Fold the table's edits back in, so what's on screen is what runs."""
+        for row, p in enumerate(self._plans):
+            it0 = self._table.item(row, 0)
+            if it0 is not None:
+                p.included = it0.checkState() == Qt.CheckState.Checked
+            it1 = self._table.item(row, 1)
+            if it1 is not None and p.ok:
+                txt = it1.text().strip()
+                if txt and txt != "— not read —":
+                    p.concept = txt
+            combo = self._table.cellWidget(row, 2)
+            if combo is not None:
+                p.scope = combo.currentData() or p.scope
+            spin = self._table.cellWidget(row, 3)
+            if spin is not None:
+                p.cards = spin.value()
+
+    # ── stage 2: the search ──────────────────────────────────────────────────
+
+    def _on_search(self) -> None:
+        if not anki_utils.require_col() or self._busy:
+            return
+        self._sync_plans()
+        plans = self._active_plans()
+        if not plans:
+            tooltip("No gaps ticked — nothing to search.")
+            return
+        points = kg_triage.points_of(plans)
+        if not points:
+            showWarning("None of those gaps produced anything searchable.")
+            return
+        self._run_plans = list(plans)
+
+        import threading
+        from ..lecture.panel import run_pipeline
+
+        cfg = dict(tool_config("lecture"))
+        cfg["lo_text"] = ""                       # never the LO branch: points win
+        cfg["target_cards"] = kg_triage.total_cards(plans)
+        # Depth no longer decides the per-point cap here (cap_for does), but it
+        # still sizes the candidate POOL the judge reads. Use the deepest preset
+        # so a broad gap has enough candidates to draw a real cluster from.
+        cfg["depth"] = "thorough"
+        cap_for = kg_triage.cap_for(plans)
+        # ...but a narrow gap's point still gets a SMALL pool: the judge reads
+        # every candidate, and that read is the slow leg of the whole run.
+        cand_cap_for = kg_triage.cand_cap_for(plans)
+
+        self._cancel_ev = threading.Event()
+        cancel_ev = self._cancel_ev
+        self._set_busy(True, "Starting…", progress=True, stoppable=True)
+
+        def _report(msg, pct):
+            def _ui():
+                if self._set_status(msg):
+                    self._progress.setValue(int(pct))
+            mw.taskman.run_on_main(_ui)
+
+        def _bg():
+            core_api.set_cancel_event(cancel_ev)
+            try:
+                return run_pipeline(None, cfg, report=_report, cancel_ev=cancel_ev,
+                                    points=points, cap_for=cap_for,
+                                    cand_cap_for=cand_cap_for)
+            finally:
+                core_api.set_cancel_event(None)
+
+        # uses_collection=False is not optional: the default executor is the one
+        # Anki's periodic backup queues behind, and the app would look hung for
+        # the whole run.
+        mw.taskman.run_in_background(_bg, self._on_search_done, uses_collection=False)
+
+    def _on_stop(self) -> None:
+        if self._cancel_ev is not None:
+            self._cancel_ev.set()
+        self._stop_btn.setEnabled(False)
+        self._status.setText("Stopping after the current step…")
+
+    def _on_search_done(self, fut) -> None:
+        if self._closed:
+            return
+        from ..lecture.panel import Cancelled
+        self._set_busy(False)
+        self._resurface()
+        try:
+            _lecture, matches, coverage = fut.result()
+        except (Cancelled, core_api.ClaudeCancelled):
+            self._status.setText("Stopped.")
+            return
+        except Exception as e:
+            import traceback
+            log.error(f"bulk search: run failed: {e}\n{traceback.format_exc()}")
+            self._status.setText("")
+            showWarning(f"Bulk search failed:\n\n{e}")
+            return
+        self._matches, self._coverage = matches, coverage
+        self._render_results()
+
+    # ── stage 3: results, grouped by gap ─────────────────────────────────────
+
+    def _render_results(self) -> None:
+        from ..lecture import matcher
+
+        by_kg: dict[str, list] = {}
+        for m in list(self._coverage.covered) + list(self._coverage.gaps):
+            by_kg.setdefault(getattr(m.point, "kg_id", ""), []).append(m)
+
+        self._tree.blockSignals(True)
+        self._tree.clear()
+        self._tag_edits = {}
+        total_notes = 0
+
+        for plan in self._run_plans:
+            group = by_kg.get(plan.kg_id) or []
+            if not group:
+                continue
+            covered_pts = sum(1 for m in group if m.final)
+            gap_pts = [m for m in group if not m.final]
+
+            top = QTreeWidgetItem(self._tree)
+            top.setData(0, self.ROLE_KIND, "gap")
+            top.setData(0, self.ROLE_KEY, plan.kg_id)
+            top.setFlags(top.flags() | Qt.ItemFlag.ItemIsAutoTristate
+                         | Qt.ItemFlag.ItemIsUserCheckable)
+            # An auto-tristate parent needs a starting state or Qt draws no
+            # checkbox at all; it takes over from the children once they exist.
+            top.setCheckState(0, Qt.CheckState.Unchecked)
+            n_cards = sum(len(m.final) for m in group)
+            total_notes += n_cards
+            # What the SEARCH found. What actually commits is driven by the
+            # ticks and reported live in the summary line below the tree.
+            state = ("GAP — nothing found" if covered_pts == 0 else
+                     f"{covered_pts}/{len(group)} points found"
+                     + ("" if covered_pts == len(group) else " — partial"))
+            top.setText(0, f"{plan.title}      {state}  ·  {n_cards} card(s)")
+            f = top.font(0)
+            f.setBold(True)
+            top.setFont(0, f)
+            top.setToolTip(0, f"{plan.concept}\n\nScope: {plan.scope} · "
+                              f"target {plan.cards} card(s)")
+
+            # Each gap carries its OWN tag — unrelated gaps must not share one.
+            tag_edit = QLineEdit()
+            tag_edit.setPlaceholderText("no tag — this gap's cards won't be tagged")
+            tag_edit.setText(self._suggest_tag(plan, group))
+            tag_edit.setToolTip(
+                "Applied to every ticked card under this gap. Prefilled from the "
+                "gap's own system/subsystem/topic, in the same scheme AI Browse "
+                "and AI Create use. Edit or clear it freely.")
+            attach_tag_completer(tag_edit, multi=False)
+            self._tree.setItemWidget(top, 1, tag_edit)
+            self._tag_edits[plan.kg_id] = tag_edit
+
+            for pi, m in enumerate(group):
+                node = QTreeWidgetItem(top)
+                node.setData(0, self.ROLE_KIND, "point")
+                node.setData(0, self.ROLE_KEY, pi)
+                node.setFlags(node.flags() | Qt.ItemFlag.ItemIsAutoTristate
+                              | Qt.ItemFlag.ItemIsUserCheckable)
+                node.setCheckState(0, Qt.CheckState.Unchecked)
+
+                chosen = list(m.final)
+                extra = [n for n in m.candidates if n not in set(chosen)]
+                # A gap point has no chosen cards; offer its own-topic cards (the
+                # tag leg proved they're on topic) rather than showing it empty.
+                if not chosen and m.topic_present:
+                    extra = list(m.topic_cards) + [
+                        n for n in extra if n not in set(m.topic_cards)]
+                extra = extra[:EXTRA_CANDIDATES_PER_POINT]
+
+                # Three different reasons a point can show nothing, and calling
+                # them all "gap" would be a lie: the deck genuinely lacks it, the
+                # deck has the TOPIC but no card testing this claim, or the deck
+                # has cards and the budget simply went elsewhere. Only the first
+                # two are gaps; the third is a card he can just tick.
+                label = _short(m.point.concept, 96)
+                if chosen:
+                    pass
+                elif not m.is_gap:
+                    label += "   — cards found, but this gap's card budget went elsewhere"
+                elif m.topic_present:
+                    label = ("⚠  " + label
+                             + "   — no card tests this; your own topic cards below")
+                else:
+                    label = "⚠  " + label + "   — your deck has nothing for this"
+                node.setText(0, label)
+                node.setToolTip(0, f"{m.point.concept}\n\nterms: {m.point.terms}")
+
+                for nid in chosen + extra:
+                    leaf = QTreeWidgetItem(node)
+                    leaf.setData(0, self.ROLE_KIND, "note")
+                    leaf.setData(0, self.ROLE_KEY, int(nid))
+                    leaf.setFlags(leaf.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    leaf.setCheckState(0, Qt.CheckState.Checked if nid in chosen
+                                       else Qt.CheckState.Unchecked)
+                    susp, tot = m.susp.get(nid, (0, 0))
+                    # Words, not colour: a suspended card is the one there's
+                    # something to DO about, and that has to read as text.
+                    mark = ("⏸ suspended  " if susp else "in rotation  ") \
+                        if tot else ""
+                    # Show as much of the card as the row can hold, and keep the
+                    # rest in the tooltip: deciding whether a card belongs to a
+                    # gap is unreadable off a 150-character stub.
+                    full = matcher.note_text(nid, 700)
+                    leaf.setText(0, f"{mark}{_short(full, 260)}")
+                    leaf.setToolTip(0, f"{full}\n\nDouble-click to open this "
+                                       "note in the Anki browser.")
+                if not chosen and not extra:
+                    empty = QTreeWidgetItem(node)
+                    empty.setData(0, self.ROLE_KIND, "info")
+                    empty.setText(0, "nothing in your deck matched this point's "
+                                     "search terms")
+                    empty.setFlags(empty.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+
+                node.setExpanded(bool(chosen))
+            top.setExpanded(True)
+
+        self._tree.blockSignals(False)
+
+        full, partial, empty = self._outcome_split()
+        self._gap_hint.setText(
+            f"{len(full)} gap(s) fully covered · {len(partial)} partly · "
+            f"{len(empty)} not covered at all.  Only fully-covered gaps are "
+            "marked done — the rest stay open, and those are the ones worth "
+            "making cards for."
+        )
+        self._stack.setCurrentIndex(1)
+        self._back_btn.setVisible(True)
+        self._read_btn.setVisible(False)
+        self._search_btn.setVisible(False)
+        self._commit_btn.setVisible(True)
+        self._title.setText(
+            f"<b>{len(self._run_plans)} gap(s) searched</b> · {total_notes} card(s) found")
+        self._update_selection_count()
+
+    def _suggest_tag(self, plan, group) -> str:
+        """This gap's hierarchical tag. Built from the point levels the triage
+        pass assigned — preferring a point that actually found cards, since a
+        gap point's levels are the least corroborated thing in the group."""
+        ordered = [m for m in group if m.final] + [m for m in group if not m.final]
+        for m in ordered:
+            try:
+                tag = autotag.tag_from_levels(m.point.tag_levels,
+                                              kg_type_key=plan.kg_type)
+            except Exception as e:
+                log.warn(f"bulk search: tag_from_levels failed: {e}")
+                tag = ""
+            if tag:
+                return tag
+        # No usable levels — fall back to the gap's own curated tag, if any.
+        return (plan.tags[0] if plan.tags else "")
+
+    # ── results interaction ──────────────────────────────────────────────────
+
+    def _on_tree_item_changed(self, item, column) -> None:
+        if column == 0:
+            self._update_selection_count()
+
+    def _on_tree_double_clicked(self, item, column) -> None:
+        if item is None or item.data(0, self.ROLE_KIND) != "note":
+            return
+        nid = item.data(0, self.ROLE_KEY)
+        try:
+            from aqt import dialogs
+            browser = dialogs.open("Browser", mw)
+            if hasattr(browser, "search_for_terms"):
+                browser.search_for_terms(f"nid:{nid}")
+            else:
+                browser.form.searchEdit.lineEdit().setText(f"nid:{nid}")
+                browser.onSearchActivated()
+        except Exception as e:
+            log.warn(f"bulk search: couldn't open browser for nid:{nid}: {e}")
+
+    def _ticked(self) -> dict[str, dict]:
+        """{kg_id: {"nids": [...], "covered_points": n, "total_points": n}} from
+        what's actually ticked right now — the user's decision, not the
+        allocator's, is what commits and what closes a gap."""
+        out: dict[str, dict] = {}
+        for gi in range(self._tree.topLevelItemCount()):
+            g = self._tree.topLevelItem(gi)
+            kg_id = g.data(0, self.ROLE_KEY)
+            rec = out.setdefault(kg_id, {"nids": [], "covered_points": 0,
+                                         "total_points": 0})
+            for pi in range(g.childCount()):
+                p = g.child(pi)
+                if p.data(0, self.ROLE_KIND) != "point":
+                    continue
+                rec["total_points"] += 1
+                hit = False
+                for ni in range(p.childCount()):
+                    n = p.child(ni)
+                    if n.data(0, self.ROLE_KIND) != "note":
+                        continue
+                    if n.checkState(0) == Qt.CheckState.Checked:
+                        hit = True
+                        nid = int(n.data(0, self.ROLE_KEY))
+                        if nid not in rec["nids"]:
+                            rec["nids"].append(nid)
+                if hit:
+                    rec["covered_points"] += 1
+        return out
+
+    def _outcome_split(self) -> tuple[list[str], list[str], list[str]]:
+        """(fully covered, partly covered, nothing) gap ids, by what's ticked."""
+        full, partial, empty = [], [], []
+        for kg_id, rec in self._ticked().items():
+            if rec["covered_points"] == 0:
+                empty.append(kg_id)
+            elif rec["covered_points"] >= rec["total_points"]:
+                full.append(kg_id)
+            else:
+                partial.append(kg_id)
+        return full, partial, empty
+
+    def _update_selection_count(self) -> None:
+        ticked = self._ticked()
+        n = len({nid for rec in ticked.values() for nid in rec["nids"]})
+        self._sel_lbl.setText(f"{n} card(s) ticked")
+        full, partial, empty = self._outcome_split()
+        self._gap_hint.setText(
+            f"{len(full)} gap(s) fully covered · {len(partial)} partly · "
+            f"{len(empty)} not covered at all.  Only fully-covered gaps are "
+            "marked done — the rest stay open, and those are the ones worth "
+            "making cards for."
+        )
+        self._commit_btn.setEnabled(n > 0)
+        uncovered = len(partial) + len(empty)
+        self._send_create_btn.setText(
+            f"→  Send gaps to AI Create…  ({uncovered} uncovered)"
+            if uncovered else "→  Send gaps to AI Create…")
+        self._send_create_btn.setEnabled(self._tree.topLevelItemCount() > 0)
+
+    # ── commit ───────────────────────────────────────────────────────────────
+
+    def _on_commit(self) -> None:
+        if not anki_utils.require_col() or not self._coverage:
+            return
+        ticked = self._ticked()
+        all_nids = sorted({nid for rec in ticked.values() for nid in rec["nids"]})
+        if not all_nids:
+            tooltip("Nothing ticked.")
+            return
+        full, partial, empty = self._outcome_split()
+
+        untagged = [kg_id for kg_id, rec in ticked.items()
+                    if rec["nids"] and not self._tag_text(kg_id)]
+        do_unsuspend = self._unsuspend_cb.isChecked()
+
+        lines = [f"Tag {len(all_nids)} note(s), each under its own gap's tag"
+                 + (", and unsuspend them?" if do_unsuspend else "?")]
+        lines.append(f"\n{len(full)} gap(s) fully covered — these are marked done.")
+        if partial:
+            lines.append(f"{len(partial)} partly covered — kept OPEN, because some "
+                         "of what you wrote them down for still isn't in your deck.")
+        if empty:
+            lines.append(f"{len(empty)} found nothing and stay open.")
+        if untagged:
+            lines.append(f"\n{len(untagged)} gap(s) have an empty tag box — their "
+                         "cards will be unsuspended but not tagged.")
+        lines.append("\nCard content is never modified.")
+        if not askUser("\n".join(lines)):
+            return
+
+        cids: list[int] = []
+        for nid in all_nids:
+            try:
+                note = mw.col.get_note(nid)
+            except Exception:
+                continue
+            cids.extend(note.card_ids() if hasattr(note, "card_ids")
+                        else [c.id for c in note.cards()])
+
+        # One checkpoint around the lot, so one undo reverses the whole batch.
+        if hasattr(mw, "checkpoint"):
+            mw.checkpoint("Ankisstant: bulk gap search")
+
+        plans_by_id = {p.kg_id: p for p in self._run_plans}
+        tagged = 0
+        for kg_id, rec in ticked.items():
+            if not rec["nids"]:
+                continue
+            tags: list[str] = []
+            t = self._tag_text(kg_id)
+            if t:
+                tags.append(t)
+            plan = plans_by_id.get(kg_id)
+            if plan:
+                tags.extend(x for x in plan.tags if x and x not in tags)
+            for tag in tags:
+                anki_utils.tag_notes(rec["nids"], tag)
+            if tags:
+                tagged += len(rec["nids"])
+
+        cfg = tool_config("browse")
+        audit = (cfg.get("audit_tag") or "").strip()
+        if audit:
+            anki_utils.tag_notes(all_nids, audit)
+        mtag = month_tag()
+        if mtag:
+            anki_utils.tag_notes(all_nids, mtag)
+
+        unsuspended = 0
+        if do_unsuspend and cids:
+            before = sum(1 for cid in cids if mw.col.get_card(cid).queue == -1)
+            anki_utils.unsuspend_cards(cids)
+            after = sum(1 for cid in cids if mw.col.get_card(cid).queue == -1)
+            unsuspended = before - after
+
+        closed = self._close_gaps(full)
+
+        self._commit_btn.setEnabled(False)
+        msg = (f"Done — {len(all_nids)} note(s) committed"
+               + (f" ({tagged} tagged)" if tagged != len(all_nids) else "")
+               + (f", {unsuspended} card(s) unsuspended" if do_unsuspend else "")
+               + f", {closed} gap(s) closed.")
+        left = len(partial) + len(empty)
+        if left:
+            msg += (f" {left} gap(s) stay open — send them to AI Create to make "
+                    "the cards your deck is missing.")
+        self._status.setText(msg)
+        tooltip(msg, period=5000)
+        try:
+            mw.col.reset()
+            mw.reset()
+        except Exception:
+            pass
+
+    def _tag_text(self, kg_id: str) -> str:
+        edit = self._tag_edits.get(kg_id)
+        return edit.text().strip() if edit is not None else ""
+
+    def _close_gaps(self, kg_ids: list[str]) -> int:
+        """Mark fully-covered gaps done. Best-effort: a store failure must never
+        undo the tagging and unsuspending that already succeeded."""
+        closed = 0
+        for kg_id in kg_ids:
+            try:
+                if kg_store.update(kg_id, status="done"):
+                    closed += 1
+            except Exception as e:
+                log.error(f"bulk search: couldn't close gap {kg_id}: {e}")
+        try:
+            from .. import knowledge_gaps
+            knowledge_gaps._refresh_open_panel()
+        except Exception:
+            pass
+        return closed
+
+    # ── hand-off ─────────────────────────────────────────────────────────────
+
+    def _main_window(self):
+        """The Ankisstant window that owns the queues. Walks up from this
+        dialog's parent, then falls back to the module singleton — the dialog
+        can be parented to Anki's own main window, which has no queues."""
+        try:
+            from ...ui.main_window import queue_owner
+            return queue_owner(self.parent())
+        except Exception as e:
+            log.warn(f"bulk search: couldn't find the Ankisstant window: {e}")
+            return None
+
+    def _uncovered_points(self) -> dict[str, list]:
+        """{kg_id: [PointMatch, ...]} for the points with nothing ticked under
+        them. These — not the gap title — are what AI Create actually needs:
+        'Graves + Tx' with 5 of 7 points already covered wants cards for the
+        remaining 2, not another pass at the whole disease."""
+        out: dict[str, list] = {}
+        by_kg: dict[str, list] = {}
+        for m in list(self._coverage.covered) + list(self._coverage.gaps):
+            by_kg.setdefault(getattr(m.point, "kg_id", ""), []).append(m)
+
+        for gi in range(self._tree.topLevelItemCount()):
+            g = self._tree.topLevelItem(gi)
+            kg_id = g.data(0, self.ROLE_KEY)
+            group = by_kg.get(kg_id) or []
+            missing = []
+            for pi in range(g.childCount()):
+                p = g.child(pi)
+                if p.data(0, self.ROLE_KIND) != "point":
+                    continue
+                ticked = any(
+                    p.child(ni).data(0, self.ROLE_KIND) == "note"
+                    and p.child(ni).checkState(0) == Qt.CheckState.Checked
+                    for ni in range(p.childCount())
+                )
+                idx = p.data(0, self.ROLE_KEY)
+                if not ticked and isinstance(idx, int) and 0 <= idx < len(group):
+                    missing.append(group[idx])
+            out[kg_id] = missing
+        return out
+
+    def _on_send_to_create(self) -> None:
+        """Hand the gaps your deck doesn't cover to AI Create — WITH the specific
+        points it couldn't find, and only the ones you pick.
+
+        Uses the same queue shape the KG page pushes, so AI Create can't tell
+        where a queued gap came from."""
+        if not self._coverage:
+            return
+        main = self._main_window()
+        if main is None:
+            showWarning("Open Ankisstant from Tools → Ankisstant first.")
+            return
+
+        missing_by_kg = self._uncovered_points()
+        plans_by_id = {p.kg_id: p for p in self._run_plans}
+        rows = []
+        for kg_id, missing in missing_by_kg.items():
+            plan = plans_by_id.get(kg_id)
+            if plan is None:
+                continue
+            rows.append((plan, missing))
+        if not rows:
+            tooltip("Nothing searched yet.")
+            return
+
+        dlg = _SendToCreateDialog(rows, parent=self)
+        if not dlg.exec():
+            return
+        chosen = dlg.chosen()          # [(plan, [PointMatch, ...])]
+        if not chosen:
+            tooltip("Nothing selected.")
+            return
+
+        queued, sent_ids = 0, []
+        for plan, missing in chosen:
+            kg = kg_store.get(plan.kg_id)
+            if not kg:
+                continue
+            gaps_text = [m.point.concept for m in missing]
+            notes_bits = []
+            own = kg_store.field(kg, "notes")
+            if own:
+                notes_bits.append(own)
+            if gaps_text:
+                # Plain prose, because this lands in the Create form's context
+                # box and is read by both the user and the model.
+                notes_bits.append(
+                    "My deck has no card for these parts of this gap:\n"
+                    + "\n".join(f"• {t}" for t in gaps_text))
+            main.gap_queue.append({
+                "title":       kg.get("title", ""),
+                "kg_id":       plan.kg_id,
+                "stem_html":   kg_store.field(kg, "stem_html") or None,
+                "notes":       "\n\n".join(notes_bits) or None,
+                "concept":     kg_store.field(kg, "concept") or plan.concept,
+                "explanation": kg_store.field(kg, "explanation") or "",
+                "images":      list((kg.get("fields") or {}).get("images") or []),
+                "kg_type":     (kg.get("type") or "").lower(),
+                "tags":        [t for t in (kg.get("tags") or []) if t],
+                # Structured copy of the same thing, for when Create learns to
+                # generate one card per uncovered point.
+                "points":      [
+                    {"concept": m.point.concept, "terms": list(m.point.terms),
+                     "system": m.point.system, "subsystem": m.point.subsystem,
+                     "topic": m.point.topic}
+                    for m in missing
+                ],
+                "target_cards": max(1, len(gaps_text)),
+            })
+            queued += 1
+            sent_ids.append(plan.kg_id)
+
+        # Handed to a tool, so no longer untouched — same rule as the KG page.
+        for kg_id in sent_ids:
+            try:
+                kg = kg_store.get(kg_id)
+                if kg and kg.get("status") == "open":
+                    kg_store.update(kg_id, status="in_progress")
+            except Exception as e:
+                log.warn(f"bulk search: couldn't mark {kg_id} in progress: {e}")
+        try:
+            from .. import knowledge_gaps
+            knowledge_gaps._refresh_open_panel()
+        except Exception:
+            pass
+
+        if hasattr(main, "refresh_queue_badge"):
+            main.refresh_queue_badge()
+        # Refresh Create's queue view in place — no tab switch.
+        if hasattr(main, "refresh_tool_queue"):
+            main.refresh_tool_queue("card_creator")
+        msg = (f"Queued {queued} gap(s) for AI Create, with the points your deck "
+               "is missing attached.")
+        self._set_status(msg)
+        tooltip(msg, period=5000)
+
+    # ── misc ─────────────────────────────────────────────────────────────────
+
+    def _on_back(self) -> None:
+        self._stack.setCurrentIndex(0)
+        self._back_btn.setVisible(False)
+        self._read_btn.setVisible(True)
+        self._search_btn.setVisible(True)
+        self._commit_btn.setVisible(False)
+        self._refresh_buttons()
+        self._refresh_title()
+
+    def _set_busy(self, on: bool, msg: str = "", *, progress: bool = False,
+                  stoppable: bool = False) -> None:
+        self._busy = on
+        if msg:
+            self._status.setText(msg)
+        self._progress.setVisible(on and progress)
+        if on and progress:
+            self._progress.setRange(0, 100)
+            self._progress.setValue(0)
+        self._stop_btn.setVisible(on and stoppable)
+        self._stop_btn.setEnabled(on and stoppable)
+        self._table.setEnabled(not on)
+        # Close stays live while busy — that's the whole point of being able to
+        # send the run to the background.
+        self._close_btn.setEnabled(True)
+        self._refresh_buttons()
+
+    def _set_status(self, msg: str) -> bool:
+        """Progress arrives from a worker thread long after the user may have
+        stopped and closed this window. Returns False if there's nothing left
+        to write to."""
+        if self._closed:
+            return False
+        try:
+            self._status.setText(msg)
+            return True
+        except RuntimeError:      # the underlying Qt widget is gone
+            self._closed = True
+            return False
+
+    def _resurface(self) -> None:
+        """Bring a backgrounded run's window back when it has something to show."""
+        if not self._backgrounded:
+            return
+        self._backgrounded = False
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def closeEvent(self, ev) -> None:
+        """Closing mid-run offers to keep searching. Anki's own long jobs are
+        modal-ish and that's what made a 20-minute search feel like a hostage
+        situation — there is nothing about this run that needs the window open."""
+        if self._busy:
+            if askUser(
+                "Keep searching in the background?\n\n"
+                "Yes — this window hides and reopens by itself when the search "
+                "finishes.\n"
+                "No — stop the search and close.",
+                defaultno=False,
+            ):
+                self._backgrounded = True
+                ev.ignore()
+                self.hide()
+                tooltip("Still searching — this window will reopen when it's done.",
+                        period=4000)
+                return
+            self._on_stop()
+        self._closed = True
+        ev.accept()
+        self.deleteLater()
+
+    def reject(self) -> None:
+        # Esc and the window chrome both land here; route them through the same
+        # close path so the background offer isn't bypassed.
+        self.close()
+
+
+class _SendToCreateDialog(QDialog):
+    """Pick which searched gaps go to AI Create, and see exactly what each one
+    would ask for.
+
+    Exists because "send the uncovered ones" was doing the choosing on his
+    behalf. A partly-covered gap is the interesting case — some of it is in the
+    deck and some isn't — and whether the residue is worth a card is a judgement
+    only he can make, per gap.
+    """
+
+    def __init__(self, rows, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Send gaps to AI Create")
+        self.setMinimumSize(720, 480)
+        self._rows = rows                    # [(plan, [PointMatch, ...])]
+
+        col = QVBoxLayout(self)
+        col.setContentsMargins(14, 12, 14, 12)
+        col.setSpacing(8)
+        head = QLabel(
+            "Each gap goes over with the specific points your deck had nothing "
+            "for — so Create writes cards for the residue, not the whole topic "
+            "again. Fully-covered gaps are listed but left unticked.")
+        head.setWordWrap(True)
+        col.addWidget(head)
+
+        self._tree = QTreeWidget()
+        self._tree.setColumnCount(1)
+        self._tree.setHeaderLabels(["Gap  ·  what your deck is missing"])
+        self._tree.setAlternatingRowColors(True)
+        col.addWidget(self._tree, 1)
+
+        for plan, missing in rows:
+            top = QTreeWidgetItem(self._tree)
+            top.setFlags(top.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            n = len(missing)
+            state = (f"{n} point(s) uncovered" if n
+                     else "fully covered — nothing to make")
+            top.setText(0, f"{plan.title}      {state}")
+            top.setCheckState(0, Qt.CheckState.Checked if n
+                              else Qt.CheckState.Unchecked)
+            f = top.font(0)
+            f.setBold(True)
+            top.setFont(0, f)
+            for m in missing:
+                leaf = QTreeWidgetItem(top)
+                leaf.setText(0, _short(m.point.concept, 160))
+                leaf.setToolTip(0, f"{m.point.concept}\n\nterms: {m.point.terms}")
+                leaf.setFlags(leaf.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+            top.setExpanded(bool(missing))
+
+        row = QHBoxLayout()
+        for label, state in (("Tick all", Qt.CheckState.Checked),
+                             ("Untick all", Qt.CheckState.Unchecked)):
+            b = QPushButton(label)
+            b.setAutoDefault(False)
+            b.clicked.connect(lambda _c=False, s=state: self._set_all(s))
+            row.addWidget(b)
+        row.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.setAutoDefault(False)
+        cancel.clicked.connect(self.reject)
+        row.addWidget(cancel)
+        send = QPushButton("Send to AI Create")
+        send.setDefault(True)
+        send.clicked.connect(self.accept)
+        row.addWidget(send)
+        col.addLayout(row)
+        theme_dialog(self)
+
+    def _set_all(self, state) -> None:
+        for i in range(self._tree.topLevelItemCount()):
+            self._tree.topLevelItem(i).setCheckState(0, state)
+
+    def chosen(self):
+        out = []
+        for i, (plan, missing) in enumerate(self._rows):
+            if self._tree.topLevelItem(i).checkState(0) == Qt.CheckState.Checked:
+                out.append((plan, missing))
+        return out
+
+
+def open_bulk_search(kgs: list[dict], parent=None) -> None:
+    """Entry point. `kgs` are full KG records from tools/kg/store.py."""
+    kgs = [k for k in (kgs or []) if isinstance(k, dict)
+           and str(k.get("title") or "").strip()]
+    if not kgs:
+        tooltip("No knowledge gaps to search.")
+        return
+    dlg = BulkSearchDialog(kgs, parent=parent)
+    dlg.show()
+    dlg.raise_()
+    dlg.activateWindow()
+    # Read straight away, as Mass AI Create does. Until the gaps are read this
+    # screen has nothing on it worth deciding about — every row shows a default
+    # scope and no points. singleShot(0) so the window paints before the busy
+    # state lands on it; the enabled-check mirrors _refresh_buttons, so a
+    # missing or manual provider still just shows its explanation.
+    if dlg._read_btn.isEnabled():
+        QTimer.singleShot(0, lambda: (not dlg._closed) and dlg._on_read())
