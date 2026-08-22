@@ -195,6 +195,8 @@ class BulkSearchDialog(QDialog):
         self._gen_profile: dict = {}         # the notetype profile cards commit under
         self._gen_active = False             # jobs still running
         self._gen_rendered = False           # the written cards are on screen
+        self._gen_shown: set = set()         # kg_ids whose cards are rendered
+        self._gen_seen: dict = {}            # normalised front -> gap that has it
         self._applied = False
         self._poll = QTimer(self)
         self._poll.setInterval(750)
@@ -1699,22 +1701,27 @@ class BulkSearchDialog(QDialog):
             self._update_selection_count()
             return
         counts = create_jobs.batch_progress(self._gen_batch_id)
+        try:
+            # Cards first, then the promises for whatever is still outstanding —
+            # in that order, so a gap that just landed is never re-labelled
+            # "writing" over its own freshly rendered cards.
+            self._render_generated(jobs)
+            self._update_written_placeholders(jobs)
+        except RuntimeError:
+            self._closed = True
+            return
+
         if counts["finished"]:
             self._poll.stop()
             self._gen_active = False
             self._progress.setVisible(False)
             self._stop_btn.setVisible(False)
             self._resurface()
-            self._render_generated(jobs)
+            self._refresh_gen_head()
             return
         try:
             self._progress.setValue(
                 int(100 * counts["done"] / max(1, counts["total"])))
-        except RuntimeError:
-            self._closed = True
-            return
-        try:
-            self._update_written_placeholders(jobs)
             self._gen_note.setText(
                 f"{counts['ready']} of {counts['total']} gap(s) written \u00b7 "
                 f"{counts['running']} writing \u00b7 {counts['queued']} queued"
@@ -1819,10 +1826,18 @@ class BulkSearchDialog(QDialog):
         return [node.child(i) for i in range(node.childCount())
                 if node.child(i).data(0, self.ROLE_KIND) in ("newcard", "pending")]
 
+    # One message for every state that still has an answer coming.
+    #
+    # A gap that finished early used to flip to "written — see below" while the
+    # cards were still waiting on the SLOWEST gap in the batch, so the row
+    # announced an output that wasn't on screen yet. Rendering is per gap now
+    # (see _render_generated), so the only honest thing to say until a gap's
+    # cards are actually there is that it is being written.
+    _WRITING = "\u270d\ufe0e  writing a card for this\u2026"
     _PENDING_TEXT = {
-        "queued": "\u270d\ufe0e  queued \u2014 a card will be written for this",
-        "running": "\u270d\ufe0e  writing a card for this\u2026",
-        "ready": "\u270d\ufe0e  written \u2014 see below",
+        "queued": _WRITING,
+        "running": _WRITING,
+        "ready": _WRITING,
         "error": "\u26a0\ufe0f  couldn\u2019t write a card for this",
         "interrupted": "\u26d4  stopped before this was written",
     }
@@ -1892,6 +1907,8 @@ class BulkSearchDialog(QDialog):
         self._tree.blockSignals(True)
         for j in jobs:
             kg_id = str(j.get("kg_id") or "")
+            if kg_id in self._gen_shown:
+                continue          # its cards are on screen; nothing to promise
             st = str(j.get("status") or "")
             text = self._PENDING_TEXT.get(st, st)
             if st == "error":
@@ -1903,17 +1920,16 @@ class BulkSearchDialog(QDialog):
             folder = self._written_folder(kg_id)
             if folder is not None:
                 n = len(j.get("mass_points") or [])
-                folder.setText(0, {
-                    "queued": f"\u270d\ufe0e  queued \u2014 {n} card(s) to write",
-                    "running": f"\u23f3  writing {n} card(s)\u2026",
-                    # NOT a tick. A tick next to a card that has not been added
-                    # to the collection reads as "done" — and nothing here has
-                    # touched the deck until Apply.
-                    "ready": "\u270d\ufe0e  written \u2014 not added yet",
-                    "error": "\u26a0\ufe0f  couldn\u2019t write these \u2014 "
-                             + str(j.get("error") or "generation failed"),
-                    "interrupted": "\u26d4  stopped before these were written",
-                }.get(st, st))
+                if st == "error":
+                    txt = ("\u26a0\ufe0f  couldn\u2019t write these \u2014 "
+                           + str(j.get("error") or "generation failed"))
+                elif st == "interrupted":
+                    txt = "\u26d4  stopped before these were written"
+                else:
+                    # queued, running, and ready-but-not-yet-rendered all read
+                    # the same: there is an answer coming and it isn't here yet.
+                    txt = f"\u270d\ufe0e  writing {n} card(s)\u2026"
+                folder.setText(0, txt)
         self._tree.blockSignals(False)
 
     def _render_generated(self, jobs: list[dict]) -> None:
@@ -1930,37 +1946,50 @@ class BulkSearchDialog(QDialog):
         from .mass_create import _norm_front
 
         self._gen_jobs = {str(j.get("kg_id") or ""): j for j in jobs}
+
+        # PER GAP, as each one lands. Waiting for the whole batch meant a gap
+        # that finished in twenty seconds sat behind one that took three
+        # minutes, with a row claiming an output that wasn't on screen. A gap is
+        # rendered once and then left alone.
+        fresh = [j for j in jobs
+                 if str(j.get("status") or "") in ("ready", "error", "interrupted")
+                 and str(j.get("kg_id") or "") not in self._gen_shown]
+        if not fresh:
+            return          # nothing new landed this tick; don't redo the work
+
         self._gen_profile = cc._resolved_profile(
             tool_config("card_creator"),
             self._notetype.currentText().strip()
             if self._notetype is not None else "")
         front_field = self._gen_profile.get("front_field", "Text")
 
-        # ONE dup-check pass for the batch, not one per row: it is a find_notes
-        # per card on the main thread. Within-batch near-duplicates are flagged
-        # too \u2014 two gaps about the same entity produce the same card, and
-        # nothing culls a freshly written duplicate the way search dedupes a
-        # matched one.
+        # One dup-check pass over the gaps being rendered now, not one per row:
+        # it is a find_notes per card on the main thread. Within-batch
+        # near-duplicates are flagged too \u2014 two gaps about the same entity
+        # produce the same card, and nothing culls a freshly written duplicate
+        # the way search dedupes a matched one. _gen_seen carries across calls so
+        # a later gap is still checked against an earlier one.
         dups: dict[int, str] = {}
-        seen: dict[str, str] = {}
         idx = 0
-        for j in jobs:
+        for j in fresh:
             for card in (j.get("cards") or []):
                 msg = cc.dup_check(card, front_field)
                 key = _norm_front(card)
-                if key and key in seen:
-                    extra = f"\u26a0 near-duplicate of a card under \u2018{seen[key]}\u2019"
+                if key and key in self._gen_seen:
+                    extra = ("\u26a0 near-duplicate of a card under "
+                             f"\u2018{self._gen_seen[key]}\u2019")
                     msg = f"{msg}  \u00b7  {extra}" if msg else extra
                 elif key:
-                    seen[key] = j.get("title") or "another gap"
+                    self._gen_seen[key] = j.get("title") or "another gap"
                 if msg:
                     dups[idx] = msg
                 idx += 1
 
         self._tree.blockSignals(True)
         idx = 0
-        for j in jobs:
+        for j in fresh:
             kg_id = str(j.get("kg_id") or "")
+            self._gen_shown.add(kg_id)
             if self._gap_item(kg_id) is None:
                 idx += len(j.get("cards") or [])
                 continue
@@ -2044,11 +2073,17 @@ class BulkSearchDialog(QDialog):
         items = self._written_items()
         approved = sum(1 for it, _c in items
                        if it.checkState(0) == Qt.CheckState.Checked)
+        # Rendering is per gap, so the count is a running total while a batch is
+        # still going. Saying how many gaps are still out stops "3 of 3 ticked"
+        # from reading as "that's all of them".
+        outstanding = len([k for k in self._gen_jobs if k not in self._gen_shown])
+        tail = (f"; {outstanding} more gap(s) still writing"
+                if outstanding else "")
         try:
             self._found_head.setText(
                 "What your deck has for these gaps \u2014 and, marked NEW, the "
                 f"cards written for what it didn\u2019t "
-                f"({approved} of {len(items)} ticked)")
+                f"({approved} of {len(items)} ticked{tail})")
             self._gen_note.setText(self._gen_note_text())
             self._gen_note.setVisible(True)
         except RuntimeError:
@@ -2067,8 +2102,11 @@ class BulkSearchDialog(QDialog):
         """The line under the tree. Rebuilt from BOTH halves\u2019 state, because
         ticking a found card changes what it should say."""
         note = self._crosstalk_note()
+        # Only gaps that have actually finished. A queued job has no cards yet,
+        # and counting it as "came back with no cards" reports a failure that
+        # hasn't happened.
         blank = [kg_id for kg_id, j in self._gen_jobs.items()
-                 if not (j.get("cards") or [])]
+                 if kg_id in self._gen_shown and not (j.get("cards") or [])]
         if blank:
             note = ((note + "  ") if note else "") + (
                 f"{len(blank)} gap(s) came back with no cards \u2014 right-click "
