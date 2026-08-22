@@ -432,6 +432,10 @@ def run_pipeline(path: str, cfg: dict, *, report, cancel_ev: threading.Event,
         if cancel_ev.is_set():
             raise Cancelled()
 
+    # `points` is rebound below when we extract, so remember whether the CALLER
+    # supplied them — that's what distinguishes a lecture run from KG mode.
+    supplied_points = points
+
     target_points = int(cfg.get("target_points") or extractor.DEFAULT_TARGET_POINTS)
     target_cards = int(cfg.get("target_cards") or matcher.DEFAULT_TARGET_CARDS)
     depth = str(cfg.get("depth") or matcher.DEFAULT_DEPTH)
@@ -648,6 +652,20 @@ def run_pipeline(path: str, cfg: dict, *, report, cancel_ev: threading.Event,
     # 6 — fail-open fill, dedupe, budget, diagnostics, coverage. Shared with the
     # file hand-off path (see finish_matches); a clean CLI run passes its own
     # relevance model so the semantic dedupe still fires.
+    # Size the cap from what the lecture actually produced, now that we know.
+    # Done here rather than at the top because the point count is the input and
+    # it doesn't exist until extraction has run.
+    #
+    # NOT in KG mode. When `points` was supplied, the budget is the sum of the
+    # per-gap card targets the triage pass worked out (and the user edited in
+    # the plan table) — a deliberate figure, not a default to improve on.
+    if supplied_points is None and bool(cfg.get("auto_target_cards", True)):
+        sized = matcher.auto_target_cards(len(points or []))
+        if sized != target_cards:
+            log.info(f"lecture: {len(points or [])} point(s) -> max notes "
+                     f"{sized} (was {target_cards}, sized from the lecture)")
+        target_cards = sized
+
     coverage = finish_matches(matches, target_cards=target_cards, depth=depth,
                               on_main=_on_main, report=report, ai_dedupe_model=model_r,
                               cap_for=cap_for)
@@ -898,6 +916,18 @@ class LecturePanel(QWidget):
             "reach it."
         )
         opt.addWidget(self._cards_spin)
+        self._auto_cards_cb = QCheckBox("from lecture")
+        self._auto_cards_cb.setToolTip(
+            "Size the cap from how many learning points the lecture actually "
+            "yields, instead of a fixed number.\n\nA fixed cap is wrong in both "
+            "directions — it binds on a dense pharmacology deck and is far too "
+            "loose on a six-point tutorial. Still only a cap: nothing is ever "
+            "padded to reach it.\n\nUntick to go back to the number on the left, "
+            "which is kept either way."
+        )
+        self._auto_cards_cb.toggled.connect(
+            lambda on: self._cards_spin.setEnabled(not on))
+        opt.addWidget(self._auto_cards_cb)
         opt.addStretch(1)
         setup.addLayout(opt)
 
@@ -947,6 +977,7 @@ class LecturePanel(QWidget):
         # their text). A minimum, not a fixed size — they still grow with the font.
         for _ctl in (self._mode_combo, self._file_btn, self._lo_file_btn,
                      self._companion_btn, self._coverage_combo, self._cards_spin,
+                     self._auto_cards_cb,
                      self._nt_combo):
             _ctl.setMinimumHeight(30)
 
@@ -1121,6 +1152,11 @@ class LecturePanel(QWidget):
         _ci = self._coverage_combo.findData(_cov)
         self._coverage_combo.setCurrentIndex(_ci if _ci >= 0 else self._coverage_combo.count() - 1)
         self._cards_spin.setValue(int(self.cfg.get("target_cards") or 60))
+        # Default ON. The cap is documented as a soft ceiling that is never
+        # padded to, so sizing it from the lecture can only relax a constraint —
+        # and the typed value is left untouched underneath for when it's off.
+        self._auto_cards_cb.setChecked(bool(self.cfg.get("auto_target_cards", True)))
+        self._cards_spin.setEnabled(not self._auto_cards_cb.isChecked())
         self._vision_cb.setChecked(bool(self.cfg.get("use_vision", DEFAULT_USE_VISION)))
         self._enrich_cb.setChecked(bool(self.cfg.get("enrich", False)))
         self._attach_cb.setChecked(bool(self.cfg.get("attach_slides", False)))
@@ -1382,6 +1418,7 @@ class LecturePanel(QWidget):
             _spec["detail"], extractor.DEFAULT_TARGET_POINTS)
         self.cfg["depth"] = _spec["depth"]
         self.cfg["target_cards"] = self._cards_spin.value()
+        self.cfg["auto_target_cards"] = self._auto_cards_cb.isChecked()
         self.cfg["use_vision"] = self._vision_cb.isChecked()
         self.cfg["enrich"] = self._enrich_cb.isChecked()
         self.cfg["attach_slides"] = self._attach_cb.isChecked()

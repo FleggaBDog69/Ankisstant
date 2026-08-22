@@ -639,26 +639,112 @@ def parse_batch_reply(reply, batch: Batch) -> list[LearningPoint]:
     return points
 
 
+# Two concepts whose significant words overlap at or above this are treated as
+# the same point. Deliberately high, for the same reason matcher._DEDUPE_MIN_JACCARD
+# is: medical phrasing shares heavy vocabulary, so a lower bar would fuse two
+# genuinely different facts and lose one of them silently.
+#
+# The case this exists for, from the ICP/herniation run: the model returned
+# "Cushing reflex is hypertension, bradycardia and irregular respiration" and
+# "Cushing triad: raised BP, bradycardia, abnormal breathing" as separate
+# points. They then competed for the same cards, and the budget spent two slots
+# restating one fact.
+_TWIN_MIN_JACCARD = 0.72
+
+# Words carrying no identity — two concepts sharing only these are not twins.
+_TWIN_STOP = {
+    "the", "a", "an", "of", "in", "on", "to", "and", "or", "is", "are", "for",
+    "with", "by", "as", "at", "from", "that", "this", "it", "its", "be", "can",
+    "may", "which", "when", "than", "then", "into", "via", "due", "causes",
+    "cause", "caused", "leads", "lead", "results", "result",
+}
+
+
+def _twin_tokens(text: str) -> set[str]:
+    """The significant words of a concept, for near-duplicate comparison."""
+    words = re.findall(r"[a-z0-9]+", (text or "").lower())
+    return {w for w in words if len(w) > 2 and w not in _TWIN_STOP}
+
+
+def _twin_of(tokens: set[str], candidates: list[tuple[set[str], LearningPoint]]):
+    """The already-kept point this one is a near-duplicate of, or None."""
+    if not tokens:
+        return None
+    best, best_score = None, 0.0
+    for other_tokens, point in candidates:
+        if not other_tokens:
+            continue
+        inter = len(tokens & other_tokens)
+        if not inter:
+            continue
+        score = inter / len(tokens | other_tokens)
+        if score > best_score:
+            best, best_score = point, score
+    return best if best_score >= _TWIN_MIN_JACCARD else None
+
+
 def merge(batch_results: list[list[LearningPoint]]) -> list[LearningPoint]:
     """Flatten batches into one ordered list, collapsing the duplicates the
     overlap deliberately creates. First occurrence wins; later citations are
-    folded in so a point spanning a seam cites both segments."""
+    folded in so a point spanning a seam cites both segments.
+
+    Two kinds of duplicate are collapsed here:
+
+    1. IDENTICAL concepts (same _stem_key) — what batch overlap produces.
+    2. NEAR-identical concepts — twins the model returns as separate points
+       within a single batch, restating one fact in two phrasings. These are
+       worse than harmless: each twin searches for the same cards, the judge
+       scores the same cards for both, and allocate() hands the pair two budget
+       slots for one fact. Merging keeps the LONGER concept, on the grounds
+       that the more specific phrasing is the more useful search input.
+
+    Every twin collapse is logged with both concepts, because this is the one
+    place a real point can be lost to a threshold — and a silent loss here would
+    surface much later as an unexplained missing card.
+    """
     out: list[LearningPoint] = []
     by_key: dict[str, LearningPoint] = {}
+    tokenised: list[tuple[set[str], LearningPoint]] = []
+    twins = 0
+
+    def _fold(into: LearningPoint, other: LearningPoint) -> None:
+        into.refs = sorted(set(into.refs) | set(other.refs))
+        into.note_refs = sorted(set(into.note_refs) | set(other.note_refs))
+        for t in other.terms:
+            if t.lower() not in {x.lower() for x in into.terms}:
+                into.terms.append(t)
+
     for result in batch_results:
         for p in result:
             key = _stem_key(p.concept)
             if not key:
                 continue
             existing = by_key.get(key)
-            if existing is None:
-                by_key[key] = p
-                out.append(p)
+            if existing is not None:
+                _fold(existing, p)
                 continue
-            existing.refs = sorted(set(existing.refs) | set(p.refs))
-            for t in p.terms:
-                if t.lower() not in {x.lower() for x in existing.terms}:
-                    existing.terms.append(t)
+
+            tokens = _twin_tokens(p.concept)
+            twin = _twin_of(tokens, tokenised)
+            if twin is not None:
+                twins += 1
+                log.info(f"lecture: merged twin points — kept "
+                         f"'{twin.concept[:70]}', folded in '{p.concept[:70]}'")
+                _fold(twin, p)
+                # The longer phrasing usually carries the extra specificity that
+                # makes a search work, so it wins the surviving concept.
+                if len(p.concept) > len(twin.concept):
+                    twin.concept = p.concept
+                by_key[key] = twin
+                continue
+
+            by_key[key] = p
+            tokenised.append((tokens, p))
+            out.append(p)
+
+    if twins:
+        log.info(f"lecture: collapsed {twins} twin point(s) — "
+                 f"{len(out)} distinct point(s) remain")
     return out
 
 

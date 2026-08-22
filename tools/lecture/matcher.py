@@ -83,6 +83,27 @@ TAG_LEG_POOL = 40
 # only bites if that key is missing, so it matches it.
 DEFAULT_TARGET_CARDS = 45
 
+# How many cards one learning point is worth, when the estimate is sized from
+# the lecture rather than typed in. Three is deliberately generous: the number
+# is a CEILING that allocate() never pads to (see RUN-10 — "an estimate, not a
+# quota"), so erring high costs nothing, while erring low silently caps a
+# thorough lecture at fewer cards than it has facts.
+CARDS_PER_POINT = 3
+AUTO_TARGET_MIN = 15
+AUTO_TARGET_MAX = 150
+
+
+def auto_target_cards(n_points: int) -> int:
+    """Size the card estimate from how many points the lecture actually yielded.
+
+    A fixed target is wrong in both directions: on a 6-point tutorial it invites
+    the allocator to spread thin, and on a 40-point pharmacology deck it binds
+    before the content does. Clamped at both ends so a pathological extraction
+    can't produce an absurd figure."""
+    if n_points <= 0:
+        return DEFAULT_TARGET_CARDS
+    return max(AUTO_TARGET_MIN, min(AUTO_TARGET_MAX, n_points * CARDS_PER_POINT))
+
 # Depth presets — how many cards ONE objective may claim, on top of guaranteeing
 # its minimum non-redundant set-cover. This is the knob that turns the tool from
 # a "minimum revision shortlist" into a "concept-coverage set":
@@ -1210,6 +1231,29 @@ def term_leg(point: LearningPoint,
     return nids, per_term
 
 
+def _widened_terms(point: LearningPoint) -> list[str]:
+    """A last-resort, deliberately broader term set for a point whose own terms
+    found NOTHING.
+
+    term_leg already narrows individual dud terms by dropping their trailing
+    qualifier. This goes a step further and falls back to the point's own tag
+    levels — topic, then subsystem — which are broad by construction. They
+    over-recall, which is exactly right here: the alternative is reporting a gap
+    for a concept whose cards exist, and a wrong "you have no card for this" is
+    the one error that makes the coverage report lie.
+
+    Returns [] when there is nothing broader to try, so the caller can tell a
+    genuine miss from an untried one."""
+    out: list[str] = []
+    seen = {t.strip().lower() for t in point.terms if t.strip()}
+    for level in (point.topic, point.subsystem):
+        cand = re.sub(r"([a-z])([A-Z])", r"\1 \2", str(level or "")).strip()
+        if len(cand) > 2 and cand.lower() not in seen:
+            out.append(cand)
+            seen.add(cand.lower())
+    return out
+
+
 def search_point(point: LearningPoint, index: TagIndex, *,
                  notetype_filter: str = "",
                  limit: int = MAX_CANDIDATES_PER_POINT) -> PointMatch:
@@ -1235,6 +1279,30 @@ def search_point(point: LearningPoint, index: TagIndex, *,
         if nid not in seen:
             seen.add(nid)
             pool.append(nid)
+
+    # Gap re-search. An empty pool means this point is about to be reported as a
+    # gap having never been looked for in more than one way. Retry once, broader,
+    # BEFORE anyone believes the miss. Costs one query, no AI, and only ever runs
+    # on points that found nothing — so a lecture whose points all hit pays
+    # nothing for it.
+    widened = _widened_terms(point) if not pool else []
+    if widened:
+        scope = getattr(index, "scope", "")
+        query = " OR ".join(_scoped(t, notetype_filter, scope) for t in widened)
+        rescued = _find(query) or []
+        if rescued:
+            log.info(f"lecture: '{point.concept[:60]}' found nothing on its own "
+                     f"terms; widened to {widened} and found {len(rescued)} "
+                     "candidate(s)")
+            for nid in rescued:
+                if nid not in seen:
+                    seen.add(nid)
+                    pool.append(nid)
+            # Recorded so the diagnostics can say the pool came from a widened
+            # search — these candidates are looser than usual, and the relevance
+            # judge is what decides whether any of them actually answer the point.
+            per_term = list(per_term) + [(f"{t} (widened)", len(rescued))
+                                         for t in widened]
 
     terms = [t for t in point.terms if t.strip()]
     if terms and len(pool) > 1:
