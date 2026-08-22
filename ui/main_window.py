@@ -244,17 +244,28 @@ class AnkisstantBody(QWidget):
         # the body knowing what a dock is.
         self.on_popout = None
 
-        # Session-scoped queue of gaps waiting to become cards. Items are
-        # dicts: {"title": str, "kg_id": str | None, "stem_html": str | None,
-        # "notes": str | None}. The Knowledge Gaps page pushes here; Create
-        # pops one at a time, and a kg_id (when set) is marked done in the
-        # KG store on successful Add.
-        self.gap_queue: list[dict] = []
-        # Session-scoped queue of KGs waiting to be looked up in Browse.
-        # Items are full KG dicts (id, title, fields, tags, type). The
-        # Knowledge Gaps page pushes here; Browse works through them and a
-        # successful Tag & Unsuspend marks the KG done and advances.
-        self.browse_queue: list[dict] = []
+        # The two work queues. Both are kg.queues.Queue — list-like, but they
+        # persist themselves to user_files/queues.json, so a crash or a quit
+        # mid-batch no longer loses the gaps you'd picked out. See queues.py
+        # for the one rule new call sites have to follow.
+        #
+        # gap_queue: gaps waiting to become cards. Items are dicts
+        # {"title", "kg_id", "stem_html", "notes", ...}. The Knowledge Gaps
+        # page pushes here; Create takes one at a time, and a kg_id (when set)
+        # is marked done in the KG store on successful Add.
+        #
+        # browse_queue: KGs waiting to be looked up in Browse. Items are full
+        # KG dicts (id, title, fields, tags, type). Browse works through them
+        # and a successful Tag & Unsuspend marks the KG done and advances.
+        try:
+            from ..tools.kg import queues as kg_queues
+            self.gap_queue, self.browse_queue = kg_queues.load()
+        except Exception as e:
+            # Never let a bad queue file stop the window opening — an empty
+            # session is recoverable, a window that won't build isn't.
+            print(f"[ankisstant] queue restore failed, starting empty: {e}")
+            self.gap_queue = []
+            self.browse_queue = []
         self._panel_cache: dict[str, QWidget] = {}
 
         # Adoption has to happen BEFORE _build(). Building selects a tool, which
@@ -858,6 +869,13 @@ def _forget() -> None:
     of it into the next profile would be wrong as well as unsafe.
     """
     global _current, _host
+    # Flush the queues BEFORE the widgets go: the save is debounced, so the
+    # last few seconds of work may only exist in memory at this point.
+    try:
+        from ..tools.kg import queues as kg_queues
+        kg_queues.forget()
+    except Exception as e:
+        print(f"[ankisstant] queue flush on profile close failed: {e}")
     if _host is not None:
         try:
             if isinstance(_host, AnkisstantDock):
