@@ -29,6 +29,7 @@ from aqt.utils import askUser, showWarning, tooltip
 from ..core import anki_utils, api as core_api, log
 from ..core.config import tool_config, tool_model_for
 from ..grounding import guidelines as grounding
+from . import autotag
 from . import card_creator as cc
 from . import quality_pass as qp
 from ..core import synapse
@@ -220,6 +221,20 @@ class UpdateByTagPanel(QWidget):
         self._tag_input.setPlaceholderText("optional — e.g. Malleus_CM::#Subjects::Psychiatry")
         self._tag_input.textChanged.connect(self._on_filter_changed)
         tag_row.addWidget(self._tag_input, 1)
+        # Pick a KG group to rewrite everything filed under it. The group is the
+        # batch you actually think in — "redo the cards from SRS 4" — where the
+        # tag it expands to is an implementation detail you'd otherwise have to
+        # remember and type.
+        self._group_combo = QComboBox()
+        self._group_combo.setMinimumWidth(140)
+        self._group_combo.setToolTip(
+            "Fill the tag from a KG group, to re-process every card filed "
+            "under that batch."
+        )
+        self._group_combo.currentIndexChanged.connect(self._on_group_picked)
+        tag_row.addWidget(QLabel("or group:"))
+        tag_row.addWidget(self._group_combo)
+        self._refresh_groups()
         self._find_btn = QPushButton("Find Notes")
         self._find_btn.setFixedWidth(110)
         self._find_btn.clicked.connect(self._find_notes)
@@ -336,6 +351,10 @@ class UpdateByTagPanel(QWidget):
         self._tag_input.setCompleter(comp)
 
     def showEvent(self, ev):
+        try:
+            self._refresh_groups()
+        except Exception:
+            pass
         super().showEvent(ev)
         try:
             self.cfg = tool_config("update_by_tag")
@@ -353,6 +372,43 @@ class UpdateByTagPanel(QWidget):
             if p.get("name") == name:
                 return p
         return None
+
+    def _refresh_groups(self) -> None:
+        """Rebuild the group list, preserving the selection and never firing the
+        picked handler while repopulating (which would overwrite a tag the user
+        had just typed)."""
+        try:
+            from .kg import store as kg_store
+            names = kg_store.groups()
+        except Exception as e:
+            print(f"[ankisstant] group list unavailable: {e}")
+            names = []
+        current = self._group_combo.currentData() if self._group_combo.count() else ""
+        self._group_combo.blockSignals(True)
+        self._group_combo.clear()
+        self._group_combo.addItem("— none —", "")
+        for n in names:
+            self._group_combo.addItem(n, n)
+        if current:
+            idx = self._group_combo.findData(current)
+            if idx >= 0:
+                self._group_combo.setCurrentIndex(idx)
+        self._group_combo.blockSignals(False)
+
+    def _on_group_picked(self, *_a) -> None:
+        name = str(self._group_combo.currentData() or "")
+        if not name:
+            return
+        prefix = autotag.group_tag_prefix(name)
+        if not prefix:
+            showWarning(
+                f"“{name}” has no tag branch yet — set an auto-tag base in "
+                "Ankisstant Settings, or type a tag by hand.")
+            return
+        # The group prefix is never itself a literal tag: a real tag is always
+        # deeper (base::TYPE::SRS::04::System::…), so the subtree wildcard is
+        # what matches, and matches exactly.
+        self._tag_input.setText(f"{prefix}::*")
 
     def _on_filter_changed(self, *_):
         self._note_ids = []

@@ -8,11 +8,13 @@ from __future__ import annotations
 
 from aqt import mw
 from aqt.qt import (
-    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QComboBox, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem,
     QPlainTextEdit, QPushButton, Qt, QVBoxLayout, QWidget,
 )
 from aqt.utils import askUser, showWarning, tooltip
 
+from . import autotag
 from ..core import anki_utils
 from ..core.config import active_family, tool_config, tool_model_for, save_tool_config
 from ..core.qt_utils import (
@@ -130,6 +132,21 @@ class GapAnalyserPanel(QWidget):
         self.tag_input.textChanged.connect(self._update_button_state)
         attach_tag_completer(self.tag_input, multi=False)
         tag_row.addWidget(self.tag_input, 1)
+        # Group picker. This tool used to float free of everything else: you
+        # typed a tag from memory, and the gaps it found landed loose in the KG
+        # list with nothing tying them back to the batch you were auditing.
+        # Picking a group does both ends — it fills the tag with that group's
+        # branch, and files the accepted gaps straight back into it.
+        self.group_combo = QComboBox()
+        self.group_combo.setToolTip(
+            "Audit a KG group: fills the tag with that group's branch, and puts "
+            "any gaps you accept back into the same group."
+        )
+        self.group_combo.setMinimumWidth(150)
+        self.group_combo.currentIndexChanged.connect(self._on_group_picked)
+        tag_row.addWidget(QLabel("Group:"))
+        tag_row.addWidget(self.group_combo)
+        self._refresh_groups()
         self.count_btn = QPushButton("Count cards")
         self.count_btn.setAutoDefault(False)
         self.count_btn.clicked.connect(self._on_count)
@@ -189,7 +206,52 @@ class GapAnalyserPanel(QWidget):
 
     # ── enable/disable ───────────────────────────────────────────────────────
 
+    def _refresh_groups(self) -> None:
+        """Rebuild the group list from the store, preserving the selection.
+
+        Groups come and go as gaps are filed, so this can't be built once —
+        but it must not fire _on_group_picked while repopulating, or picking a
+        group would clobber a tag the user had just typed."""
+        try:
+            names = kg_store.groups()
+        except Exception as e:
+            print(f"[ankisstant] group list unavailable: {e}")
+            names = []
+        current = self.group_combo.currentData() if self.group_combo.count() else ""
+        self.group_combo.blockSignals(True)
+        self.group_combo.clear()
+        self.group_combo.addItem("— none —", "")
+        for n in names:
+            self.group_combo.addItem(n, n)
+        if current:
+            idx = self.group_combo.findData(current)
+            if idx >= 0:
+                self.group_combo.setCurrentIndex(idx)
+        self.group_combo.blockSignals(False)
+
+    def _selected_group(self) -> str:
+        return str(self.group_combo.currentData() or "")
+
+    def _on_group_picked(self, *_a) -> None:
+        name = self._selected_group()
+        if not name:
+            return
+        prefix = autotag.group_tag_prefix(name)
+        if not prefix:
+            self.status.setText(
+                f"\u201c{name}\u201d has no tag branch yet — set an auto-tag "
+                "base in Settings, or type a tag by hand.")
+            return
+        self.tag_input.setText(prefix)
+        self.status.setText(
+            f"Auditing the cards filed under \u201c{name}\u201d ({prefix}). "
+            "Accepted gaps go back into that group.")
+
     def refresh_setup_banner(self) -> None:
+        try:
+            self._refresh_groups()
+        except Exception:
+            pass
         try:
             ok = provider_configured()
             self._setup_banner.setVisible(not ok)
@@ -349,12 +411,16 @@ class GapAnalyserPanel(QWidget):
 
         lo = self.lo_input.toPlainText().strip()
         tag = self.tag_input.text().strip()
+        # File them back into the group being audited, so the gaps an audit
+        # turns up are part of the same batch rather than loose in the list.
+        group = self._selected_group()
         kg_items = [
             {
                 "title":  gap_text,
                 "source": "analyse",
                 "type":   "lo",
                 "status": "open",
+                "group":  group,
                 "tags":   [tag] if tag else [],
                 "fields": {
                     "lo":     lo,
@@ -379,7 +445,8 @@ class GapAnalyserPanel(QWidget):
             f"Queued {len(approved)} gap(s) to Knowledge Gaps — {total} open. "
             "Open the Knowledge Gaps tab to route each one."
         )
-        tooltip(f"Queued {len(approved)} gap(s) to Knowledge Gaps.")
+        tooltip(f"Queued {len(approved)} gap(s) to Knowledge Gaps"
+                + (f" in \u201c{group}\u201d." if group else "."))
 
 
 # ── Tool contract ────────────────────────────────────────────────────────────

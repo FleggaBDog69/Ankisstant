@@ -39,6 +39,7 @@ from ...core.qt_utils import (
     attach_tag_completer, is_manual_provider, make_help_button,
     provider_configured, theme_dialog,
 )
+from .. import autotag
 from .. import create_jobs
 from . import gen_prompt
 from . import store as kg_store
@@ -116,6 +117,15 @@ def _norm_front(card: dict) -> str:
 
 
 # ── the dialog ───────────────────────────────────────────────────────────────
+
+def _is_group_scope(value: str) -> bool:
+    """Whether `value` looks like a tag branch this dialog derived from a group
+    (base::*::segment). Such a value may be left over from a previous batch in a
+    different group, so it can be replaced; anything the user typed is theirs
+    and is never touched."""
+    v = (value or "").strip()
+    return "::*::" in v
+
 
 class MassCreateDialog(QDialog):
     """Plan → generate → review, for N knowledge gaps at once."""
@@ -325,6 +335,32 @@ class MassCreateDialog(QDialog):
         self._cov_value = QLineEdit(str(scope_cfg.get("value") or ""))
         self._cov_value.setPlaceholderText("deck or tag to check against")
         cov.addWidget(self._cov_value, 1)
+
+        # When the whole selection shares a group, that group's tag branch is
+        # almost always the scope you want: the usual sequence is Mass Search a
+        # group, tag what it found, then Mass Create the residue. Prefilling it
+        # turns the common case from "remember and retype the tag" into a
+        # checkbox — and it only ever prefills, so a scope you typed yourself is
+        # never overwritten.
+        shared = self._shared_group()
+        self._group_scope = ""
+        saved_val = str(scope_cfg.get("value") or "").strip()
+        if shared and (not saved_val or _is_group_scope(saved_val)):
+            prefix = autotag.group_tag_prefix(shared)
+            if prefix:
+                self._group_scope = prefix
+                self._cov_tag_rb.setChecked(True)
+                self._cov_value.setText(prefix)
+                self._cov_cb.setChecked(True)
+                self._cov_cb.setText(
+                    f"Skip what \u201c{shared}\u201d already covers")
+                self._cov_cb.setToolTip(
+                    f"Every gap here is in \u201c{shared}\u201d, so this is "
+                    f"prefilled with that group's tag branch ({prefix}) — the "
+                    "cards a Mass AI Search of this group would have filed.\n\n"
+                    "Points that branch already covers are dropped rather than "
+                    "written again. Untick to measure against your whole "
+                    "collection instead, or edit the tag freely.")
 
         self._cov_btn = QPushButton("Check coverage")
         self._cov_btn.setToolTip(
@@ -594,6 +630,18 @@ class MassCreateDialog(QDialog):
         else:
             attach_tag_completer(self._cov_value, multi=False)
             self._cov_value.setPlaceholderText("tag to check against")
+
+    def _shared_group(self) -> str:
+        """The group every selected gap is in, or "" when they disagree.
+
+        Deliberately all-or-nothing: scoping a mixed batch to one gap's group
+        would silently measure the others against a branch they were never
+        filed under, and report them uncovered."""
+        groups = {str(k.get("group") or "").strip() for k in self._kgs}
+        if len(groups) != 1:
+            return ""
+        only = groups.pop()
+        return only
 
     def _scope_settings(self) -> tuple[str, str]:
         if not self._cov_cb.isChecked():
@@ -1310,6 +1358,12 @@ class MassCreateDialog(QDialog):
             kind, value = ("deck" if self._cov_deck_rb.isChecked() else "tag",
                            self._cov_value.text().strip())
             cfg = tool_config("card_creator")
+            # A scope derived from this batch's group is per-batch state, not a
+            # preference. Remembering it would prefill the NEXT batch — quite
+            # possibly a different group — with this one's tag branch, which is
+            # worse than not prefilling at all.
+            if value and value == getattr(self, "_group_scope", ""):
+                value = ""
             cfg["mass_create_scope"] = {
                 "enabled": bool(self._cov_cb.isChecked()),
                 "kind": kind, "value": value,
