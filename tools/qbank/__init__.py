@@ -105,10 +105,8 @@ def handle_pycmd(message: str) -> tuple[bool, object]:
             _heatmap.shift_offset(1)
         else:
             _heatmap.reset_offset()
-        try:
-            mw.deckBrowser.refresh()
-        except Exception:
-            pass
+        from ...core.qt_utils import refresh_deck_browser
+        refresh_deck_browser()
         return (True, None)
 
     # Back-compat with the original eMedici-only pycmd that the heatmap used

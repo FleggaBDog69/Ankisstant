@@ -13,7 +13,7 @@ from aqt.qt import (
 )
 
 from ...core.config import tool_config
-from ...core.qt_utils import make_help_button
+from ...core.qt_utils import make_help_button, refresh_deck_browser
 from ..kg import store as kg_store
 from .browser import open_platform, open_browser, _QuestionCountDialog
 from .capture_dialog import open_capture
@@ -36,15 +36,11 @@ _pq_windows: list = []   # keep PQ library dialogs alive while open
 def _on_practice_questions_closed() -> None:
     """Prompt for a question count when the Practice Qs window closes, mirroring
     the QBank browser windows, and log it under the practice_questions platform."""
-    from aqt import mw
     dialog = _QuestionCountDialog("Practice Qs")
     if dialog.exec():
         correct, incorrect = dialog.values()
         add_session(correct, incorrect, "practice_questions")
-        try:
-            mw.deckBrowser.refresh()
-        except Exception:
-            pass
+        refresh_deck_browser()
 
 
 def _open_practice_questions() -> None:

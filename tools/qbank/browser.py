@@ -21,7 +21,7 @@ except ImportError:
     from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage
 
 from ...core.config import tool_config, save_tool_config
-from ...core.qt_utils import theme_dialog
+from ...core.qt_utils import refresh_deck_browser, theme_dialog
 from .stats import add_session
 
 
@@ -378,10 +378,7 @@ class BrowserWindow(QDialog):
             if dialog.exec():
                 correct, incorrect = dialog.values()
                 add_session(correct, incorrect, self._platform_key)
-                try:
-                    mw.deckBrowser.refresh()
-                except Exception:
-                    pass
+                refresh_deck_browser()
         _windows.pop(self._platform_key, None)
         event.accept()
 

@@ -1059,7 +1059,8 @@ class _AITab(QWidget):
                     "have no free quota, and 2.5 Flash often hits quota errors)."
                 )
 
-        mw.taskman.run_in_background(work, done)
+        # Network-only AI call — keep it off the collection executor.
+        mw.taskman.run_in_background(work, done, uses_collection=False)
 
     # ── skills catalog ──────────────────────────────────────────────────────
     def _capture_skill_ids(self) -> None:
@@ -2639,6 +2640,29 @@ class _CreatorTab(QWidget):
         )
         top_form.addRow("Max parallel background jobs:", self._max_parallel)
 
+        # Mass AI Create's per-gap override columns. Off means the batch-level
+        # setting applies to every gap, which is the simpler table; on adds a
+        # column so one gap can differ from the rest. Notetype is deliberately
+        # not offered per gap — the whole batch commits through one profile.
+        mc_cols = tool_config("card_creator").get("mass_create_columns") or {}
+        self._mc_tag_col = QCheckBox("Per-gap tag column")
+        self._mc_tag_col.setChecked(bool(mc_cols.get("tag", True)))
+        self._mc_tag_col.setToolTip(
+            "Adds a Tag box to each row in Mass AI Create, on top of the tags the "
+            "gap already carries. Useful when one batch spans several topics.")
+        self._mc_deck_col = QCheckBox("Per-gap deck column")
+        self._mc_deck_col.setChecked(bool(mc_cols.get("deck", False)))
+        self._mc_deck_col.setToolTip(
+            "Adds a Deck box to each row in Mass AI Create. Leave a row blank to "
+            "use the batch deck.")
+        mc_row = QHBoxLayout()
+        mc_row.addWidget(self._mc_tag_col)
+        mc_row.addWidget(self._mc_deck_col)
+        mc_row.addStretch(1)
+        mc_holder = QWidget()
+        mc_holder.setLayout(mc_row)
+        top_form.addRow("Mass create columns:", mc_holder)
+
         root.addLayout(top_form)
 
         # Shared with Browse — both flows can apply it, so it's shown (and
@@ -3008,6 +3032,10 @@ class _CreatorTab(QWidget):
             "gap_n_cards":      int(self._gap_n_cards.value()),
             "background_generation": self._bg_gen.isChecked(),
             "max_parallel_jobs": int(self._max_parallel.value()),
+            "mass_create_columns": {
+                "tag": self._mc_tag_col.isChecked(),
+                "deck": self._mc_deck_col.isChecked(),
+            },
             "notetypes":        list(self._profiles),
             "selected_notetype": selected,
             "default_notetype": selected,  # legacy mirror
@@ -3325,11 +3353,13 @@ class _LectureTab(QWidget):
         self._candidate_cap.setValue(int(self._lec_cfg.get("candidate_cap", d["candidate_cap"])))
         self._candidate_cap.setToolTip(
             "How many candidate notes per point the AI judges for relevance. "
-            "Lower = smaller, faster, cheaper relevance calls — but it drops "
-            "cards: the pre-judge ranking only loosely predicts what the judge "
-            "keeps, so trimming the tail loses roughly one good card per point "
-            "for every 3 you cut. 10 is the quality floor; lower only to save "
-            "cost on a throttled account.")
+            "Whatever you set here, the Depth setting in the lecture panel can "
+            "only lower it (tight 12 / standard 16 / thorough 20).\n\n"
+            "Lower = smaller, faster, cheaper relevance calls. 10 is the "
+            "measured sweet spot: the judge's keeps concentrate in the top of "
+            "the pre-rank, so a deeper pool mostly adds adjacent cards to "
+            "reject. Raise it only if points you care about are coming back "
+            "empty with a large 'found' count in the log.")
         layout.addRow("Candidates per point:", self._candidate_cap)
 
         self._rel_workers = QSpinBox()
@@ -3496,6 +3526,35 @@ class _SynapseTab(QWidget):
              "Tools menu entry and Ctrl+Shift+L are never touched."),
         ])
 
+        add_group("Its AI chat", [
+            ("chat_kg_button", "Add a ＋KG button to SynapsePro's chat header",
+             "Condenses the latest answer into short knowledge gaps and queues "
+             "them, instead of the chat asking whether to make cards. The same "
+             "capture is always on the Knowledge Gaps panel as \"＋ KG from AI "
+             "chat\", so turning this off moves the button rather than removing "
+             "the feature. SynapsePro's own prompts are never changed — the "
+             "condensing is Ankisstant's own AI call."),
+        ])
+
+        chat_box = QGroupBox("Gaps per chat answer")
+        chat_layout = _expand_form(QFormLayout(chat_box))
+        chat_layout.setContentsMargins(12, 10, 12, 10)
+        self._chat_max = QSpinBox()
+        self._chat_max.setRange(1, 10)
+        self._chat_max.setValue(int(self._cfg.get("chat_kg_max", d["chat_kg_max"])))
+        self._chat_max.setToolTip(
+            "A ceiling, not a target — the prompt asks for fewer, and for none "
+            "when the answer holds nothing worth revisiting.")
+        chat_layout.addRow("At most:", self._chat_max)
+        chat_hint = QLabel(
+            "<small>Duplicates of gaps already open in the queue are skipped, so "
+            "pressing ＋KG twice on the same answer won't double it up.</small>")
+        chat_hint.setTextFormat(Qt.TextFormat.RichText)
+        chat_hint.setWordWrap(True)
+        chat_hint.setStyleSheet("color: gray;")
+        chat_layout.addRow(chat_hint)
+        layout.addWidget(chat_box)
+
         mode_box = QGroupBox("Opening Ankisstant")
         mode_layout = _expand_form(QFormLayout(mode_box))
         mode_layout.setContentsMargins(12, 10, 12, 10)
@@ -3528,6 +3587,7 @@ class _SynapseTab(QWidget):
     def get_values(self) -> dict:
         values = {k: cb.isChecked() for k, cb in self._checks.items()}
         values["open_mode"] = self._open_mode.currentData() or "dock"
+        values["chat_kg_max"] = self._chat_max.value()
         # dock_width isn't exposed: it's whatever the user last dragged the
         # panel to, and a number box for it would be a worse control than the
         # panel edge itself.

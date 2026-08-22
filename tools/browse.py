@@ -401,6 +401,17 @@ class BrowsePanel(QWidget):
             tooltip("Those queued gaps are no longer in your KG list.")
             return
         open_bulk_search(fresh, parent=self._main_window or self)
+        # The queue has been acted on, so it empties — it's an inbox, not a
+        # record of what you've done. Leaving the gaps sitting there meant
+        # every later bulk search re-ran everything already searched. The
+        # popup holds its own copy, so closing it doesn't lose anything, and
+        # the gaps themselves are still on the KG page.
+        n = len(queue)
+        queue.clear()
+        self._refresh_queue_badge()
+        self._rebuild_queue_view()
+        tooltip(f"Searching {len(fresh)} gap(s) — Browse queue cleared "
+                f"({n} item{'s' if n != 1 else ''}).", period=3000)
 
     def _on_clear_queue(self) -> None:
         queue = getattr(self._main_window, "browse_queue", None) or []
@@ -1712,7 +1723,8 @@ def _run_native_ai_search(browser, checkbox, line_edit, topic: str) -> None:
             return
         _apply_native_ai_results(browser, cfg, reply)
 
-    mw.taskman.run_in_background(_bg, _done)
+    # Network-only AI call — keep it off the collection executor.
+    mw.taskman.run_in_background(_bg, _done, uses_collection=False)
 
 
 def install_native_ai_search(browser) -> None:

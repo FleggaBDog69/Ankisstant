@@ -14,7 +14,7 @@ from aqt.qt import (
 )
 
 from ...core.config import tool_config, save_tool_config
-from ...core.qt_utils import attach_tag_completer, theme_dialog
+from ...core.qt_utils import attach_tag_completer, refresh_deck_browser, theme_dialog
 from ..kg import store as kg_store
 from ..kg import engine
 
@@ -405,10 +405,7 @@ class CaptureDialog(QDialog):
                 save_tool_config("qbank", cfg)
         except Exception as e:
             print(f"[ankisstant] persist last_levels failed: {e}")
-        try:
-            mw.deckBrowser.refresh()
-        except Exception:
-            pass
+        refresh_deck_browser()
         self.accept()
 
 

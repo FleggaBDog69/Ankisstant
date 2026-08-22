@@ -144,6 +144,16 @@ DEFAULTS: dict = {
         "match_font": False,
         # Inject the Ankisstant and ＋ buttons into its launcher strip.
         "sidebar_buttons": True,
+        # Put a ＋KG button in SynapsePro's AI chat header, which condenses the
+        # last answer into knowledge gaps (core/synapse_chat.py). The same
+        # capture is always available on the Knowledge Gaps panel, which needs
+        # far less of SynapsePro, so turning this off loses the placement
+        # rather than the feature.
+        "chat_kg_button": True,
+        # Most gaps to take from a single chat answer. A cap, not a target —
+        # the prompt asks for fewer, and for none when there's nothing worth
+        # revisiting.
+        "chat_kg_max": 3,
         # Drop our own "Ankisstant" link from Anki's top toolbar once the
         # sidebar button is live (it's the same door twice). Only ever takes
         # effect while injection is actually succeeding.
@@ -540,8 +550,36 @@ DEFAULTS: dict = {
             # <img> tags unless the filename guard catches them.
             "attach_slides": False,
             # Blank → resolved automatically to AnKing's "Lecture Notes" field.
-            # Mirrors the AI Create profile key of the same name.
+            # Mirrors the AI Create profile key of the same name. Used for BOTH
+            # attached slide images and appended card notes — they go to the same
+            # place, and neither ever falls back to Extra.
             "slide_field": "",
+            # ── companion text: your own notes, or a transcript ────────────────
+            # Off by default. The slides are the spine of a run; this is the
+            # optional second document beside them. One slot rather than a
+            # "notes" feature and a "transcript" feature, because mechanically
+            # they are the same thing — a text document that isn't the slides.
+            "companion_enabled": False,
+            "companion_last_dir": "",
+            # Share of the point budget the companion text may claim, with a
+            # floor of 2 (see extractor.companion_cap). His steer: "slides should
+            # make up 95% of the LPs... transcript should really only be
+            # supplemental, especially those little gems." The cap is what keeps
+            # that true — a 90-minute transcript will otherwise happily generate
+            # fifty plausible points and drown the lecture.
+            "companion_lp_share": 0.12,
+            # Opt-in. Appends a line of context — a number, a caveat, a mnemonic,
+            # a pearl, or something the lecturer leaned on — to a committed
+            # note's slide field, and places your own notes onto the cards they
+            # belong to. Off by default, and when off the run makes no extra AI
+            # call at all, so it costs exactly what it always did.
+            #
+            # The bar is deliberately hard to clear (see matcher.CARD_NOTES_SYSTEM):
+            # a line must add something the card doesn't already say AND have a
+            # reason to be on THAT card. Most cards get nothing; that is the
+            # designed outcome, not a miss.
+            "attach_notes": False,
+            "card_notes_max_per_note": 2,
             # Mirrors AI Browse / AI Create's audit-tag scheme (!!Fleg::AI::…),
             # so every AI-touched note is auditable under one branch.
             "audit_tag": "!!Fleg::AI::Lecture",

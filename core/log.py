@@ -43,6 +43,9 @@ def _log_path() -> str | None:
 
 
 def _debug_enabled() -> bool:
+    # `debug_logging` is the "mirror to stderr" opt-in ONLY — the one path that
+    # pops Anki's crash dialog. Keep it separate from file logging so a chatty
+    # diagnostic run doesn't spray fake "An error occurred" dialogs.
     # Imported lazily to avoid a circular import (config.py uses nothing else
     # from this module, but keeps the dependency one-way).
     try:
@@ -52,12 +55,23 @@ def _debug_enabled() -> bool:
         return False
 
 
-def _emit(level: str, msg: str) -> None:
-    line = f"{_PREFIX} {level}{msg}" if level else f"{_PREFIX} {msg}"
-    # Mirror to stderr only when the user opted into debug logging — this is the
-    # only path that can trigger Anki's error dialog, and now it's intentional.
-    if _debug_enabled():
-        print(line, file=sys.stderr)
+def _file_enabled() -> bool:
+    """Whether to write the log FILE (trace/info/debug). Independent of stderr
+    mirroring: set `file_logging=true` to capture the full diagnostic trail in
+    user_files/ankisstant.log WITHOUT the crash-looking dialogs that
+    `debug_logging` causes. Falls back to `debug_logging` when unset so nothing
+    changes for anyone who never touches the new key."""
+    try:
+        from .config import load_config
+        c = load_config()
+        if "file_logging" in c:
+            return bool(c.get("file_logging"))
+        return bool(c.get("debug_logging", False))
+    except Exception:
+        return False
+
+
+def _write_file(line: str) -> None:
     path = _log_path()
     if not path:
         return
@@ -75,19 +89,46 @@ def _emit(level: str, msg: str) -> None:
         pass  # logging must never raise
 
 
-def info(msg: str) -> None:
+def _emit(level: str, msg: str, *, always_file: bool = False) -> None:
+    line = f"{_PREFIX} {level}{msg}" if level else f"{_PREFIX} {msg}"
+    # Mirror to stderr only when the user opted into debug logging — this is the
+    # only path that can trigger Anki's error dialog, and now it's intentional.
     if _debug_enabled():
+        print(line, file=sys.stderr)
+    # warn()/error() always persist; info()/debug() persist when file logging is on.
+    if always_file or _file_enabled():
+        _write_file(line)
+
+
+def enabled() -> bool:
+    """Whether any diagnostic logging is on — so callers can skip building an
+    expensive diagnostic payload (e.g. loading note text) when nobody will read
+    it. True when EITHER the file trail or the stderr mirror is enabled."""
+    return _debug_enabled() or _file_enabled()
+
+
+def trace(msg: str) -> None:
+    """Verbose per-run diagnostic detail. Writes to the log FILE only, and NEVER
+    mirrors to stderr — so a chatty trail (the lecture pipeline's per-point
+    candidate dump) can't trip Anki's error dialog the way info()/warn() do.
+    Gated on file logging so normal runs don't bloat the log."""
+    if _file_enabled():
+        _write_file(f"{_PREFIX} trace: {msg}")
+
+
+def info(msg: str) -> None:
+    if _debug_enabled() or _file_enabled():
         _emit("", msg)
 
 
 def debug(msg: str) -> None:
-    if _debug_enabled():
+    if _debug_enabled() or _file_enabled():
         _emit("debug: ", msg)
 
 
 def warn(msg: str) -> None:
-    _emit("warn: ", msg)
+    _emit("warn: ", msg, always_file=True)
 
 
 def error(msg: str) -> None:
-    _emit("error: ", msg)
+    _emit("error: ", msg, always_file=True)

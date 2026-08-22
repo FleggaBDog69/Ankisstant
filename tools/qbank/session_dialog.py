@@ -9,7 +9,7 @@ from aqt.qt import (
 )
 
 from ...core.config import tool_config
-from ...core.qt_utils import theme_dialog
+from ...core.qt_utils import refresh_deck_browser, theme_dialog
 from .stats import add_session, ensure_storage
 
 
@@ -91,10 +91,7 @@ class _SessionDialog(QDialog):
         iso = self._date.date().toString("yyyy-MM-dd")
         ensure_storage(platform_key)
         add_session(correct, incorrect, platform_key, on_date=iso)
-        try:
-            mw.deckBrowser.refresh()
-        except Exception:
-            pass
+        refresh_deck_browser()
         self.accept()
 
 

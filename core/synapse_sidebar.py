@@ -190,8 +190,13 @@ def _safely(fn) -> None:
 
 
 def _on_open() -> None:
-    from ..ui.main_window import open_main_window
-    open_main_window()
+    # A toggle, as the strip's other buttons are and as this button's own
+    # lit/unlit state has always implied. In dock mode there is no other way
+    # out: SynapsePro's panels suppress the native title bar and ours copies
+    # them, so the dock has no close button, and a plain open() left the panel
+    # with no way to dismiss it at all.
+    from ..ui.main_window import toggle_main_window
+    toggle_main_window()
 
 
 def _on_add_kg() -> None:

@@ -110,7 +110,9 @@ def _run_claude(button, label: str, work):
         except RuntimeError:
             pass
 
-    mw.taskman.run_in_background(_bg, _done)
+    # AI calls touch the network, never the collection — keep them off taskman's
+    # serialized collection executor or Anki's backup queues behind them.
+    mw.taskman.run_in_background(_bg, _done, uses_collection=False)
     dlg.show()
     loop.exec()
 
@@ -361,7 +363,8 @@ def run_claude_json_async(button, on_done, **kwargs):
         except Exception as e:  # pragma: no cover - defensive
             log.error(f"run_claude_json_async on_done failed: {e}")
 
-    mw.taskman.run_in_background(_bg, _finish)
+    # See _run_claude: network-only work must not sit on the collection executor.
+    mw.taskman.run_in_background(_bg, _finish, uses_collection=False)
 
 
 def run_claude_text(button, label: str, **kwargs):
@@ -402,6 +405,25 @@ class _MultiTagCompleter(QCompleter):
             return completion + after
         gap = "" if before[last_comma + 1:].startswith(" ") else " "
         return before[:last_comma + 1] + gap + completion + after
+
+
+def refresh_deck_browser() -> None:
+    """Re-render the deck browser — but only when it is the screen on show.
+
+    ``mw.deckBrowser.refresh()`` does not check ``mw.state``: it paints the deck
+    list straight into ``mw.web``, which during review is the reviewer. Worse,
+    the deck-list bridge command is installed by ``DeckBrowser.show()``, not by
+    the render, so the deck list you get that way is inert — clicking a deck
+    posts to the reviewer's link handler and nothing happens, until some other
+    event redraws the real screen. Every refresh here is cosmetic (a heatmap or
+    KG count on the deck page), so outside the deck browser the right answer is
+    to do nothing: ``show()`` refreshes on the way back in anyway.
+    """
+    try:
+        if mw is not None and mw.state == "deckBrowser":
+            mw.deckBrowser.refresh()
+    except Exception as e:
+        log.warn(f"deck browser refresh failed: {e}")
 
 
 def attach_tag_completer(line_edit, multi: bool = False) -> None:

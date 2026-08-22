@@ -252,6 +252,9 @@ class _PageTools(QWidget):
          "Track what you don't know yet, then turn gaps into cards or searches"),
         ("card_creator", "AI Create",
          "Generate cards from text, PDFs, or web pages"),
+        ("lecture", "AI Lecture",
+         "Point a lecture or LO list at your deck — finds and unsuspends the "
+         "cards you ALREADY own for it (hands off to Browse/Create if enabled)"),
     ]
 
     _BROWSE_MODES = [
@@ -345,11 +348,13 @@ class _PageTools(QWidget):
             "browse_native_only": mode == "native_only",
             "knowledge_gaps":     self._boxes["knowledge_gaps"].isChecked(),
             "card_creator":       self._boxes["card_creator"].isChecked(),
+            "lecture":            self._boxes["lecture"].isChecked(),
         }
 
     def validate(self) -> bool:
         sel = self.selected_tools()
-        if not (sel["qbank"] or sel["browse"] or sel["knowledge_gaps"] or sel["card_creator"]):
+        if not (sel["qbank"] or sel["browse"] or sel["knowledge_gaps"]
+                or sel["card_creator"] or sel["lecture"]):
             showWarning(
                 "Pick at least one tool to continue — you can turn any of "
                 "them on or off later in Settings."
@@ -690,7 +695,8 @@ class _PageCredentials(QWidget):
                 )
                 self._key_test_lbl.setStyleSheet("color: #c0392b; font-size: 12px;")
 
-        mw.taskman.run_in_background(work, done)
+        # Network-only AI call — keep it off the collection executor.
+        mw.taskman.run_in_background(work, done, uses_collection=False)
 
     def _detect_cli(self, *_args, silent: bool = False) -> None:
         path = core_api.detect_cli_path(
@@ -1218,7 +1224,8 @@ class _PageTest(QWidget):
                 )
                 self._test_lbl.setStyleSheet("color: #c0392b; font-size: 12px;")
 
-        mw.taskman.run_in_background(work, done)
+        # Network-only AI call — keep it off the collection executor.
+        mw.taskman.run_in_background(work, done, uses_collection=False)
 
     def _run_gen(self):
         # Async, for the same reason as _run_test — no nested modal loop.
@@ -1267,7 +1274,8 @@ class _PageTest(QWidget):
             self._gen_lbl.setText("✓ Card generated")
             self._gen_lbl.setStyleSheet("color: #1c8000;")
 
-        mw.taskman.run_in_background(work, done)
+        # Network-only AI call — keep it off the collection executor.
+        mw.taskman.run_in_background(work, done, uses_collection=False)
 
     @staticmethod
     def _parse_card(raw: str) -> dict | None:
@@ -1363,7 +1371,7 @@ class SetupWizard(QDialog):
         # on" so flow-building never KeyErrors before that page is visited.
         self.selected_tools: dict = {
             "qbank": True, "browse": True, "browse_native_only": False,
-            "knowledge_gaps": True, "card_creator": True,
+            "knowledge_gaps": True, "card_creator": True, "lecture": True,
         }
 
         self.current_provider: str = (self.cfg.get("provider") or "auto").lower()
@@ -1569,6 +1577,7 @@ class SetupWizard(QDialog):
         tools.setdefault("knowledge_gaps", {})["enabled"]     = sel["knowledge_gaps"]
         tools.setdefault("gap_analyser", {})["enabled"]       = sel["knowledge_gaps"]
         tools.setdefault("card_creator", {})["enabled"]       = sel["card_creator"]
+        tools.setdefault("lecture", {})["enabled"]            = sel.get("lecture", True)
 
         cc = tools.setdefault("card_creator", {})
         if deck:

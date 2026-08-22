@@ -2,6 +2,278 @@
 
 ## Unreleased
 
+### Changed — queues stop being busywork
+
+- **Bulk search reads on open**, like Mass AI Create now does.
+- **A queue handed off in bulk empties.** Bulk-searching the Browse queue, or
+  Mass-creating the Create queue, clears it. It's an inbox, not a record of what
+  you've done — left full, the next bulk run re-did everything already handled.
+  The popup holds its own copy, and the gaps are still on the KG page.
+- **Generating a queued gap loads the next one.** The queue used to advance only
+  when a review was accepted, so after pressing Generate the form stayed parked
+  on the gap you'd just sent — and because the form was dirty with its own
+  contents, every later load asked "overwrite?" first. Background generation now
+  advances as soon as the request is away. The modal path still advances only on
+  accept, so cancelling a review leaves the gap queued to retry.
+- **Queue buttons cut from four to three.** *Clear queue* is gone. *Load next →*
+  became **Load selected →**, which loads the row you clicked (double-click works
+  too) and falls back to the top item when nothing is selected — so it still does
+  what *Load next* did. *Skip current* now skips the gap **the form is on**
+  rather than queue[0]: those can differ once any row is loadable, and skipping
+  something other than what's on screen would be indefensible. The ▶ marker and
+  the header follow the loaded gap for the same reason.
+
+### Changed — Mass AI Create, after the first real run
+
+- **It reads the gaps for you.** The plan table used to open showing
+  "— not read yet —" in every row, with nothing on it worth deciding until you
+  pressed *Read gaps with AI*. It now reads on open, and pressing **Generate** on
+  an unread table reads first and then generates instead of refusing.
+- **Reading no longer overwrites a breadth you set.** Setting a gap to Core/4 and
+  then reading returned it as Deep/20. A hand-set row is now locked: the lock is
+  stated in the prompt (so the decomposition is sized to it) *and* re-applied
+  after parsing (so the model can't argue).
+- **The coverage check follows the read.** With a scope set, it runs
+  automatically once the reading lands — the answer to "what should I write?"
+  isn't complete until you know what the deck already has.
+- **Everything came back "Deep".** The breadth prompt said to prefer deep for
+  core-curriculum pathophysiology and pharmacology, which is most of medicine.
+  Wide is now the default for a whole entity and deep the exception, with two
+  new hard rules: a gap naming a **class** ("modalities of dialysis", "types of
+  shock") is wide, never deep — going deep spends the budget dissecting the
+  first member and leaves the rest unwritten — and a gap framed as an
+  **approach** ("approach to X", "workup of Y") is wide, because it wants the
+  decision pathway, not mechanism cards on every condition in it. Plus an
+  explicit instruction to calibrate across the batch rather than in isolation.
+
+### Fixed — Mass AI Create
+
+- **A card budget smaller than the point list produced arbitrary cards.** Asking
+  for 4 cards while listing 14 points that each demanded "at least one card" is
+  an impossible instruction, and the model resolved it by picking — which is how
+  a 4-card "dialysis modalities" gap came back as cards about haemodialysis and
+  nothing about peritoneal dialysis. The point list is now cut to the budget, in
+  priority order, with the rule becoming *exactly one card each*. The Pts column
+  shows `14 → 4` and names the dropped points in its tooltip.
+- **Your own instructions were dropped between reading and writing.** A gap
+  saying "do not focus on dx" shaped the points and was then never shown to the
+  model that writes the cards, which duly wrote a card per diagnosis. Triage now
+  extracts such directives verbatim into `constraints`, and they lead the
+  generation prompt as rules that override everything else about what to cover.
+
+### Added — Mass AI Create
+
+Generation-side twin of Mass AI Search. Select any number of knowledge gaps →
+one AI call sizes each one and decomposes it into the points its cards must
+cover → a plan table you edit → one run → one review surface → one undoable
+commit. **Restart Anki after updating: `.py` changes don't hot-reload.**
+
+- **Where it opens from.** The KG page's right-click menu (next to Bulk search),
+  and a *Mass create…* button on the AI Create queue, so a queue built up over a
+  week can be acted on in one go. Mass Search already had the equivalent button
+  on the Browse queue.
+- **One breadth dial, two dials underneath.** `Pinpoint / Core / Wide / Deep`
+  moves both how much ground the cards cover *and* how deep each one cuts —
+  `Wide` and `Deep` cover the same ground, `Deep` goes past the headlines into
+  mechanism. Deliberately **not** reusing Search's `narrow/focused/broad`: those
+  already mean "how many existing cards to surface", and both dialogs are open in
+  the same session.
+- **The card number is a ceiling, not a quota** — borrowed, along with
+  *enumerate the members of a named class*, from AI Lecture's extraction rules.
+  A gap with little in it comes back with fewer cards, by design.
+- **Reads gaps Mass AI Search already planned, for free.** Search has always
+  written `points` and `target_cards` onto the gaps it hands to Create, and
+  nothing ever read them. Now a gap that arrives already planned skips the AI
+  call entirely and keeps the deck measurement Search made.
+- **Optional "skip what a deck or tag already covers"** (off by default). Names a
+  scope — typically the tag your Search results were filed under — and drops any
+  point already covered there, scaling that gap's card count down to the residue.
+  Run it as its own step so you can see what it would skip before spending
+  generation tokens.
+- **Batch review.** Every card grouped by the gap it came from, per-card,
+  per-gap and whole-batch approve/reject, and one `Ctrl+Z` to unroll the entire
+  commit. Rows build lazily per group — a 150-card batch would otherwise stall on
+  open. Near-duplicates *within* the batch are flagged (two gaps about the same
+  entity will produce the same card, and nothing culls a newly-written duplicate
+  the way search dedupes a matched one).
+- **"Add all — skip the read-through"** for when you trust the run. Not blind: it
+  still drops cards the quality pass failed and in-batch duplicate copies, and
+  tells you how many it culled.
+- **The run survives everything.** It looks dialog-owned — own progress bar, own
+  Stop, "keep generating in the background" on close — but the work is ordinary
+  background job records on disk, so closing the window, quitting, or a crash
+  loses nothing. Live batches get a row in AI Create to get back into them.
+
+### Fixed — long generations truncated their own reply
+
+`max_tokens` was hardcoded to 4096 for every generation. Ample at the usual 3–10
+cards and quietly fatal past ~30: the reply truncates mid-JSON, nothing parses,
+and the job fails with a generic *"the AI reply wasn't in the expected card
+format"*. Now scaled to the card count (~500/card, capped at 16000). This was
+already biting the existing Create panel at high card counts — it is not new to
+mass create, which simply hits it as a matter of routine.
+
+### Fixed — the search was too broad, so the pool filled with adjacent cards
+
+The candidate cap is **not** the problem and has not been changed: 10 is a
+measured setting, the judge's keeps concentrate in the top of the pre-rank, and
+a point whose 3 terms return 127 notes has a breadth problem the cap was only
+ever hiding. These fix the breadth.
+
+- **An initialism expanded to the first word of its topic.** The abbreviation
+  backstop maps `FRC` → the topic `functional_residual_capacity` so a card
+  spelling it out is still found — but it took `words[0]`, so `FRC` became
+  `functional`. `GA FRC reduction` was searched as `GA functional reduction`,
+  which narrowed to `GA functional` and matched **56 notes** of nothing to do
+  with the point; `FRC desaturation` became `functional desaturation`. The
+  expansion now uses the whole phrase. Measured on the 2026-08-02 respiratory
+  run: the noise those two points' expansions contributed drops from ~49 notes
+  to **0**, and both correctly report as gaps (the deck genuinely has no
+  FRC-and-anaesthesia card).
+- **A lowercase word could register as an abbreviation.** The reverse
+  `ABBR (Name)` pattern read "endotracheal tube (ETT)" as `tube` → `ETT`. It now
+  requires an uppercase abbreviation.
+- **A narrowed search term can no longer flood the pool.** When a term finds
+  nothing it gets narrowed a word at a time, and a two-word generic remainder
+  can match half the deck: `clinical groups` → 127 notes. Those hits crowded out
+  the point's well-targeted terms sitting right beside them (`hypoxaemia airway`
+  → 10, `wheeze crackles` → 3). A *narrowed* term returning more than 40 notes
+  is now treated as the dud its parent was, and logged. The extractor's own
+  terms are honoured at any size — only narrowing is guarded.
+- The candidate cap in force is logged at the start of every run, and the
+  Settings tooltip now says depth can only lower it.
+
+### Added — video transcripts as a primary resource
+
+- **A transcript can now BE the material.** An assigned video has no slides, so
+  its transcript is the primary resource, not a supplement. `.rtf`, `.vtt` and
+  `.srt` are accepted in the primary slot alongside the existing formats, and a
+  transcript is reflowed into segment-sized parts instead of arriving as two or
+  three unreadable walls.
+- **Nothing is assumed from the file extension.** A `.txt` or `.rtf` is only
+  reflowed when it actually reads like speech — repeated speaker labels, or
+  hundreds of short unpunctuated lines. Anything with bullets is never reflowed.
+  Ordinary notes, prose handouts and PBL block docs segment exactly as before.
+- **A YouTube auto-caption has no punctuation at all** — one sample had two full
+  stops in 17,500 characters — so sentence grouping falls back to word count
+  rather than returning the document as one chunk.
+- **RTF is read with a real tokeniser.** The first regex version silently lost
+  every word that began a line: an auto-transcript ends each line with a bare
+  backslash, so `\` followed by `called` parsed as the control word `\called`.
+  Word counts now match the source exactly, and font/colour tables no longer
+  leak into the first segment.
+- **The two slots are named for what they are:** "Primary resource" and "Add a
+  supplementary resource", rather than "Lecture" and "Add your notes or a
+  transcript".
+
+### Changed — transcripts get tidied; the pass got cheaper
+
+- **A transcript excerpt may now be cleaned up on its way onto a card.** The
+  never-reword rule was written for notes the student wrote, and then wrongly
+  applied to an auto-transcript because both arrive through the same slot — so
+  lecturer speech landed on cards complete with "uh", "OK?", "they, they, they"
+  and one line cut off mid-word. Chunks now carry a `verbatim` flag: your own
+  writing is still restored from source after the reply (the model cannot edit
+  it), while transcript chunks keep the tidied version. The panel names the
+  difference — "your note" vs "from the transcript".
+- **Each call now carries only the notes its own cards could want.** The whole
+  companion document used to be repeated in every batch, on the reasoning that
+  any jot could belong to any card. A free local pre-filter (shared vocabulary,
+  discounting words common to the whole batch) sends the plausible ones, capped
+  at 30. Chunks that reach no batch are reported unplaced, which is what the
+  tray was built for.
+- **The card-note call had a real timeout risk.** Measured at ~166-219s against
+  a 180s default — the live run got through on luck. It now asks for 420s.
+- **Loading no longer truncates at 25,000 characters.** That cap was there
+  because the whole document went into every prompt; now that placement only
+  sends what it needs, the cap applies to the extraction block alone, and the
+  full transcript stays available for placement.
+- Batch size 16 → 12, chosen against the worker pool rather than token cost: a
+  41-card run is then 4 batches, one parallel wave. (8 was tried and measured at
+  two waves and twice the wall clock.)
+- **The dock no longer mangles SynapsePro's launcher strip.** Opening Ankisstant
+  beside their AI panel and closing the AI left the strip displaced and the
+  whole layout offset. Cause was `resizeDocks`, which makes Qt take the pixels
+  from somewhere — including a fixed-width sibling with no give. None of
+  SynapsePro's own panels call it, which is why this only happened to ours. The
+  opening width is now requested with a temporary minimum released on the next
+  tick, so Qt can rebalance when a sibling closes.
+
+### Fixed — first live run of the card-note pass
+
+- **Card notes were found, then silently thrown away.** `summarise()` re-derives
+  the Coverage from the matches every time you untick a card, take one by hand or
+  re-search a point — and it only sees the matches, so everything the pipeline had
+  computed and hung on Coverage was reset to its default. One click after the run
+  finished, the proposed lines were gone: the chips disappeared and the commit
+  wrote nothing, while the confirmation dialog still promised the lines (it counts
+  the panel's own picks, which do survive). Run-scoped state now goes through
+  `Coverage.carry_run_state`, so a new field on that dataclass has one place to be
+  carried rather than a copy line at each call site.
+- **A transcript chunked into unusable blobs.** `.vtt`/`.srt` were reshaped into
+  sentence-sized pieces, but a transcript exported as plain `.txt` was not — it
+  chunked by paragraph, giving ~1,200-character walls of speech that nothing could
+  place onto a card. A `.txt`/`.md` that looks like speech (repeated speaker
+  labels, or long unbulleted paragraphs) is now reflowed the same way, and chunks
+  are capped by size as well as sentence count so they can't arrive longer than
+  the card-note write limit. A bulleted document is never reflowed — that guard is
+  what keeps your own words verbatim.
+- **Truncation is now visible.** Hitting the 25,000-character budget only warned
+  in the log, so a 62k transcript quietly lost most of itself. The panel says so.
+- **The confirmation dialog oversold it** — "a line of notes to 11 note(s)" read
+  as "every card gets a line". It now reports lines and notes separately.
+- **The Ankisstant panel could not be closed.** In dock mode the title bar is
+  suppressed to match SynapsePro's own panels, so there is no close button, and
+  the sidebar button called `open_main_window()` — open-or-focus, never a toggle,
+  despite its lit/unlit state implying otherwise. The sidebar button now toggles;
+  `open_main_window()` is unchanged for every other caller.
+
+### Added — AI Lecture: your own notes, and notes on cards
+
+Two optional extras, **both off by default**. With both off a run is exactly what
+it was: same points, same cards, same number of AI calls. The slides remain the
+spine of every run; neither of these is allowed to grow past being supplemental.
+
+- **Hand over your own notes, or a transcript.** One optional slot beside the
+  lecture file — a `.txt` / `.md` / `.docx` / `.vtt` / `.srt` file, a paste box,
+  or both. Whatever you put in gets split into chunks (one bullet, one jot, one
+  paragraph each); a transcript has its timings and rolling-caption duplicates
+  stripped first.
+
+  It does two things. It can add a **handful** of learning points for things you
+  noted that the slides never taught — hard-capped at roughly an eighth of the
+  point budget, with a floor of 2, and every one of them badged *"from your
+  notes"* in the results so you can always see where a point came from. And it
+  gives the feature below something of yours to place.
+
+- **Add notes to cards.** A line of context appended to a committed note's
+  **Lecture Notes** field (never the tested Text/Extra — that promise is
+  unchanged). The bar is deliberately hard to clear: a line has to add something
+  the card doesn't already say **and** have a reason to be on *that* card.
+  Restatements of the card's own answer are rejected, and so is textbook content
+  you'd find in any resource — being true and useful isn't enough. What gets
+  through is a number, a cutoff, a caveat, a mnemonic, a clinical pearl, or
+  something the lecturer leaned on. **Most cards get nothing, by design.**
+
+  Slide material and your own words are treated differently on purpose. Slide
+  lines are chosen, and may be tidied into a readable sentence. Your notes are
+  never judged and **never reworded** — you already decided they mattered by
+  writing them down, so the only question is which card each belongs on. Anything
+  that can't be placed is listed at the foot of the results with a two-click
+  "put it here", so nothing you wrote is ever quietly dropped.
+
+  Proposals arrive pre-ticked; untick any chip to drop it. Re-running the same
+  lecture and committing again won't stack duplicates, and the whole commit —
+  tags, unsuspends, notes and slide images — is still one undo.
+
+Costs nothing unless you turn it on: the extra AI call only happens with "Add
+notes to cards" ticked, and it reads only the cards that survived the budget.
+
+**Note for the LectureLens split:** this landed in the Ankisstant tree only.
+`shared/` was already six files behind before this work (KG mode and the
+SynapsePro bridge), so `sync.py` would clobber rather than merge; reconciling it
+is a separate job.
+
 ### Added — SynapsePro integration
 
 All of this is inert unless [SynapsePro](https://github.com/mobesamedia/SynapsePro)

@@ -8,3 +8,6 @@ user_files/
 *.ankiaddon
 ANKIWEB.md
 _phaseA_backup_*/
+
+# Stray sqlite scratch left behind by lecture runs — not code.
+tools/lecture/col[0-9]*

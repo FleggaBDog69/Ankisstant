@@ -19,6 +19,7 @@ Ankisstant.
 |---|---|
 | `core/synapse.py` | Resolves SynapsePro; serves its palette as tokens, CSS vars and a Qt stylesheet |
 | `core/synapse_sidebar.py` | The two buttons in its launcher strip |
+| `core/synapse_chat.py` | The ＋KG button in its AI chat — see "Borrowing its chat" |
 | `ui/main_window.py` | The dock host, the icon rail, and the pop-out |
 
 Everything is configured under the top-level `synapse` config block and
@@ -222,10 +223,80 @@ Borrowing SynapsePro's AI provider and API keys was considered and dropped. It
 would have worked — `ai_assistant._load_settings()` returns provider, model, key
 and endpoints, read-only — but the two add-ons' AI paths don't otherwise touch,
 and Ankisstant's per-tool model matrix would have had to be bypassed to use it.
+That still holds: the chat bridge below reads SynapsePro's *conversation*, never
+its provider settings, and does its own thinking on Ankisstant's own AI path.
+
+## Borrowing its chat
+
+`core/synapse_chat.py`. SynapsePro's chat assistant has **no tool-calling** —
+it's five streaming text paths (`_stream_openai_compat`, `_stream_anthropic`,
+`_stream_gemini`, `_stream_ollama`, `_stream_claude_cli`) piping tokens into a
+`QWebEngineView`, with no mechanism for the model to *do* anything. So this
+doesn't try to make the model act. It puts a **＋KG** button in the chat header;
+you press it when an answer has exposed something you didn't know, and the
+answer is condensed into short knowledge gaps in the queue. One button instead
+of a negotiation about whether to make cards.
+
+Still no edit inside SynapsePro. Four seams it happens to leave open are used
+from outside:
+
+| Seam | What it gives us |
+|---|---|
+| `ai_assistant._webview` | `runJavaScript` puts our button in `#header-right` |
+| `sendToPython(action, data)` | a global JS function in `chat_ui.html` — our button calls it, so the click rides SynapsePro's **existing** PYCALL console bridge rather than needing a second one |
+| `ai_assistant._handle_action` | a plain module function with a *local* dispatch dict, so wrapping the module attribute is additive; unknown actions currently only `print` |
+| `ai_assistant._conversation` | module-global `[{role, content}]` — the answer is read **in Python**, never scraped out of the DOM |
+
+**This is harder coupling than the rest of this file**, and it's the one place
+that admits it. Everything above only reads a palette. This monkeypatches
+another add-on's function and reads two of its private globals, every one of
+those names undocumented and free to change. So each seam is feature-detected
+**independently** and a missing one degrades to "the button doesn't appear",
+never a traceback — and the same capture is on the Knowledge Gaps panel as
+**＋ KG from AI chat**, which needs only `_conversation`. One private name
+instead of four. If injection ever silently stops working, the feature is still
+there. That redundancy is the entire reason the panel button exists; don't
+"simplify" it away.
+
+**Conciseness is not asked of SynapsePro.** Its `_SYSTEM_MSG` and chip prompts
+are left exactly alone — the captured text goes through Ankisstant's own AI call
+against a KG-shaped schema (title ≤ 10 words, one-sentence *why*, ≤ 3 tags,
+capped at `chat_kg_max`). So the result is identical whether the chat is on
+Anthropic, OpenAI, Gemini, Ollama or the Claude CLI, the per-tool model matrix
+still applies, and nothing is written into another add-on's config.
+
+Gaps land with `source="chat"` (new in `tools/kg/store.py`, labelled "AI chat"),
+and duplicates of anything already **open** in the queue are skipped — pressing
+＋KG twice on one answer is the obvious mistake, and silently doubling the queue
+is worse than doing nothing. Gaps already marked done don't block a re-log.
+
+Two traps neither of which is visible by inspection, and each has a test:
+
+- **`_trim_conversation()` rebinds the global** (`_conversation = system + tail`)
+  rather than mutating in place. A cached reference would serve answers out of a
+  list SynapsePro has already discarded.
+- **`ChatPage` resolves `_handle_action` through module globals at call time.**
+  That is the only reason wrapping the attribute works. If upstream ever holds a
+  reference instead, `test_action_hook_is_seen_by_caller` is what fails.
+
+Also: the kill switch is re-read *inside* the wrapper rather than gating the
+install, because un-patching would mean restoring a function a third add-on may
+have wrapped since — and putting back a stale reference is how you delete
+someone else's hook. And the reload hook is flagged on the **page** object, not
+this module: SynapsePro can build a new page, and a module-level flag would
+leave it unhooked forever.
+
+The webview is built lazily on first open of the chat dock, not at profile load,
+so `register()` retries on a timer and on `state_did_change`, and `_ensure()` is
+cheap and idempotent because it runs a lot.
+
+Tests: `scratchpad/test_synapse_chat.py` (52, offline, no Qt and no SynapsePro).
 
 ## Deliberately not done
 
-- **Any edit inside SynapsePro.** Not even to add an extension point.
+- **Any edit inside SynapsePro.** Not even to add an extension point. (The chat
+  bridge patches a module attribute at runtime, from Ankisstant's own code —
+  SynapsePro's files are still never touched.)
 - **Making the launcher strip auto-reveal for the Ankisstant dock mid-review.**
   `_feature_panel_dock_names()` is a hardcoded list inside SynapsePro, so it
   doesn't know about our dock. Not fixable from outside.

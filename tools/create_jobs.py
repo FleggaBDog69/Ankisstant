@@ -276,9 +276,15 @@ class _Runner:
             self._inflight[job_id] = ev
             self._running += 1
             rec = get(job_id) or nxt
+            # uses_collection=False is not optional: the default is taskman's
+            # single-worker _collection_executor, which Anki's periodic backup
+            # (and every other collection op) queues behind — so a "background"
+            # generation would hang the app for its whole multi-minute run, and
+            # max_parallel_jobs would silently serialise to 1.
             mw.taskman.run_in_background(
                 lambda r=rec, e=ev: _worker(r, e),
                 lambda fut, jid=job_id: self._done(jid, fut),
+                uses_collection=False,
             )
 
     # ── completion (main thread) ────────────────────────────────────────────
@@ -338,6 +344,85 @@ def enqueue(record: dict) -> dict:
 
 def cancel(job_id: str) -> None:
     _runner().cancel(job_id)
+
+
+# ── batches (Mass AI Create) ───────────────────────────────────────────────────
+#
+# A "batch" is nothing new to the runner: it's N ordinary jobs that happen to
+# share a batch_id, which rides through _normalise untouched because that starts
+# from dict(item). So parallelism, cancellation, restart recovery and retry are
+# all the existing machinery, and the mass-create dialog just needs to address
+# its own jobs as a group.
+
+def by_batch(batch_id: str) -> list[dict]:
+    """Every job in a batch, in creation order. The dialog polls this rather
+    than subscribing to the runner: it works whether or not the dialog is alive,
+    which is what makes reopening a batch after a restart the same code path as
+    watching one live."""
+    if not batch_id:
+        return []
+    return [it for it in load_all() if it.get("batch_id") == batch_id]
+
+
+def enqueue_batch(records: list[dict]) -> list[dict]:
+    """Add every record, then pump ONCE.
+
+    Deliberately not a loop of enqueue(): that pumps per record, and each pump
+    walks the whole store looking for the next queued job. For a 12-gap batch
+    that's 12 full passes before any work starts, on the main thread, while the
+    user waits on a dialog that hasn't switched pages yet.
+    """
+    jobs = [add(**{**rec, "status": QUEUED}) for rec in (records or [])]
+    if jobs:
+        _runner().pump()
+    return jobs
+
+
+def cancel_batch(batch_id: str) -> int:
+    """Stop everything still queued or running in this batch. Jobs that already
+    finished are LEFT ALONE — a Stop half way through a run should keep what it
+    has already paid for, and those cards are what the review page shows."""
+    n = 0
+    for job in by_batch(batch_id):
+        if job.get("status") in (QUEUED, RUNNING):
+            _runner().cancel(job["id"])
+            n += 1
+    return n
+
+
+def remove_batch(batch_id: str) -> None:
+    """Drop a whole batch's records — used after its cards have been committed,
+    so a finished batch doesn't linger in the Create panel's counts."""
+    for job in by_batch(batch_id):
+        remove(job["id"])
+
+
+def batch_progress(batch_id: str) -> dict:
+    """Counts by state, for the running page's progress bar and status line.
+
+    `done` is the bar's numerator: an errored job is finished as far as the run
+    is concerned (it won't progress further without a retry), so a batch with
+    one permanent failure still reaches 100% instead of hanging at 11/12.
+    """
+    jobs = by_batch(batch_id)
+    counts = {"total": len(jobs), "queued": 0, "running": 0,
+              "ready": 0, "error": 0, "interrupted": 0, "cards": 0}
+    for j in jobs:
+        st = j.get("status")
+        if st == QUEUED:
+            counts["queued"] += 1
+        elif st == RUNNING:
+            counts["running"] += 1
+        elif st == READY:
+            counts["ready"] += 1
+            counts["cards"] += len(j.get("cards") or [])
+        elif st == ERROR:
+            counts["error"] += 1
+        elif st == INTERRUPTED:
+            counts["interrupted"] += 1
+    counts["done"] = counts["ready"] + counts["error"] + counts["interrupted"]
+    counts["finished"] = counts["total"] > 0 and counts["done"] >= counts["total"]
+    return counts
 
 
 def retry_job(job_id: str) -> None:

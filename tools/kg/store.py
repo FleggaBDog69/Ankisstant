@@ -1,12 +1,19 @@
 # Persistent unified Knowledge Gaps queue.
 # Stored in ankisstant/user_files/kg_queue.json.
 #
-# A KG can come from four sources:
+# A KG can come from seven sources:
 #   - "manual"   — typed in via the ＋ KG button on the home screen or sidebar
 #   - "analyse"  — sent over from the Analyse LO sub-feature
 #   - "qbank"    — captured from the Capture missed Q dialog (was the legacy
 #                  missed_queue.json store before unification)
 #   - "browse"   — saved from Browse with Claude when nothing matched
+#   - "chat"     — condensed out of a SynapsePro AI chat answer via the ＋KG
+#                  button in its chat header (core/synapse_chat.py)
+#   - "quick"    — captured outside Anki (dashboard command box, `life` CLI)
+#   - "things"   — swept out of a "KGs" heading in Things 3
+#
+# The last two arrive through user_files/kg_inbox.json rather than being
+# written straight into the queue — see drain_inbox() at the bottom.
 #
 # Statuses: "open" | "done" | "dismissed".
 
@@ -80,12 +87,17 @@ def save_all(items: list[dict]) -> None:
 
 # ── normalisation ────────────────────────────────────────────────────────────
 
-VALID_SOURCES = {"manual", "analyse", "qbank", "browse"}
-VALID_STATUSES = {"open", "done"}
+VALID_SOURCES = {"manual", "analyse", "qbank", "browse", "chat",
+                 "quick", "things"}
+# "in_progress" is set when a gap is handed to Browse or Create: it's been
+# picked up but nothing has come of it yet. It exists so a queue of 40 gaps
+# doesn't look untouched after you've sent half of them off — the Open filter
+# is then genuinely "not started".
+VALID_STATUSES = {"open", "in_progress", "done"}
 # Statuses that no longer exist but may still be in old saved data.
 # "dismissed" used to be a separate top-level status; it now folds into
 # status="done" plus the boolean `dismissed` flag (see _normalise).
-LEGACY_STATUS_ALIASES = {"in_progress": "open"}
+LEGACY_STATUS_ALIASES: dict[str, str] = {}
 
 
 def _now() -> str:
@@ -304,3 +316,65 @@ def migrate_from_missed_queue() -> int:
     except OSError as e:
         print(f"[ankisstant] kg migration: rename legacy file failed: {e}")
     return len(converted)
+
+
+# ── inbox drain (captures made while Anki was closed) ────────────────────────
+
+def _inbox_path() -> str:
+    return os.path.join(_user_files(), "kg_inbox.json")
+
+
+def drain_inbox() -> int:
+    """Move anything captured outside Anki into the queue, then clear it.
+
+    The dashboard daemon (lifed) and the `life` CLI can't write kg_queue.json
+    safely: save_all() rewrites the whole file, so an external append made
+    while Anki holds the queue in memory would be silently lost the next time
+    the add-on saves. They append to kg_inbox.json instead and we drain it
+    here, on profile load, when nothing else is touching the queue.
+
+    Deduped on fields.things_uuid so a Things gap that was swept more than
+    once doesn't land twice. Returns the number added."""
+    path = _inbox_path()
+    if not os.path.isfile(path):
+        return 0
+    try:
+        with open(path, "r") as f:
+            raw = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[ankisstant] kg inbox read failed: {e}")
+        return 0
+    if not isinstance(raw, list) or not raw:
+        _clear_inbox(path)
+        return 0
+
+    seen = {
+        (it.get("fields") or {}).get("things_uuid")
+        for it in load_all()
+        if (it.get("fields") or {}).get("things_uuid")
+    }
+    fresh = []
+    for it in raw:
+        if not isinstance(it, dict) or not str(it.get("title", "")).strip():
+            continue
+        tu = (it.get("fields") or {}).get("things_uuid")
+        if tu and tu in seen:
+            continue
+        if tu:
+            seen.add(tu)
+        fresh.append(it)
+
+    if fresh:
+        add_many(fresh)
+    _clear_inbox(path)
+    return len(fresh)
+
+
+def _clear_inbox(path: str) -> None:
+    """Truncate rather than delete: lifed appends to whatever is there, and
+    an empty list is a valid starting point it can read back."""
+    try:
+        with open(path, "w") as f:
+            json.dump([], f)
+    except OSError as e:
+        print(f"[ankisstant] kg inbox clear failed: {e}")

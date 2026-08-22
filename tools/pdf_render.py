@@ -37,6 +37,31 @@ def _cache_key(path: str, long_edge: int, max_pages: int) -> tuple | None:
         return None
 
 
+def _flatten_onto_white(img, QImage, QPainter, Qt):
+    """Composite a rendered page onto opaque white.
+
+    QtPdf renders a page with a TRANSPARENT background — it only paints what the
+    PDF actually draws. Saved straight to PNG that alpha survives into Anki's
+    media, and on a card the page shows the note background through it: in night
+    mode that's black slide text on dark grey, i.e. unreadable. A page is paper,
+    so flatten it to white here rather than leaving every downstream consumer to
+    remember. Returns the original image untouched if anything goes wrong."""
+    try:
+        if not img.hasAlphaChannel():
+            return img
+        out = QImage(img.size(), QImage.Format.Format_RGB32)
+        out.fill(Qt.GlobalColor.white)
+        p = QPainter(out)
+        try:
+            p.drawImage(0, 0, img)
+        finally:
+            p.end()
+        return out if not out.isNull() else img
+    except Exception as e:
+        log.error(f"pdf_render: flatten failed: {e}")
+        return img
+
+
 def render_pdf_to_images(
     pdf_path: str,
     *,
@@ -56,7 +81,7 @@ def render_pdf_to_images(
     try:
         # Imported lazily so importing this module never fails on a Qt build
         # that somehow lacks QtPdf — callers just get [].
-        from aqt.qt import QImage  # noqa: F401  (sanity that Qt GUI is available)
+        from aqt.qt import QImage, QPainter, Qt  # noqa: F401
         from PyQt6.QtPdf import QPdfDocument, QPdfDocumentRenderOptions  # type: ignore
     except Exception as e:
         log.error(f"pdf_render: QtPdf unavailable: {e}")
@@ -87,6 +112,7 @@ def render_pdf_to_images(
             if img.isNull():
                 log.error(f"pdf_render: null image for page {i} of {pdf_path}")
                 continue
+            img = _flatten_onto_white(img, QImage, QPainter, Qt)
             tmp = os.path.join(out_dir, f"slide_{i + 1:04d}.png")
             if img.save(tmp, "PNG") and os.path.getsize(tmp) > 0:
                 out.append(tmp)

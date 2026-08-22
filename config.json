@@ -79,7 +79,15 @@
       "gap_n_cards": 3,
       "front_field": "Text",
       "extra_field": "Extra",
-      "one_by_one_field": "One by one"
+      "one_by_one_field": "One by one",
+      "cite_source": false,
+      "images": {
+        "card_max_w": 400,
+        "card_max_h": 560,
+        "slide_max_w": 700,
+        "slide_max_h": 560,
+        "flatten_transparency": true
+      }
     }
   }
 }

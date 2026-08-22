@@ -25,7 +25,7 @@ import importlib
 from aqt import gui_hooks, mw
 from aqt.qt import (
     QDialog, QDockWidget, QEvent, QFrame, QHBoxLayout, QLabel, QPushButton, QSize,
-    QSizePolicy, QStackedWidget, Qt, QToolButton, QVBoxLayout, QWidget,
+    QSizePolicy, QStackedWidget, Qt, QTimer, QToolButton, QVBoxLayout, QWidget,
 )
 
 from ..core import synapse
@@ -740,11 +740,28 @@ class AnkisstantDock(QDockWidget):
         self.resize(width, self.height())
 
         self._place()
-        try:
-            mw.resizeDocks([self], [width], Qt.Orientation.Horizontal)
-        except Exception:
-            pass
+        # Width is asked for with a TEMPORARY minimum, not with resizeDocks.
+        #
+        # resizeDocks makes Qt find the pixels somewhere, and "somewhere" turned
+        # out to include SynapsePro's launcher strip — a fixed-width dock that
+        # has no give. Opening Ankisstant beside their AI panel and then closing
+        # the AI left the strip mangled and the whole layout offset. None of
+        # their own feature panels call resizeDocks, which is exactly why this
+        # only ever happened to ours.
+        #
+        # A minimum, released on the next tick, gets the same opening width
+        # while leaving Qt free to rebalance afterwards — including when a
+        # sibling dock closes and its space has to go back.
+        self.setMinimumWidth(width)
+        QTimer.singleShot(0, self._release_width)
         self.visibilityChanged.connect(self._on_visibility)
+
+    def _release_width(self) -> None:
+        """Drop back to the real minimum once the opening width has been taken."""
+        try:
+            self.setMinimumWidth(_DOCK_MIN_WIDTH)
+        except RuntimeError:
+            pass      # dock already destroyed; nothing to relax
 
     def _place(self) -> None:
         try:
@@ -791,6 +808,31 @@ class AnkisstantDock(QDockWidget):
 # through this and is duck-typed on the queue API — see the module docstring.
 _current: AnkisstantBody | None = None
 _host: QWidget | None = None
+
+
+def queue_owner(widget=None):
+    """The live widget that owns the queues (gap_queue / browse_queue).
+
+    That's the *body* — never `widget.window()`, which lands on the host: the
+    free-floating MainWindow, or Anki's own main window when we're a dock under
+    SynapsePro. Neither has the queues, so anything resolving a hand-off by
+    walking to the top-level fails in both hosts.
+
+    Walks up from `widget` first (so a panel inside a body finds its own body,
+    even if a second one somehow exists), then falls back to the singleton —
+    which is what dialogs parented outside the body need.
+    """
+    w = widget
+    while w is not None:
+        if hasattr(w, "gap_queue"):
+            return w
+        try:
+            w = w.parent()
+        except RuntimeError:      # underlying C++ object deleted mid-walk
+            break
+    if _current is not None and _is_live(_current) and hasattr(_current, "gap_queue"):
+        return _current
+    return None
 
 
 def _sync_sidebar(open_: bool) -> None:
@@ -861,6 +903,29 @@ def open_main_window() -> None:
         return
     _current, _host = None, None
     _open_in("dock" if _dock_mode() else "window")
+
+
+def toggle_main_window() -> None:
+    """Open Ankisstant, or hide it if it's already on screen.
+
+    Only the sidebar button uses this — `open_main_window()` keeps its
+    open-or-focus behaviour, because a menu item or a hand-off from another tool
+    that closed the panel would be baffling.
+
+    Hiding, never destroying: the queues, the panel cache and any half-typed
+    form have to survive being dismissed, exactly as they do when the free
+    window is closed with its own button.
+    """
+    global _host
+    if _host is not None and _is_live(_host) and _host.isVisible():
+        _host.hide()
+        # The dock's visibilityChanged does this for us; a hidden QDialog emits
+        # nothing, so tell the button ourselves or it stays lit over a panel
+        # that isn't there.
+        if not isinstance(_host, AnkisstantDock):
+            _sync_sidebar(False)
+        return
+    open_main_window()
 
 
 def _open_in(mode: str, body: AnkisstantBody | None = None) -> None:

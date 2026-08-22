@@ -133,6 +133,17 @@ def _on_profile_loaded() -> None:
     except Exception as e:
         log.error(f"bundled notetype install failed: {e}")
 
+    # Pull in knowledge gaps captured while Anki was closed — from the
+    # dashboard command box, the `life` CLI, or a "KGs" heading in Things.
+    # No-op when none are waiting; never fatal if the inbox is malformed.
+    try:
+        from .tools.kg import store as _kg_store
+        drained = _kg_store.drain_inbox()
+        if drained:
+            log.info(f"drained {drained} knowledge gap(s) from the inbox")
+    except Exception as e:
+        log.error(f"kg inbox drain failed: {e}")
+
     for key, module in TOOLS:
         if not tool_enabled(key):
             continue
@@ -147,9 +158,14 @@ def _on_profile_loaded() -> None:
     # SynapsePro bridge — a no-op when SynapsePro isn't installed. Registered
     # per profile because its launcher strip is rebuilt per profile.
     try:
-        from .core import synapse, synapse_sidebar
+        from .core import synapse, synapse_chat, synapse_sidebar
         synapse.reset_cache()          # add-ons may have been enabled since
         synapse_sidebar.register()
+        # The ＋KG button in its AI chat. Registered separately because its
+        # webview is built lazily on first open, not at profile load — so it
+        # retries on its own schedule and must not be able to take the strip
+        # injection down with it.
+        synapse_chat.register()
     except Exception as e:
         log.error(f"synapse sidebar registration failed: {e}")
 

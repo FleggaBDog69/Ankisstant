@@ -14,6 +14,7 @@ import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
 import zipfile
+from dataclasses import dataclass, field
 from datetime import datetime as _dt
 
 from aqt import mw, gui_hooks
@@ -43,6 +44,7 @@ from ..core.qt_utils import (
     theme_dialog,
 )
 from .kg import engine
+from .kg import gen_prompt
 from ..core import synapse
 
 
@@ -650,32 +652,43 @@ def _topic_directive(topic: str, n: int) -> str:
     return " ".join(lines)
 
 
-def _breadth_directive(n: int, mode: str) -> str:
+def _breadth_directive(n: int, mode: str, *, band: str | None = None) -> str:
     """Scale card depth and breadth to the requested count. The same topic yields
     very different card sets at N=1 vs N=50: one card should be the single
     highest-yield fact (a quick, broad-strokes card); fifty should fan out across
     the topic's subtopics AND drill into mechanism and detail. Folded into every
     generation request. `mode` is 'topic' or 'source' — in source mode breadth is
     bounded by the supplied material (extract more/deeper from it) rather than
-    ranging over the whole subject."""
+    ranging over the whole subject.
+
+    `band` overrides the count-derived depth. Normally depth IS a function of the
+    count, which is right when the count is all we know. Mass AI Create knows
+    more: its dial carries a depth judgement of its own (a 12-card "wide" gap and
+    a 12-card "deep" gap want the same number of cards at different depths), so
+    it selects the band directly. One of "single", "essentials", "mechanism",
+    "comprehensive"; anything else falls back to the count.
+    """
     try:
         n = int(n)
     except (TypeError, ValueError):
         n = 1
     source_bound = (mode == "source")
     where = "the source" if source_bound else "this topic"
-    if n <= 2:
+    if band not in ("single", "essentials", "mechanism", "comprehensive"):
+        band = ("single" if n <= 2 else "essentials" if n <= 8
+                else "mechanism" if n <= 20 else "comprehensive")
+    if band == "single":
         scope = (
             f"only {n} card(s) requested — make the SINGLE highest-yield, most "
             f"exam-critical card on {where}: the one thing you would test if you "
             "could test only one. Broad strokes, no minutiae or secondary detail."
         )
-    elif n <= 8:
+    elif band == "essentials":
         scope = (
             f"a small set — cover the core high-yield facts of {where} that a "
             "student must know first. Stay on the essentials; skip secondary detail."
         )
-    elif n <= 20:
+    elif band == "mechanism":
         scope = (
             f"a medium set — cover the main concepts across {where} with moderate "
             "depth: key mechanisms, presentations, and management, not just "
@@ -1067,6 +1080,32 @@ _IMG_MAX_DIM = 1600          # px on the longest side
 _IMG_REENCODE_BYTES = 1_500_000  # files larger than this get re-encoded even if small-dim
 
 
+def _flatten_transparency_enabled() -> bool:
+    try:
+        icfg = (tool_config("card_creator").get("images") or {})
+        return bool(icfg.get("flatten_transparency", True))
+    except Exception:
+        return True
+
+
+def _flatten_image_onto_white(img):
+    """Composite an image with alpha onto opaque white. Returns the original on
+    any failure — a flatten that doesn't work must not lose the image."""
+    try:
+        from aqt.qt import QPainter
+        out = QImage(img.size(), QImage.Format.Format_RGB32)
+        out.fill(Qt.GlobalColor.white)
+        p = QPainter(out)
+        try:
+            p.drawImage(0, 0, img)
+        finally:
+            p.end()
+        return out if not out.isNull() else img
+    except Exception as e:
+        print(f"[ankisstant] image flatten failed: {e}")
+        return img
+
+
 def _normalize_image_file(path: str) -> str:
     """Return a path to a web-safe (downscaled, re-encoded) copy of `path` when
     it is oversized; otherwise return `path` unchanged. Never raises — on any
@@ -1083,7 +1122,12 @@ def _normalize_image_file(path: str) -> str:
             return path  # not a raster Qt understands (e.g. SVG) — leave as-is
         w, h = img.width(), img.height()
         longest = max(w, h)
-        if longest <= _IMG_MAX_DIM and size <= _IMG_REENCODE_BYTES:
+        # Transparency is a correctness problem, not just a size one: a see-through
+        # image shows the note background through it, so in night mode dark line-art
+        # (rendered slides, most Wikipedia diagrams) becomes unreadable. Flatten it
+        # onto white even when the file is otherwise small enough to pass through.
+        flatten = _flatten_transparency_enabled() and img.hasAlphaChannel()
+        if longest <= _IMG_MAX_DIM and size <= _IMG_REENCODE_BYTES and not flatten:
             return path  # already small enough; keep original bytes/quality
         if longest > _IMG_MAX_DIM:
             img = img.scaled(
@@ -1091,6 +1135,8 @@ def _normalize_image_file(path: str) -> str:
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
+        if flatten:
+            img = _flatten_image_onto_white(img)
         has_alpha = img.hasAlphaChannel()
         ext = ".png" if has_alpha else ".jpg"
         fd, out = tempfile.mkstemp(prefix="ankisstant_img_norm_", suffix=ext)
@@ -1119,15 +1165,51 @@ def _import_image_to_media(path: str) -> str | None:
         return None
 
 
-def _img_tags_for(paths: list[str]) -> str:
+# Display size caps. _normalize_image_file keeps the STORED file up to
+# _IMG_MAX_DIM so it stays sharp when zoomed; these cap how big it RENDERS on the
+# card. Without them a 1600px figure fills the whole review screen. max-width /
+# max-height (rather than a width= attribute) caps both axes, preserves aspect
+# ratio, and never upscales an image that's already small.
+_CARD_IMG_MAX_W = 400    # px — figures attached to a card
+_CARD_IMG_MAX_H = 560
+_SLIDE_IMG_MAX_W = 700   # px — whole rendered slides need more room to stay legible
+_SLIDE_IMG_MAX_H = 560
+
+
+def _img_display_cfg() -> tuple[int, int, int, int]:
+    """(card_w, card_h, slide_w, slide_h) from config, falling back to the
+    defaults above. Fail-open — a bad config never blocks card creation."""
+    try:
+        icfg = (tool_config("card_creator").get("images") or {})
+        return (
+            int(icfg.get("card_max_w", _CARD_IMG_MAX_W)),
+            int(icfg.get("card_max_h", _CARD_IMG_MAX_H)),
+            int(icfg.get("slide_max_w", _SLIDE_IMG_MAX_W)),
+            int(icfg.get("slide_max_h", _SLIDE_IMG_MAX_H)),
+        )
+    except Exception:
+        return (_CARD_IMG_MAX_W, _CARD_IMG_MAX_H, _SLIDE_IMG_MAX_W, _SLIDE_IMG_MAX_H)
+
+
+def img_tag(fname: str, max_w: int, max_h: int) -> str:
+    """One <img> tag for a filename already in Anki media, capped to a display
+    box. The single place the add-on writes an <img>, so the cap can't be
+    bypassed by one call site forgetting it."""
+    style = f"max-width:{max_w}px; max-height:{max_h}px;"
+    return f'<img src="{html.escape(fname, quote=True)}" style="{style}">'
+
+
+def _img_tags_for(paths: list[str], *, slide: bool = False) -> str:
     """Import a list of image paths into the media folder and return an
     HTML fragment of <img> tags (one per line) to append to a field."""
+    card_w, card_h, slide_w, slide_h = _img_display_cfg()
+    max_w, max_h = (slide_w, slide_h) if slide else (card_w, card_h)
     bits: list[str] = []
     for p in paths or []:
         fname = _import_image_to_media(p)
         if not fname:
             continue
-        bits.append(f'<img src="{html.escape(fname, quote=True)}">')
+        bits.append(img_tag(fname, max_w, max_h))
     return "<br>".join(bits)
 
 
@@ -1342,13 +1424,12 @@ class CreatorPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.cfg = tool_config("card_creator")
-        # Set by refresh_queue_state when the panel is driven by Browse's
-        # LO-gap queue. self._current_gap holds the gap text we pre-filled
-        # the form with; we pop it from the queue only on a successful
-        # ReviewDialog acceptance.
+        # Set by refresh_queue_state when the panel is driven by the KG queue.
         self._main_window = None
-        # _current_gap is the dict at queue[0] we pre-filled the form with —
-        # popped only on a successful ReviewDialog acceptance.
+        # _current_gap is the queued gap the form is currently loaded with. It
+        # is no longer necessarily queue[0]: "Load selected" can load any row.
+        # It leaves the queue when generation starts, not when the review is
+        # accepted — see _advance_queue_after_generate.
         self._current_gap: dict | None = None
         self._build()
         self._rebuild_queue_view()
@@ -1427,6 +1508,8 @@ class CreatorPanel(QWidget):
         self.queue_list.setStyleSheet(
             _queue_list_css()
         )
+        self.queue_list.itemDoubleClicked.connect(
+            lambda _i: self._on_load_selected_gap())
         qbl.addWidget(self.queue_list)
 
         # Manual-add row.
@@ -1449,27 +1532,39 @@ class CreatorPanel(QWidget):
         self.queue_remove_btn.setAutoDefault(False)
         self.queue_remove_btn.clicked.connect(self._on_remove_selected_gap)
         queue_btn_row.addWidget(self.queue_remove_btn)
+        # The whole queue in one run, rather than one gap at a time through this
+        # form. Mirrors Browse's "bulk search the queue" button, so a queue built
+        # up over a week can be acted on in one go.
+        self.queue_mass_btn = QPushButton("⚡ Mass create…")
+        self.queue_mass_btn.setAutoDefault(False)
+        self.queue_mass_btn.setToolTip(
+            "Plan and generate cards for every gap in this queue at once, then "
+            "review the whole batch together."
+        )
+        self.queue_mass_btn.clicked.connect(self._on_mass_create_queue)
+        queue_btn_row.addWidget(self.queue_mass_btn)
         queue_btn_row.addStretch(1)
-        # Load Next force-fills the form from queue[0]. Replaces the
-        # implicit behaviour where typing in the topic field silently
-        # blocked the queue from ever populating.
-        self.queue_load_btn = QPushButton("Load next →")
+        # "Load selected" rather than "Load next": the queue is a list you can
+        # click, so the button that fills the form should honour what you
+        # clicked. With nothing selected it falls back to the top item, which is
+        # what "Load next" always did.
+        self.queue_load_btn = QPushButton("Load selected →")
         self.queue_load_btn.setAutoDefault(False)
         self.queue_load_btn.setToolTip(
-            "Take the top item from the queue and fill the form with it "
-            "(topic, focus context, KG images). Asks before overwriting "
-            "anything you've already typed."
+            "Fill the form from the gap selected in the list above (topic, focus "
+            "context, KG images). With nothing selected, loads the top one. Asks "
+            "before overwriting anything you've already typed."
         )
-        self.queue_load_btn.clicked.connect(self._on_load_top_gap)
+        self.queue_load_btn.clicked.connect(self._on_load_selected_gap)
+        # Skips the gap the FORM is on, not queue[0] — those can now differ,
+        # since Load selected can load from anywhere in the list.
         self.queue_skip_btn = QPushButton("Skip current")
         self.queue_skip_btn.setAutoDefault(False)
+        self.queue_skip_btn.setToolTip(
+            "Drop the gap currently loaded in the form and move to the next one.")
         self.queue_skip_btn.clicked.connect(self._on_skip_gap)
-        self.queue_clear_btn = QPushButton("Clear queue")
-        self.queue_clear_btn.setAutoDefault(False)
-        self.queue_clear_btn.clicked.connect(self._on_clear_queue)
         queue_btn_row.addWidget(self.queue_load_btn)
         queue_btn_row.addWidget(self.queue_skip_btn)
-        queue_btn_row.addWidget(self.queue_clear_btn)
         qbl.addLayout(queue_btn_row)
 
         root.addWidget(self.queue_box)
@@ -1728,6 +1823,20 @@ class CreatorPanel(QWidget):
         self.bg_hint.setStyleSheet("color: gray; font-size: 11px;")
         self.bg_hint.setVisible(False)
         root.addWidget(self.bg_hint)
+
+        # ── live Mass AI Create batches ──────────────────────────────────────
+        # Their individual jobs are hidden from the lists below (they're
+        # committed as a batch, not one at a time); this is the way back into
+        # one after closing its window or restarting Anki.
+        self.batch_box = QFrame()
+        self.batch_box.setObjectName("batchBox")
+        self.batch_box.setFrameShape(QFrame.Shape.StyledPanel)
+        self.batch_box.setStyleSheet(_queue_box_css("batchBox"))
+        self.batch_layout = QVBoxLayout(self.batch_box)
+        self.batch_layout.setContentsMargins(10, 8, 10, 8)
+        self.batch_layout.setSpacing(5)
+        self.batch_box.setVisible(False)
+        root.addWidget(self.batch_box)
 
         # ── background jobs: in-progress + ready-to-review ───────────────────
         self.jobs_box = QFrame()
@@ -2040,8 +2149,22 @@ class CreatorPanel(QWidget):
             items = create_jobs.load_all()
         except Exception:
             items = []
+        # Mass-create jobs are deliberately NOT listed individually. They're
+        # reviewed and committed as a batch in their own dialog, and a job
+        # appearing here too could be opened and committed separately — creating
+        # the same cards twice. One aggregate row per live batch stands in.
+        batches: dict[str, list] = {}
+        singles: list = []
+        for it in items:
+            bid = it.get("batch_id")
+            if bid:
+                batches.setdefault(bid, []).append(it)
+            else:
+                singles.append(it)
+        items = singles
         active = [it for it in items if it.get("status") in ("queued", "running")]
         done = [it for it in items if it.get("status") in ("ready", "error", "interrupted")]
+        self._render_batch_rows(batches)
 
         self.inprogress_list.clear()
         for it in active:
@@ -2067,6 +2190,39 @@ class CreatorPanel(QWidget):
         bg_on = bool(self.cfg.get("background_generation", True))
         self.bg_hint.setVisible(bg_on and not (active or done))
         self._update_go_btn_label(len(active))
+
+    def _render_batch_rows(self, batches: dict) -> None:
+        """One row per live Mass AI Create batch, with a button that reopens its
+        dialog. This is how a batch survives closing the window or restarting
+        Anki: the jobs are on disk, and this is the way back to them."""
+        box = getattr(self, "batch_box", None)
+        if box is None:
+            return
+        while self.batch_layout.count():
+            w = self.batch_layout.takeAt(0).widget()
+            if w is not None:
+                w.setParent(None)
+        for bid, jobs in batches.items():
+            ready = sum(1 for j in jobs if j.get("status") == "ready")
+            errs = sum(1 for j in jobs if j.get("status") == "error")
+            row = QHBoxLayout()
+            bits = f"Mass AI Create — {len(jobs)} gap(s) ({ready} ready"
+            bits += f", {errs} failed)" if errs else ")"
+            lbl = QLabel(bits)
+            row.addWidget(lbl)
+            row.addStretch(1)
+            btn = QPushButton("Open ▶")
+            btn.setAutoDefault(False)
+            btn.clicked.connect(lambda _c=False, b=bid: self._open_batch(b))
+            row.addWidget(btn)
+            holder = QWidget()
+            holder.setLayout(row)
+            self.batch_layout.addWidget(holder)
+        box.setVisible(bool(batches))
+
+    def _open_batch(self, batch_id: str) -> None:
+        from .kg.mass_create import open_mass_create
+        open_mass_create([], parent=self._main_window or self, batch_id=batch_id)
 
     def _selected_job_id(self, listw) -> str | None:
         it = listw.currentItem()
@@ -2212,14 +2368,23 @@ class CreatorPanel(QWidget):
         would clobber."""
         return bool(self.topic.text().strip() or self.focus.text().strip())
 
-    def _on_load_top_gap(self) -> None:
+    def _on_load_selected_gap(self) -> None:
+        """Fill the form from the gap highlighted in the queue list.
+
+        Falls back to the top item when nothing is selected, which is exactly
+        what the old "Load next →" did — so the button got more useful without
+        losing its previous behaviour.
+        """
         if self._main_window is None:
             return
         queue = getattr(self._main_window, "gap_queue", None) or []
         if not queue:
             tooltip("Queue is empty.")
             return
-        gap = queue[0]
+        row = self.queue_list.currentRow()
+        if not (0 <= row < len(queue)):
+            row = 0
+        gap = queue[row]
         # Only ask before clobbering content that doesn't match what would
         # already be there from a prior pre-fill of the same gap.
         if (self._form_is_dirty()
@@ -2231,6 +2396,52 @@ class CreatorPanel(QWidget):
             return
         self._prefill_form_from_gap(gap)
         tooltip(f"Loaded: {self._gap_title(gap)[:60]}")
+
+    def _queue_index_of(self, gap) -> int | None:
+        """Where `gap` sits in the queue, or None. Identity first, then equality:
+        two manually-added gaps with the same title are equal dicts, and popping
+        the wrong one would take a gap the user hasn't dealt with yet."""
+        if gap is None or self._main_window is None:
+            return None
+        queue = getattr(self._main_window, "gap_queue", None) or []
+        for i, g in enumerate(queue):
+            if g is gap:
+                return i
+        for i, g in enumerate(queue):
+            if g == gap:
+                return i
+        return None
+
+    def _advance_queue_after_generate(self) -> None:
+        """Take the generated gap out of the queue and load the next one.
+
+        Generating is the point of no return for a queued gap — the request is
+        away and its cards will arrive in the ready list whether or not the
+        queue still lists it. Leaving it sitting at the top meant the form stayed
+        on the gap you'd just dealt with, and every subsequent load asked
+        "overwrite?" because the form was dirty with its own contents. So the
+        queue advances here rather than at the end of the review.
+
+        The KG is NOT marked done here: nothing has been added yet. That still
+        happens on accept, off the gap carried in the job record.
+        """
+        if self._main_window is None:
+            return
+        idx = self._queue_index_of(self._current_gap)
+        if idx is None:
+            return
+        queue = self._main_window.gap_queue
+        queue.pop(idx)
+        self._current_gap = None
+        # Clear the form so the next gap pre-fills without the dirty-form guard
+        # blocking it (refresh_queue_state only auto-fills a clean form).
+        self.topic.setText("")
+        self.focus.setText("")
+        self._refresh_badge()
+        if self._main_window is not None:
+            self.refresh_queue_state(self._main_window)
+        if queue:
+            tooltip(f"Next up: {self._gap_title(queue[0])[:60]}", period=2500)
 
     def _rebuild_queue_view(self) -> None:
         """Rebuild the queue list widget from the main-window queue. Does NOT
@@ -2249,25 +2460,29 @@ class CreatorPanel(QWidget):
             self.queue_remove_btn.setVisible(False)
             self.queue_load_btn.setVisible(False)
             self.queue_skip_btn.setVisible(False)
-            self.queue_clear_btn.setVisible(False)
             return
+        # The marker follows the gap the FORM is on, which is no longer always
+        # queue[0] now that any row can be loaded. Marking row 0 regardless
+        # would point at the wrong gap the moment you load from further down.
+        active = self._queue_index_of(self._current_gap)
         for i, gap in enumerate(queue):
-            prefix = "▶ " if i == 0 else "    "
-            item = QListWidgetItem(prefix + self._gap_title(gap))
-            if i == 0:
+            item = QListWidgetItem(("▶ " if i == active else "    ")
+                                   + self._gap_title(gap))
+            if i == active:
                 f = item.font()
                 f.setBold(True)
                 item.setFont(f)
             self.queue_list.addItem(item)
         n = len(queue)
         self.queue_header.setText(
-            f"{n} gap{'s' if n != 1 else ''} queued — top item drives the form below"
+            f"{n} gap{'s' if n != 1 else ''} queued — "
+            + ("▶ marks the one loaded below" if active is not None
+               else "double-click one, or press Load selected")
         )
         self.queue_list.setVisible(True)
         self.queue_remove_btn.setVisible(True)
         self.queue_load_btn.setVisible(True)
         self.queue_skip_btn.setVisible(True)
-        self.queue_clear_btn.setVisible(True)
 
     def _on_add_gap_manually(self):
         text = self.queue_add_input.text().strip()
@@ -2307,12 +2522,19 @@ class CreatorPanel(QWidget):
         tooltip(f"Removed: {self._gap_title(removed)[:60]}")
 
     def _on_skip_gap(self):
+        """Drop the gap the FORM is on and move to the next.
+
+        Not queue[0] any more: "Load selected" means the loaded gap and the top
+        of the queue can differ, and skipping something other than what's on
+        screen would be indefensible.
+        """
         if self._main_window is None:
             return
         queue = getattr(self._main_window, "gap_queue", None)
         if not queue:
             return
-        skipped = queue.pop(0)
+        idx = self._queue_index_of(self._current_gap)
+        skipped = queue.pop(idx if idx is not None else 0)
         self._current_gap = None
         # Skipping is an explicit "advance to the next gap" — clear the form so
         # the new top gap pre-fills cleanly (and its Focus replaces the old one).
@@ -2323,19 +2545,54 @@ class CreatorPanel(QWidget):
         self.refresh_queue_state(self._main_window)
         tooltip(f"Skipped: {self._gap_title(skipped)[:60]}")
 
-    def _on_clear_queue(self):
-        if self._main_window is None:
-            return
-        queue = getattr(self._main_window, "gap_queue", None)
+    def _on_mass_create_queue(self):
+        """Hand the whole gap queue to Mass AI Create.
+
+        The queue holds SNAPSHOTS taken when each gap was queued, so re-read each
+        from the store: titles and notes may have been edited since, and a gap
+        deleted in the meantime should drop out silently rather than generate
+        cards from a stale copy. Same rule as Browse's bulk-search button.
+        """
+        queue = getattr(self._main_window, "gap_queue", None) or []
         if not queue:
+            tooltip("The Create queue is empty — send some gaps over from the "
+                    "Knowledge Gaps page first.")
             return
-        if not askUser(f"Discard all {len(queue)} queued gap(s)?"):
+        from .kg import store as kg_store
+        from .kg.mass_create import open_mass_create
+        fresh = []
+        for q in queue:
+            if not isinstance(q, dict):
+                continue
+            kg = kg_store.get(q.get("kg_id") or "")
+            if kg is None:
+                # A manually-typed queue entry has no KG record behind it; carry
+                # the entry itself so it can still be generated.
+                kg = q if str(q.get("title") or "").strip() else None
+            if kg is not None:
+                # Carry any points/target_cards Mass AI Search attached, so the
+                # dialog can skip re-reading a gap that's already planned.
+                for key in ("points", "target_cards"):
+                    if q.get(key) and not kg.get(key):
+                        kg = {**kg, key: q[key]}
+                fresh.append(kg)
+        if not fresh:
+            tooltip("Those queued gaps are no longer in your KG list.")
             return
+        open_mass_create(fresh, parent=self._main_window or self)
+        # Same rule as Browse's bulk search: a queue handed off in bulk empties.
+        # Otherwise the gaps stay listed as still-to-do while their cards are
+        # already generating, and the next Mass create re-runs the lot.
+        n = len(queue)
         queue.clear()
         self._current_gap = None
-        if hasattr(self._main_window, "refresh_queue_badge"):
-            self._main_window.refresh_queue_badge()
-        self.refresh_queue_state(self._main_window)
+        self.topic.setText("")
+        self.focus.setText("")
+        self._refresh_badge()
+        if self._main_window is not None:
+            self.refresh_queue_state(self._main_window)
+        tooltip(f"Generating {len(fresh)} gap(s) — Create queue cleared "
+                f"({n} item{'s' if n != 1 else ''}).", period=3000)
 
     # ── file attachment handlers ─────────────────────────────────────────────
 
@@ -2788,6 +3045,9 @@ class CreatorPanel(QWidget):
             tooltip(f"Generating “{record['title']}” in the background…", period=3000)
             self.refresh_ready_lists()
             self._refresh_badge()
+            # The gap is away — hand the form to the next one rather than
+            # leaving it parked on the gap just sent.
+            self._advance_queue_after_generate()
             return
 
         if slide_mode:
@@ -2803,7 +3063,8 @@ class CreatorPanel(QWidget):
         else:
             reply = run_claude_json(
                 self.go_btn, loading_label,
-                prompt=user_msg, system=system_prompt, max_tokens=4096, model=model,
+                prompt=user_msg, system=system_prompt,
+                max_tokens=gen_prompt.max_tokens_for(n), model=model,
                 skill_id=skill_id, skill_invocation=skill_invocation,
                 attachments=attachments_for_api or None,
             )
@@ -3198,19 +3459,13 @@ class CreatorPanel(QWidget):
             accepted = result == QDialog.DialogCode.Accepted
         except Exception:
             accepted = bool(result)
-        if (
-            accepted
-            and self._current_gap is not None
-            and self._main_window is not None
-            and getattr(self._main_window, "gap_queue", None)
-            and self._main_window.gap_queue
-            and self._main_window.gap_queue[0] == self._current_gap
-        ):
-            popped = self._main_window.gap_queue.pop(0)
-            # If this gap traces back to a KG, mark it done in the store and
-            # nudge the KG panel to refresh.
+        # The queue advanced at generation time (_advance_queue_after_generate),
+        # so there is nothing left to pop here — only the KG to mark done, and
+        # only if cards were actually accepted. Keyed off the gap that was
+        # generated rather than off the queue, which has already moved on.
+        if accepted and isinstance(gap, dict):
             try:
-                kg_id = popped.get("kg_id") if isinstance(popped, dict) else None
+                kg_id = gap.get("kg_id")
                 if kg_id:
                     from .kg import store as kg_store
                     kg_store.update(kg_id, status="done")
@@ -3218,16 +3473,12 @@ class CreatorPanel(QWidget):
                     knowledge_gaps._refresh_open_panel()
             except Exception as e:
                 print(f"[ankisstant] mark KG done failed: {e}")
-            self._current_gap = None
-            # Clear the form so the next queued gap pre-fills cleanly. Without
-            # this, the just-finished gap's topic/focus linger and the dirty-form
-            # guard in refresh_queue_state blocks the next gap from auto-loading
-            # (leaving a stale Focus from the previous KG).
-            self.topic.setText("")
-            self.focus.setText("")
-            if hasattr(self._main_window, "refresh_queue_badge"):
-                self._main_window.refresh_queue_badge()
-            self.refresh_queue_state(self._main_window)
+            # Only the modal path reaches here, and only on accept — so unlike
+            # the background path it advances at the END. Cancelling a review
+            # deliberately leaves the gap queued so it can be retried, and that
+            # was worth keeping: with the modal you are blocked until the review
+            # closes anyway, so nothing is gained by advancing earlier.
+            self._advance_queue_after_generate()
         return True
 
     def _make_job_record(self, *, mode, source_label, topic_label, focus, deck_name,
@@ -3276,7 +3527,13 @@ class CreatorPanel(QWidget):
             "lecture_match": bool(lecture_match),
             "page_texts": list(page_texts or []),
             "user_msg": user_msg, "system_prompt": system_prompt, "model": model,
-            "skill_id": skill_id, "skill_invocation": skill_invocation, "max_tokens": 4096,
+            # Scaled to the card count, not fixed: 4096 is ample for the usual
+            # 3-10 cards and quietly fatal past ~30, where the reply truncates
+            # mid-JSON and the job fails with a generic "reply wasn't in the
+            # expected card format". Shared with mass create so both size it the
+            # same way.
+            "skill_id": skill_id, "skill_invocation": skill_invocation,
+            "max_tokens": gen_prompt.max_tokens_for(self.n_cards.value()),
             "merge_tag": bool(merge_tag), "merge_explanation": bool(merge_explanation),
             "merge_grade": bool(merge_grade), "want_tag": bool(want_tag),
             "want_explanation": bool(want_explanation), "cached_tag": cached_tag or "",
@@ -3837,6 +4094,288 @@ class _SlideGalleryDialog(QDialog):
         return [i for i, b in enumerate(self._buttons) if b.isChecked()]
 
 
+# ── committing cards to the collection (shared) ───────────────────────────────
+#
+# Writing a card into Anki used to live entirely inside ReviewDialog, reading a
+# dozen `self` attributes as it went. That was fine while exactly one screen ever
+# committed anything. Mass AI Create commits a batch spanning several gaps in one
+# checkpoint — same notetype and (usually) deck, but per-gap tags and per-gap KG
+# content — so the field-writing had to stop being a method on the screen that
+# happens to be showing.
+#
+# CommitCtx is that dozen attributes named once. ReviewDialog builds one on
+# demand (so nothing goes stale if a field is reassigned mid-review) and mass
+# create builds one per gap group.
+
+@dataclass
+class CommitCtx:
+    """Everything needed to turn a generated card dict into an Anki note."""
+    profile: dict
+    tags: list                                  # applied to every note
+    mode: str = "topic"
+    source_label: str | None = None
+    panel_image_paths: list = field(default_factory=list)
+    # KG-attached content. For MQ-type gaps these compose the Missed Questions
+    # field; for every other type only the images are used.
+    kg_image_filenames: list = field(default_factory=list)
+    kg_type_for_image: str = ""
+    kg_stem_html: str = ""
+    kg_notes: str = ""
+    kg_concept: str = ""
+    kg_explanation: str = ""
+    # The KG type definition + this gap's per-note field values, for user-defined
+    # fields whose declarative target is a literal Anki field (kind="field").
+    type_meta: dict | None = None
+    kg_field_values: dict = field(default_factory=dict)
+
+
+def enrich_extra(extra: str, ctx: CommitCtx) -> str:
+    """Optionally stamp the source label onto Extra. Off by default: the label is
+    whatever the file was called, and a journal's PII filename on the back of
+    every card is noise. Turn on with card_creator.cite_source."""
+    out = extra or ""
+    if not bool(tool_config("card_creator").get("cite_source", False)):
+        return out
+    if ctx.mode == "source" and ctx.source_label:
+        cite = f"Source: {ctx.source_label}"
+        if cite not in out:
+            out = (out + "<br>" if out else "") + cite
+    return out
+
+
+def kg_image_html(ctx: CommitCtx) -> str:
+    """<img> HTML for KG-attached images (filenames already in media)."""
+    card_w, card_h, _sw, _sh = _img_display_cfg()
+    return "<br>".join(img_tag(f, card_w, card_h) for f in ctx.kg_image_filenames if f)
+
+
+def kg_content_html(ctx: CommitCtx) -> str:
+    """Full HTML to append to the KG target field — for MQ-type KGs this leads
+    with the specific knowledge gap (concept) and an AI-written explanation of
+    it, then the captured question stem and any freeform notes above the
+    screenshot(s). For non-MQ KGs it's just the images. "" if nothing to add."""
+    parts: list[str] = []
+    if ctx.kg_type_for_image == "mq":
+        if ctx.kg_concept:
+            parts.append(f"<b>Knowledge gap:</b> {html.escape(ctx.kg_concept)}")
+        if ctx.kg_explanation:
+            parts.append("<i>" + html.escape(ctx.kg_explanation).replace("\n", "<br>") + "</i>")
+        if ctx.kg_stem_html.strip():
+            parts.append(ctx.kg_stem_html.strip())
+        if ctx.kg_notes.strip():
+            # Notes are plain-text; escape for safety.
+            parts.append(html.escape(ctx.kg_notes.strip()).replace("\n", "<br>"))
+    img_html = kg_image_html(ctx)
+    if img_html:
+        parts.append(img_html)
+    return "<br>".join(parts)
+
+
+def kg_image_target_field(ctx: CommitCtx) -> str:
+    """Field that KG-attached content should land in. MQ-type KGs route to the
+    qbank Missed Questions field; everything else uses Extra."""
+    if ctx.kg_type_for_image == "mq":
+        try:
+            return tool_config("qbank").get("missed_q_field") or "Missed Questions"
+        except Exception:
+            return "Missed Questions"
+    return ctx.profile.get("extra_field", "Extra")
+
+
+def images_for(card: dict, ctx: CommitCtx) -> str:
+    """<img>-tag fragment for the image field: panel-level images plus per-card
+    images attached during review, EXCLUDING slide images (those route to the
+    slide field via slide_imgs_for). Files are copied into Anki media here (NOT
+    at generation time) so only what actually gets created is imported."""
+    slide_paths = set(card.get("_slide_paths") or [])
+    paths: list[str] = list(ctx.panel_image_paths)
+    paths.extend(p for p in (card.get("_image_paths") or []) if p not in slide_paths)
+    return _img_tags_for(paths) if paths else ""
+
+
+def slide_imgs_for(card: dict) -> str:
+    """<img> fragment for the card's source-slide image(s). Empty when none."""
+    paths = card.get("_slide_paths") or []
+    return _img_tags_for(list(paths), slide=True) if paths else ""
+
+
+def set_fields(note, card: dict, ctx: CommitCtx) -> None:
+    """Write one generated card into a fresh note. The single definition — both
+    the single-gap review screen and mass create go through here."""
+    profile       = ctx.profile
+    front_field   = profile.get("front_field", "Text")
+    extra_field   = profile.get("extra_field", "Extra")
+    image_field   = profile.get("image_field", extra_field)
+    slide_field   = _resolve_slide_field(profile, note.keys())
+    sources_field = (profile.get("sources_field") or "").strip()
+    obo_field     = profile.get("one_by_one_field", "One by one")
+    try:
+        note[front_field] = card.get("front", "")
+    except KeyError:
+        note.fields[0] = card.get("front", "")
+    if extra_field in note:
+        note[extra_field] = enrich_extra(card.get("extra", ""), ctx)
+    # Non-slide images go into image_field (often == extra_field, in which case
+    # we append; if it's a separate field, that field is set directly).
+    img_html = images_for(card, ctx)
+    if img_html and image_field in note:
+        if image_field == extra_field:
+            _append_field(note, image_field, img_html)
+        else:
+            note[image_field] = img_html
+    # Source-slide image(s) go into the slide field (AnKing 'Lecture Notes' by
+    # default), separate from the medical/searched images above.
+    _append_field(note, slide_field, slide_imgs_for(card))
+    source_html = (card.get("source") or "").strip()
+    if source_html and sources_field and sources_field in note:
+        if sources_field == extra_field:
+            existing = note[sources_field] or ""
+            note[sources_field] = (existing + "<br>" if existing else "") + source_html
+        else:
+            note[sources_field] = source_html
+    # KG-attached content: for MQ-type KGs the captured question stem + freeform
+    # notes + screenshot(s), routed to Missed Questions. Non-MQ KGs just
+    # contribute their images to Extra (or image_field).
+    kg_content = kg_content_html(ctx)
+    if kg_content:
+        target = kg_image_target_field(ctx)
+        if target and target in note:
+            existing = note[target] or ""
+            note[target] = (existing + "<br>" if existing else "") + kg_content
+    if card.get("one_by_one") and obo_field in note:
+        note[obo_field] = "y"
+    # User-defined fields whose declarative target is a literal Anki field
+    # (kind="field"). Built-in role targets are handled above; this only adds the
+    # custom field→field routing, so default types are unaffected.
+    if ctx.type_meta and ctx.kg_field_values:
+        try:
+            qb_cfg = tool_config("qbank")
+            custom = engine.note_field_plan(
+                ctx.type_meta, profile, qb_cfg,
+                lambda k: ctx.kg_field_values.get(k, ""), only_kinds=("field",))
+            for fname, val in custom.items():
+                if val and fname in note:
+                    existing = note[fname] or ""
+                    note[fname] = (existing + "<br>" if existing else "") + val
+        except Exception as e:
+            log.warn(f"custom field routing skipped: {e}")
+    for t in ctx.tags:
+        note.add_tag(t)
+
+
+def one_by_one_rewrite(old_card: dict, profile: dict) -> dict | None:
+    """Rewrite a card as one note with sibling {{c1}} clozes for AnKing's
+    'One by one' reveal. None if the model didn't return a usable card."""
+    prompt = (
+        "Original card front:\n" + old_card.get("front", "") + "\n\n"
+        "Original card extra:\n" + old_card.get("extra", "") + "\n\n"
+        "Rewrite as ONE card with multiple sibling {{c1::...}} clozes so AnKing's "
+        "'One by one' addon reveals each in sequence."
+    )
+    skill_invocation, skill_id = _resolve_skill(profile)
+    new = core_api.ask_claude_json(
+        prompt=prompt,
+        system=_augment_system(ONE_BY_ONE_SYSTEM, profile),
+        max_tokens=1024, model=tool_model_for("card_creation"),
+        skill_id=skill_id, skill_invocation=skill_invocation,
+    )
+    if not isinstance(new, dict) or "front" not in new or "extra" not in new:
+        return None
+    front = new["front"]
+    if re.search(r"\{\{c[2-9]\d*::", front):
+        new["front"] = re.sub(r"\{\{c\d+::", "{{c1::", front)
+    if old_card.get("_image_paths"):
+        new["_image_paths"] = list(old_card["_image_paths"])
+    return new
+
+
+def split_card(card: dict, profile: dict) -> list | None:
+    """Break one card into the smallest set of atomic single-cloze cards. None
+    when the model didn't return a usable list (the caller leaves the row be)."""
+    prompt = (
+        "Original card front:\n" + card.get("front", "") + "\n\n"
+        "Original card extra:\n" + card.get("extra", "") + "\n\n"
+        "Split this card into the smallest number of ATOMIC single-cloze cards "
+        "that preserve all the testable facts. Each output card must have exactly "
+        "one {{c1::...}} cloze."
+    )
+    skill_invocation, skill_id = _resolve_skill(profile)
+    new_cards = core_api.ask_claude_json(
+        prompt=prompt,
+        system=_augment_system(SPLIT_SYSTEM, profile),
+        max_tokens=2048, model=tool_model_for("card_creation"),
+        skill_id=skill_id, skill_invocation=skill_invocation,
+    )
+    if (not isinstance(new_cards, list) or not new_cards
+            or not all(isinstance(c, dict) and "front" in c and "extra" in c
+                       for c in new_cards)):
+        return None
+    return new_cards
+
+
+def dup_check(card: dict, front_field: str) -> str | None:
+    """A warning string when the collection already has a note whose front field
+    contains this card's opening text, else None."""
+    plain = anki_utils.strip_cloze(anki_utils.strip_html(card.get("front", "")))[:50].strip()
+    if len(plain) < 12:
+        return None
+    safe = plain.replace("\\", "\\\\").replace('"', '\\"')
+    try:
+        nids = mw.col.find_notes(f'"{front_field}:*{safe}*"')
+    except Exception:
+        return None
+    if nids:
+        return f"Possible duplicate — {len(nids)} note(s) already contain '{plain[:40]}…'"
+    return None
+
+
+def resolve_notetype(profile: dict, *, warn: bool = True):
+    """The Anki notetype for a profile, or None with an explanatory warning."""
+    name = (profile.get("name") or "").strip()
+    if not name:
+        if warn:
+            showWarning("No notetype configured.\n\n"
+                        "Open Ankisstant Settings → AI Create and add a notetype profile.")
+        return None
+    nt = mw.col.models.by_name(name)
+    if nt is None:
+        if warn:
+            showWarning(f"Notetype not found: {name}\n\n"
+                        "Edit or remove this notetype profile under Settings → AI Create.")
+        return None
+    front_field = (profile.get("front_field") or "Text").strip()
+    field_names = {f["name"] for f in nt.get("flds", [])}
+    if front_field and front_field not in field_names:
+        if warn:
+            showWarning(
+                f"Notetype '{name}' has no field named '{front_field}'.\n\n"
+                f"Available fields: {', '.join(sorted(field_names)) or '(none)'}\n\n"
+                "Update the profile's 'Front field' under Settings → AI Create.")
+        return None
+    # Cloze sanity check — non-cloze notetypes silently swallow {{c1::…}}.
+    if nt.get("type", 0) != 1:
+        log.warn(f"notetype {name!r} is not a cloze type — generated cards may not "
+                 "render as expected.")
+    return nt
+
+
+def commit_cards(cards: list, *, ctx: CommitCtx, deck_name: str, notetype) -> list:
+    """Add cards to the collection. Returns the created note ids.
+
+    Deliberately does NOT checkpoint, reset, confirm or log — the caller owns all
+    four, because a batch commit wants ONE checkpoint and ONE reset around many
+    calls to this, not one of each per gap.
+    """
+    deck_id = mw.col.decks.id(deck_name)
+    created = []
+    for card in cards:
+        note = mw.col.new_note(notetype)
+        set_fields(note, card, ctx)
+        mw.col.add_note(note, deck_id)
+        created.append(note.id)
+    return created
+
+
 class ReviewDialog(QDialog):
     def __init__(self, cards, mode, source_label, topic_label, focus,
                  deck_name, tags, profile=None, panel_image_paths=None,
@@ -3987,18 +4526,7 @@ class ReviewDialog(QDialog):
     # ── duplicate detection ───────────────────────────────────────────────────
 
     def _dup_check(self, card) -> str | None:
-        plain = anki_utils.strip_cloze(anki_utils.strip_html(card.get("front", "")))[:50].strip()
-        if len(plain) < 12:
-            return None
-        safe = plain.replace("\\", "\\\\").replace('"', '\\"')
-        front_field = self.profile.get("front_field", "Text")
-        try:
-            nids = mw.col.find_notes(f'"{front_field}:*{safe}*"')
-        except Exception:
-            return None
-        if nids:
-            return f"Possible duplicate — {len(nids)} note(s) already contain '{plain[:40]}…'"
-        return None
+        return dup_check(card, self.profile.get("front_field", "Text"))
 
     # ── regenerate / one-by-one / split ───────────────────────────────────────
 
@@ -4011,45 +4539,11 @@ class ReviewDialog(QDialog):
         )
 
     def _on_one_by_one(self, old_card):
-        prompt = (
-            "Original card front:\n" + old_card.get("front", "") + "\n\n"
-            "Original card extra:\n" + old_card.get("extra", "") + "\n\n"
-            "Rewrite as ONE card with multiple sibling {{c1::...}} clozes so AnKing's "
-            "'One by one' addon reveals each in sequence."
-        )
-        skill_invocation, skill_id = _resolve_skill(self.profile)
-        new = core_api.ask_claude_json(
-            prompt=prompt,
-            system=_augment_system(ONE_BY_ONE_SYSTEM, self.profile),
-            max_tokens=1024, model=tool_model_for("card_creation"),
-            skill_id=skill_id, skill_invocation=skill_invocation,
-        )
-        if not isinstance(new, dict) or "front" not in new or "extra" not in new:
-            return None
-        front = new["front"]
-        if re.search(r"\{\{c[2-9]\d*::", front):
-            new["front"] = re.sub(r"\{\{c\d+::", "{{c1::", front)
-        if old_card.get("_image_paths"):
-            new["_image_paths"] = list(old_card["_image_paths"])
-        return new
+        return one_by_one_rewrite(old_card, self.profile)
 
     def _on_split(self, row):
-        prompt = (
-            "Original card front:\n" + row.card.get("front", "") + "\n\n"
-            "Original card extra:\n" + row.card.get("extra", "") + "\n\n"
-            "Split this card into the smallest number of ATOMIC single-cloze cards "
-            "that preserve all the testable facts. Each output card must have exactly "
-            "one {{c1::...}} cloze."
-        )
-        skill_invocation, skill_id = _resolve_skill(self.profile)
-        new_cards = core_api.ask_claude_json(
-            prompt=prompt,
-            system=_augment_system(SPLIT_SYSTEM, self.profile),
-            max_tokens=2048, model=tool_model_for("card_creation"),
-            skill_id=skill_id, skill_invocation=skill_invocation,
-        )
-        if (not isinstance(new_cards, list) or not new_cards
-                or not all(isinstance(c, dict) and "front" in c and "extra" in c for c in new_cards)):
+        new_cards = split_card(row.card, self.profile)
+        if not new_cards:
             return
 
         idx_in_layout = self.inner_layout.indexOf(row)
@@ -4087,173 +4581,50 @@ class ReviewDialog(QDialog):
     def _approved_cards(self):
         return [r.card for r in self.rows if r.state == _CardRow.APPROVED]
 
-    def _enrich_extra(self, extra: str) -> str:
-        out = extra or ""
-        if self.mode == "source" and self.source_label:
-            cite = f"Source: {self.source_label}"
-            if cite not in out:
-                out = (out + "<br>" if out else "") + cite
-        return out
+    @property
+    def _ctx(self) -> CommitCtx:
+        """This dialog's state as a CommitCtx. Built on ACCESS rather than cached
+        in __init__ so a field reassigned mid-review (tags, panel images) can't
+        leave the commit path writing a stale snapshot."""
+        return CommitCtx(
+            profile=self.profile,
+            tags=self.tags,
+            mode=self.mode,
+            source_label=self.source_label,
+            panel_image_paths=self.panel_image_paths,
+            kg_image_filenames=self.kg_image_filenames,
+            kg_type_for_image=self.kg_type_for_image,
+            kg_stem_html=self.kg_stem_html,
+            kg_notes=self.kg_notes,
+            kg_concept=self.kg_concept,
+            kg_explanation=self.kg_explanation,
+            type_meta=self.type_meta,
+            kg_field_values=self.kg_field_values,
+        )
 
-    def _kg_image_html(self) -> str:
-        """<img> HTML for KG-attached images (filenames already in media)."""
-        bits = [f'<img src="{html.escape(f, quote=True)}">'
-                for f in self.kg_image_filenames if f]
-        return "<br>".join(bits)
+    def _enrich_extra(self, extra: str) -> str:
+        return enrich_extra(extra, self._ctx)
 
     def _kg_content_html(self) -> str:
-        """Full HTML to append to the KG target field — for MQ-type KGs this
-        leads with the specific knowledge gap (concept) and an AI-written
-        explanation of it, then the captured question stem and any freeform
-        notes above the screenshot(s). For non-MQ KGs it's just the images.
-
-        Returns "" if there's nothing to append."""
-        parts: list[str] = []
-        if self.kg_type_for_image == "mq":
-            if self.kg_concept:
-                parts.append(
-                    f"<b>Knowledge gap:</b> {html.escape(self.kg_concept)}"
-                )
-            if self.kg_explanation:
-                parts.append(
-                    "<i>" + html.escape(self.kg_explanation).replace("\n", "<br>")
-                    + "</i>"
-                )
-            if self.kg_stem_html.strip():
-                parts.append(self.kg_stem_html.strip())
-            if self.kg_notes.strip():
-                # Notes are plain-text; escape for safety.
-                parts.append(html.escape(self.kg_notes.strip()).replace("\n", "<br>"))
-        img_html = self._kg_image_html()
-        if img_html:
-            parts.append(img_html)
-        return "<br>".join(parts)
-
-    def _kg_image_target_field(self) -> str:
-        """Field that KG-attached images should land in. MQ-type KGs route to
-        the qbank Missed Questions field; everything else uses Extra."""
-        if self.kg_type_for_image == "mq":
-            try:
-                qb_cfg = tool_config("qbank")
-                return qb_cfg.get("missed_q_field") or "Missed Questions"
-            except Exception:
-                return "Missed Questions"
-        return self.profile.get("extra_field", "Extra")
+        return kg_content_html(self._ctx)
 
     def _images_for(self, card) -> str:
-        """Build an <img>-tag fragment for the image field: panel-level images
-        plus per-card images attached during review, EXCLUDING slide images
-        (those route to the slide/Lecture-Notes field via `_slide_imgs_for`).
-        Files are copied into Anki media here (NOT at generation time) so we only
-        import what actually gets created."""
-        slide_paths = set(card.get("_slide_paths") or [])
-        paths: list[str] = []
-        paths.extend(self.panel_image_paths)
-        paths.extend(p for p in (card.get("_image_paths") or []) if p not in slide_paths)
-        if not paths:
-            return ""
-        return _img_tags_for(paths)
+        return images_for(card, self._ctx)
 
     def _slide_imgs_for(self, card) -> str:
-        """`<img>` fragment for the card's source-slide image(s), destined for the
-        slide/Lecture-Notes field. Empty when the card has no attached slide."""
-        paths = card.get("_slide_paths") or []
-        return _img_tags_for(list(paths)) if paths else ""
+        return slide_imgs_for(card)
+
+    def _kg_image_target_field(self) -> str:
+        return kg_image_target_field(self._ctx)
 
     def _get_notetype(self):
-        name = (self.profile.get("name") or "").strip()
-        if not name:
-            showWarning(
-                "No notetype configured.\n\n"
-                "Open Ankisstant Settings → AI Create and add a "
-                "notetype profile."
-            )
-            return None
-        nt = mw.col.models.by_name(name)
-        if nt is None:
-            showWarning(
-                f"Notetype not found: {name}\n\n"
-                "Edit or remove this notetype profile under Settings → "
-                "AI Create."
-            )
-            return None
-        front_field = (self.profile.get("front_field") or "Text").strip()
-        field_names = {f["name"] for f in nt.get("flds", [])}
-        if front_field and front_field not in field_names:
-            showWarning(
-                f"Notetype '{name}' has no field named '{front_field}'.\n\n"
-                f"Available fields: {', '.join(sorted(field_names)) or '(none)'}\n\n"
-                "Update the profile's 'Front field' under Settings → AI Create."
-            )
-            return None
-        # Cloze sanity check — non-cloze notetypes will silently swallow {{c1::…}}.
-        if nt.get("type", 0) != 1:
-            log.warn(f"notetype {name!r} is not a cloze type — generated cards may not render as expected.")
-        return nt
+        return resolve_notetype(self.profile)
 
     def _get_deck_id(self):
         return mw.col.decks.id(self.deck_name)
 
     def _set_fields(self, note, card):
-        front_field   = self.profile.get("front_field", "Text")
-        extra_field   = self.profile.get("extra_field", "Extra")
-        image_field   = self.profile.get("image_field", extra_field)
-        slide_field   = _resolve_slide_field(self.profile, note.keys())
-        sources_field = (self.profile.get("sources_field") or "").strip()
-        obo_field     = self.profile.get("one_by_one_field", "One by one")
-        try:
-            note[front_field] = card.get("front", "")
-        except KeyError:
-            note.fields[0] = card.get("front", "")
-        if extra_field in note:
-            note[extra_field] = self._enrich_extra(card.get("extra", ""))
-        # Non-slide images go into image_field (often == extra_field, in which
-        # case we append; if it's a separate field, that field is set directly).
-        img_html = self._images_for(card)
-        if img_html and image_field in note:
-            if image_field == extra_field:
-                _append_field(note, image_field, img_html)
-            else:
-                note[image_field] = img_html
-        # Source-slide image(s) go into the slide field (AnKing 'Lecture Notes' by
-        # default), separate from the medical/searched images above.
-        _append_field(note, slide_field, self._slide_imgs_for(card))
-        source_html = (card.get("source") or "").strip()
-        if source_html and sources_field and sources_field in note:
-            if sources_field == extra_field:
-                existing = note[sources_field] or ""
-                note[sources_field] = (existing + "<br>" if existing else "") + source_html
-            else:
-                note[sources_field] = source_html
-        # KG-attached content: for MQ-type KGs this is the captured question
-        # stem + freeform notes + screenshot(s) routed to Missed Questions.
-        # Non-MQ KGs just contribute their images to Extra (or image_field).
-        kg_content = self._kg_content_html()
-        if kg_content:
-            target = self._kg_image_target_field()
-            if target and target in note:
-                existing = note[target] or ""
-                note[target] = (existing + "<br>" if existing else "") + kg_content
-        if card.get("one_by_one") and obo_field in note:
-            note[obo_field] = "y"
-        # User-defined fields whose declarative target is a literal Anki field
-        # (kind="field") are composed and written here. Built-in role targets
-        # (front/extra/image/missed_q) are handled above; this only adds the
-        # custom field→field routing, so default types are unaffected.
-        if self.type_meta and self.kg_field_values:
-            try:
-                qb_cfg = tool_config("qbank")
-                custom = engine.note_field_plan(
-                    self.type_meta, self.profile, qb_cfg,
-                    lambda k: self.kg_field_values.get(k, ""), only_kinds=("field",))
-                for fname, val in custom.items():
-                    if val and fname in note:
-                        existing = note[fname] or ""
-                        note[fname] = (existing + "<br>" if existing else "") + val
-            except Exception as e:
-                log.warn(f"custom field routing skipped: {e}")
-        for t in self.tags:
-            note.add_tag(t)
+        return set_fields(note, card, self._ctx)
 
     def _on_create_all(self):
         if not anki_utils.require_col():
@@ -4267,15 +4638,10 @@ class ReviewDialog(QDialog):
         nt = self._get_notetype()
         if nt is None:
             return
-        deck_id = self._get_deck_id()
-        created_ids = []
         if hasattr(mw, "checkpoint"):
             mw.checkpoint("AI Create")
-        for card in approved:
-            note = mw.col.new_note(nt)
-            self._set_fields(note, card)
-            mw.col.add_note(note, deck_id)
-            created_ids.append(note.id)
+        created_ids = commit_cards(approved, ctx=self._ctx,
+                                   deck_name=self.deck_name, notetype=nt)
         mw.reset()
         _append_session(
             mode=self.mode, source=self.source_label, topic=self.topic_label,

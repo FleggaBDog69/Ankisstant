@@ -120,6 +120,50 @@ class ClaudeCancelled(ClaudeError):
     pass
 
 
+def classify_ai_error(msg: str) -> tuple[str, str]:
+    """Map a raw ClaudeError string to a (code, user_facing_message) pair.
+
+    The provider layer speaks in diagnostics ("Claude CLI exited 1: You've hit
+    your session limit"); a user needs to know *which* thing broke and what to
+    do about it. Callers that surface a failure to the user (a tooltip, the AI
+    Lecture popup) run the raw message through here first.
+
+    Codes: out_of_usage, timeout, no_provider, network, cli_error, ai_error.
+    """
+    m = (msg or "").strip()
+    low = m.lower()
+    # Claude Code prints e.g. "You've hit your session limit · resets 5:20pm
+    # (Australia/Perth)". Pull the reset time back out so we can hand it over.
+    if any(k in low for k in ("session limit", "hit your", "usage limit",
+                              "rate limit", "quota")):
+        reset = ""
+        mo = re.search(r"reset[s]?\s+(.+?)(?:$|[.\n])", m, re.I)
+        if mo:
+            reset = f" It resets {mo.group(1).strip()}."
+        return ("out_of_usage",
+                "You're out of Claude usage for now." + reset +
+                " AI Lecture couldn't finish — try again once your limit resets.")
+    if "timed out" in low or "timeout" in low:
+        return ("timeout",
+                "The AI took too long and was cut off before it answered. That "
+                "usually means the request was very large — try turning off "
+                "'Read diagrams and tables as images', or lower the "
+                "learning-point target, and run it again.")
+    if ("no ai provider" in low or "no anthropic api key" in low
+            or "cli not found" in low or "provider not" in low):
+        return ("no_provider",
+                "No AI provider is set up. Open Ankisstant Settings → AI and add "
+                "the Claude CLI or paste an API key.")
+    if "network error" in low or "temporarily unavailable" in low or "connection" in low:
+        return ("network",
+                "Couldn't reach the AI provider — either your network is down or "
+                "the service is temporarily unavailable. Check your connection "
+                "and try again.")
+    if "exited" in low or "cli failed" in low:
+        return ("cli_error", "The Claude CLI failed:\n\n" + m)
+    return ("ai_error", m)
+
+
 # ── small text helpers ─────────────────────────────────────────────────────────
 
 def strip_fences(text: str) -> str:
@@ -226,6 +270,21 @@ def detect_cli_path(override: str = "") -> str:
 
 # ── CLI provider ──────────────────────────────────────────────────────────────
 
+def _scrub_surrogates(s: str) -> str:
+    """Drop lone UTF-16 surrogate code points (U+D800–U+DFFF) from a string.
+
+    PDF text layers and OCR occasionally emit unpaired surrogates. They're not
+    valid UTF-8, so subprocess stdin (text=True → UTF-8) raises
+    "surrogates not allowed" and sinks the whole run. Encoding with errors=
+    'ignore' round-trips valid text unchanged and silently discards the garbage
+    — the right trade at the CLI boundary, where a few dropped junk code points
+    beats losing the entire extraction.
+    """
+    if not s:
+        return s
+    return s.encode("utf-8", "ignore").decode("utf-8", "ignore")
+
+
 def _call_cli(cli_path: str, model: str, system: str, user: str,
               extra_args: list[str] | None = None, timeout: int = 180,
               attachments: list[str] | None = None,
@@ -237,6 +296,12 @@ def _call_cli(cli_path: str, model: str, system: str, user: str,
             "Claude Code CLI not found. Install Claude Code or set the path "
             "explicitly in Ankisstant Settings."
         )
+
+    # Guard the subprocess stdin (text=True → UTF-8) against unpaired surrogates
+    # from PDF/OCR text — otherwise communicate() raises "surrogates not allowed"
+    # and the whole run dies before the model ever sees the prompt.
+    system = _scrub_surrogates(system)
+    user = _scrub_surrogates(user)
 
     # Attachments need the Read tool; skill invocations are pure prompt
     # prefixes, no tool required (the CLI auto-loads skill bodies via
@@ -641,10 +706,17 @@ def ask_claude(
     skill_id: str = "",
     skill_invocation: str = "",
     show_errors: bool = True,
-    attachments: list[tuple[bytes, str]] | None = None,
+    attachments: list[str] | None = None,
+    timeout: int | None = None,
+    raise_on_error: bool = False,
 ) -> str | None:
     """Single shared entry point. Returns the text reply, or None on failure.
     A tooltip is shown on failure so the user notices (unless show_errors=False).
+
+    `timeout` overrides the per-provider default (seconds); a long vision call
+    needs more than the 300s the CLI otherwise allows. `raise_on_error` re-raises
+    ClaudeError/ClaudeCancelled instead of swallowing them to None, so a caller
+    that wants to know *why* it failed (e.g. to show a specific message) can.
 
     `attachments` is a list of absolute file paths. On the CLI path the Read
     tool is enabled and the paths are referenced in the prompt; on the API path
@@ -702,6 +774,7 @@ def ask_claude(
                 extra_args=cfg.get("claude_cli_extra_args") or [],
                 attachments=attachments,
                 skill_invocation=skill_invocation,
+                **({"timeout": timeout} if timeout is not None else {}),
             )
         if provider == "gemini" and not skill_id:
             return _call_gemini(
@@ -736,11 +809,16 @@ def ask_claude(
             "provider and paste its API key, or install the Claude Code CLI."
         )
     except ClaudeCancelled:
-        # User-initiated — no error UI, just a quiet None.
+        # User-initiated — no error UI, just a quiet None (or re-raise so a
+        # caller driving its own loop can stop cleanly).
+        if raise_on_error:
+            raise
         return None
     except ClaudeError as e:
         from . import log as _log
         _log.error(f"ask_claude failed: {e}")
+        if raise_on_error:
+            raise
         if show_errors:
             _surface_claude_error(str(e), use_cli=use_cli, use_api=any_provider_configured)
         return None
@@ -754,6 +832,8 @@ def ask_claude(
         # Gemini path and every other path equally.
         from . import log as _log
         _log.error(f"ask_claude crashed unexpectedly: {e!r}")
+        if raise_on_error:
+            raise ClaudeError(f"Unexpected error talking to the AI provider: {e}") from e
         if show_errors:
             _surface_claude_error(
                 f"Unexpected error talking to the AI provider: {e}. "
@@ -794,7 +874,8 @@ def _surface_claude_error(msg: str, *, use_cli: bool, use_api: bool) -> None:
             return
         except Exception:
             pass
-    tooltip(f"AI error: {msg}", period=4500)
+    _code, friendly = classify_ai_error(msg)
+    tooltip(f"AI error: {friendly}", period=5500)
 
 
 def ask_claude_json(
@@ -805,7 +886,9 @@ def ask_claude_json(
     skill_id: str = "",
     skill_invocation: str = "",
     show_errors: bool = True,
-    attachments: list[tuple[bytes, str]] | None = None,
+    attachments: list[str] | None = None,
+    timeout: int | None = None,
+    raise_on_error: bool = False,
 ):
     """Convenience: ask_claude + parse JSON. Returns None on failure.
     Tries strict json.loads first, then a fenced extract, then a regex fallback
@@ -819,7 +902,8 @@ def ask_claude_json(
 
     raw = ask_claude(prompt, system=system, max_tokens=max_tokens, model=model,
                      skill_id=skill_id, skill_invocation=skill_invocation,
-                     show_errors=show_errors, attachments=attachments)
+                     show_errors=show_errors, attachments=attachments,
+                     timeout=timeout, raise_on_error=raise_on_error)
     if raw is None:
         return None
     try:

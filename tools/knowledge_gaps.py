@@ -30,7 +30,8 @@ from ..core import anki_utils
 from ..core.config import active_family, tool_config, tool_model_for
 from ..core.qt_utils import (
     attach_tag_completer, make_help_button, make_setup_banner,
-    provider_configured, run_claude_json, set_ai_buttons_enabled, theme_dialog,
+    provider_configured, refresh_deck_browser, run_claude_json,
+    set_ai_buttons_enabled, theme_dialog,
 )
 from .kg import store as kg_store
 
@@ -40,11 +41,27 @@ NAME = "Knowledge Gaps"
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
+
+def _queue_owner(widget):
+    """The Ankisstant body holding gap_queue / browse_queue, or None.
+
+    Imported lazily — ui.main_window imports the tools, so a module-level
+    import here would be circular.
+    """
+    try:
+        from ..ui.main_window import queue_owner
+        return queue_owner(widget)
+    except Exception as e:
+        print(f"[ankisstant] couldn't resolve the Ankisstant queues: {e}")
+        return None
+
+
 SOURCE_LABELS = {
     "manual":  "Manual",
     "analyse": "Analyse",
     "qbank":   "QBank",
     "browse":  "Browse",
+    "chat":    "AI chat",
 }
 
 STATUS_LABELS = {
@@ -241,10 +258,7 @@ class AddKGDialog(QDialog):
             notes=notes,
             fields=fields,
         )
-        try:
-            mw.deckBrowser.refresh()
-        except Exception:
-            pass
+        refresh_deck_browser()
         # Tell any open KG panel to reload.
         try:
             _refresh_open_panel()
@@ -1556,6 +1570,26 @@ class KnowledgeGapsPanel(QWidget):
         refresh_btn.clicked.connect(lambda: self.refresh_list())
         btn_row.addWidget(add_btn)
         btn_row.addWidget(import_btn)
+        # Capture from SynapsePro's AI chat. This is the robust half of that
+        # feature — it reads one private global, where the button injected into
+        # the chat header needs four — so it stays even if a SynapsePro update
+        # renames a seam and the injected button quietly stops appearing.
+        # Built only when SynapsePro is actually there; without it the button
+        # would be permanently dead with nothing explaining why.
+        self._chat_btn = None
+        try:
+            from ..core import synapse_chat
+            if synapse_chat.chat_available():
+                self._chat_btn = QPushButton("＋ KG from AI chat")
+                self._chat_btn.setAutoDefault(False)
+                self._chat_btn.setToolTip(
+                    "Condense the latest answer in SynapsePro's AI chat into "
+                    "knowledge gaps and add them here."
+                )
+                self._chat_btn.clicked.connect(self._on_kg_from_chat)
+                btn_row.addWidget(self._chat_btn)
+        except Exception as e:
+            print(f"[ankisstant] chat KG button unavailable: {e}")
         btn_row.addStretch(1)
         btn_row.addWidget(refresh_btn)
         lcol.addLayout(btn_row)
@@ -1839,6 +1873,16 @@ class KnowledgeGapsPanel(QWidget):
             "broad it is, so a whole-disease gap pulls more cards than a "
             "one-fact gap, and each gap's matches are tagged under its own tag."
         )
+        # The generation-side twin of bulk search, and its peer in the menu:
+        # same "size the whole selection, then run it once" shape, except it
+        # WRITES the cards instead of finding them.
+        mass = menu.addAction(f"⚡ Mass AI Create {label}…",
+                              lambda: self._mass_create(ids))
+        mass.setToolTip(
+            "Generate cards for all of these in one run. Each gap is read for how "
+            "broad it is, you set how many cards it's worth, and the whole batch "
+            "is reviewed together before anything is added."
+        )
         menu.addAction(f"Send {label} to Create",
                        lambda: self._bulk_send_to_create(ids))
         menu.addAction(f"Send {label} to Browse",
@@ -1896,6 +1940,24 @@ class KnowledgeGapsPanel(QWidget):
             return
         open_bulk_search(kgs, parent=self.window())
 
+    def _mass_create(self, ids: list[str]) -> None:
+        """Open the mass-create dialog on this selection. Deliberately does NOT
+        touch the Create queue: this is a terminal path (plan → generate →
+        review → done), and queueing the same gaps as well would leave them
+        waiting to be generated a second time. "Send to Create" is still there
+        for the one-at-a-time flow."""
+        try:
+            from .kg.mass_create import open_mass_create
+        except Exception as e:
+            print(f"[ankisstant] mass create unavailable: {e}")
+            showWarning(f"Couldn't open Mass AI Create:\n\n{e}")
+            return
+        kgs = [kg for kg in (kg_store.get(i) for i in ids) if kg]
+        if not kgs:
+            tooltip("Those gaps are no longer in the list.")
+            return
+        open_mass_create(kgs, parent=self.window())
+
     def _mark_in_progress(self, ids: list[str]) -> None:
         """A gap that's been handed to a tool is no longer untouched. Only Open
         gaps move — sending a Done one somewhere doesn't reopen it."""
@@ -1908,8 +1970,8 @@ class KnowledgeGapsPanel(QWidget):
                 print(f"[ankisstant] couldn't mark {kid} in progress: {e}")
 
     def _bulk_send_to_create(self, ids: list[str]) -> None:
-        main = self.window()
-        if not hasattr(main, "gap_queue"):
+        main = _queue_owner(self)
+        if main is None:
             showWarning("Open the KG page from Tools → Ankisstant first.")
             return
         sent: list[str] = []
@@ -1949,8 +2011,8 @@ class KnowledgeGapsPanel(QWidget):
         self.refresh_list()
 
     def _bulk_send_to_browse(self, ids: list[str]) -> None:
-        main = self.window()
-        if not hasattr(main, "browse_queue"):
+        main = _queue_owner(self)
+        if main is None or not hasattr(main, "browse_queue"):
             showWarning("Open the KG page from Tools → Ankisstant first.")
             return
         existing = {q.get("id") for q in main.browse_queue if isinstance(q, dict)}
@@ -1984,6 +2046,17 @@ class KnowledgeGapsPanel(QWidget):
         dlg = AddKGDialog(self)
         if dlg.exec():
             self.refresh_list()
+
+    def _on_kg_from_chat(self) -> None:
+        """Condense SynapsePro's latest chat answer into gaps.
+
+        Asynchronous and non-modal — the panel stays usable while the AI
+        thinks, and ``capture_last_turn`` disables the button for the duration
+        so a second click can't queue a duplicate request. The list is
+        refreshed by the capture itself via ``_refresh_open_panel``.
+        """
+        from ..core import synapse_chat
+        synapse_chat.capture_last_turn(self._chat_btn)
 
     def _on_bulk_import(self) -> None:
         dlg = _BulkImportDialog(self)
