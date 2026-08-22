@@ -336,6 +336,10 @@ _BARE_BOX = re.compile(r"^\s*\[([ xX~-])\]\s*(.*)$")
 # is a label, and "**Mirizzi** syndrome" as a KG name is noise the tag builder
 # then has to clean out again.
 _EMPH = re.compile(r"(\*\*|__|\*|_|`)")
+# A blockquote is never a to-do. Exports use it to carry a gap's own context
+# under its heading, and without this rule each of those lines came back as a
+# phantom gap titled with the note.
+_QUOTE = re.compile(r"^\s*>\s?(.*)$")
 _LINK = re.compile(r"\[([^\]]+)\]\([^)]*\)")
 
 
@@ -428,6 +432,15 @@ def parse_markdown(text: str) -> list[dict]:
         if not raw.strip():
             if current is not None:
                 current["_notes"].append("")
+            continue
+
+        quote = _QUOTE.match(raw)
+        if quote:
+            # Context for whatever it sits under: the current item's notes, or
+            # dropped when it belongs to a heading (the heading became a group,
+            # and a group has nowhere to keep prose).
+            if current is not None:
+                current["_notes"].append(quote.group(1))
             continue
 
         head = _HEADING.match(raw)

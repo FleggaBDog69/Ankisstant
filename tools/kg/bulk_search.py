@@ -544,6 +544,17 @@ class BulkSearchDialog(QDialog):
         for _wgt in (self._written_lbl, self._gen_approve_all,
                      self._gen_reject_all):
             _wgt.setVisible(False)
+        ctl.addSpacing(14)
+        # Always there, whatever the provider is — the whole point of this
+        # button is the people who don't generate cards in here at all.
+        self._copy_btn = QPushButton("⧉ Copy uncovered points…")
+        self._copy_btn.setAutoDefault(False)
+        self._copy_btn.setToolTip(
+            "Take the points your deck turned out NOT to cover somewhere "
+            "else — your own card maker, a chatbot, or back into Things. "
+            "That list cost a search and a relevance pass to produce.")
+        self._copy_btn.clicked.connect(self._copy_menu)
+        ctl.addWidget(self._copy_btn)
         ctl.addStretch(1)
         self._sel_lbl = QLabel("")
         self._sel_lbl.setStyleSheet("color: gray; font-size: 11px;")
@@ -1869,6 +1880,135 @@ class BulkSearchDialog(QDialog):
                   "topic": m.point.topic}
                  for m in missing]))
         return out
+
+    # ── taking the uncovered points elsewhere ───────────────────────────────
+
+    def _copy_menu(self) -> None:
+        """Hand the residue to whatever tool the user actually writes cards in.
+
+        Not everyone generates cards in here. Some people use a different
+        creator add-on, a Custom GPT, or write them by hand — and for them the
+        valuable output of this screen is not the cards, it is the LIST: the
+        points their own deck turned out not to cover. That list took a search
+        and a judge pass to produce and there was no way to get it out.
+        """
+        payload = self._create_payload()
+        if not payload:
+            tooltip("Nothing uncovered — every point has a card ticked under it.",
+                    period=4000)
+            return
+        n_gaps = len(payload)
+        n_pts = sum(len(r.get("mass_points") or []) for r in payload)
+        menu = QMenu(self)
+        a1 = menu.addAction(f"Copy {n_pts} point(s) as a list")
+        a1.setToolTip("Plain text, grouped by gap, with each gap's notes. For "
+                      "pasting into your own card maker.")
+        a1.triggered.connect(lambda: self._copy_uncovered("points"))
+        a2 = menu.addAction(f"Copy the full prompt for {n_gaps} gap(s)")
+        a2.setToolTip("Exactly what Ankisstant would send its own AI, "
+                      "instructions and all. Paste it into any chatbot.")
+        a2.triggered.connect(lambda: self._copy_uncovered("prompt"))
+        a3 = menu.addAction("Copy as markdown checklist")
+        a3.setToolTip(
+            "One '- [ ]' per point, under a heading per gap — the shape Bulk "
+            "import reads back, and the shape Things and most outliners paste "
+            "into. Re-importing turns each POINT into its own gap, so the "
+            "parent gap's notes don't survive that round trip.")
+        a3.triggered.connect(lambda: self._copy_uncovered("markdown"))
+        menu.exec(self._copy_btn.mapToGlobal(self._copy_btn.rect().bottomLeft()))
+
+    def _copy_uncovered(self, kind: str) -> None:
+        payload = self._create_payload()
+        if not payload:
+            return
+        if kind == "prompt":
+            text = self._uncovered_as_prompt(payload)
+            if not text:
+                showWarning(
+                    "Couldn't build the prompt — that needs a notetype profile "
+                    "so the instructions match the card format. Pick one on the "
+                    "plan page, or copy the points as a list instead.")
+                return
+        else:
+            text = self._uncovered_as_text(payload, markdown=(kind == "markdown"))
+        try:
+            QApplication.clipboard().setText(text)
+        except Exception as e:
+            log.error(f"work through: clipboard write failed: {e}")
+            showWarning(f"Couldn't copy that: {e}")
+            return
+        n_pts = sum(len(r.get("mass_points") or []) for r in payload)
+        tooltip(f"Copied {n_pts} uncovered point(s) from {len(payload)} gap(s).",
+                period=4000)
+
+    def _uncovered_as_text(self, payload: list, *, markdown: bool) -> str:
+        """The residue as text. The gap's own notes ride along, because a point
+        read out of context is often not enough to write a card from."""
+        out: list[str] = []
+        for rec in payload:
+            title = str(rec.get("title") or "(untitled)")
+            out.append(f"## {title}" if markdown else title.upper())
+            concept = str(rec.get("concept") or "").strip()
+            if concept and concept != title:
+                # Blockquote, not italics: the markdown shape has to read back
+                # through Bulk import as the SAME gaps, and an unindented plain
+                # line there is a gap of its own.
+                out.append(f"> _{concept}_" if markdown else f"  ({concept})")
+            notes = str(rec.get("notes") or "").strip()
+            if notes:
+                # create_record_for appends the missing-points prose to notes
+                # for the generator; strip it here or every gap repeats its own
+                # point list twice.
+                cut = notes.find("My deck has no card for these parts")
+                if cut > 0:
+                    notes = notes[:cut].strip()
+                elif cut == 0:
+                    notes = ""
+                if notes:
+                    out.append(("> " if markdown else "  notes: ")
+                               + notes.replace("\n",
+                                               "\n> " if markdown else "\n  "))
+            for pt in (rec.get("mass_points") or []):
+                out.append(f"- [ ] {pt}" if markdown else f"  - {pt}")
+            out.append("")
+        return "\n".join(out).strip() + "\n"
+
+    def _uncovered_as_prompt(self, payload: list) -> str:
+        """The real generation request, assembled but not sent.
+
+        Built through gen_prompt, not a second prompt written for this button —
+        a copy that drifts from what the add-on actually sends is worse than no
+        copy at all, because it looks authoritative."""
+        notetype_name = (self._notetype.currentText().strip()
+                         if self._notetype is not None else "")
+        if not notetype_name:
+            return ""
+        from . import gen_prompt
+        blocks: list[str] = []
+        for rec in payload:
+            plan = kg_triage.plan_from_queued_gap(rec)
+            if plan is None:
+                continue
+            try:
+                req = gen_prompt.build_generation_request(
+                    kg=rec, plan=plan,
+                    profile=gen_prompt._profile_for(tool_config("card_creator"),
+                                                    notetype_name),
+                    cfg=tool_config("card_creator"))
+            except Exception as e:
+                log.warn(f"work through: couldn't build prompt for "
+                         f"{rec.get('title')!r}: {e}")
+                continue
+            blocks.append(
+                f"===== {rec.get('title') or 'gap'} =====\n\n"
+                f"[SYSTEM INSTRUCTIONS]\n{req.get('system_prompt', '')}\n\n"
+                f"[YOUR TASK]\n{req.get('user_msg', '')}")
+        if not blocks:
+            return ""
+        head = (f"{len(blocks)} gap(s) your deck didn't cover. Each block below "
+                "is one independent request — run them one at a time and keep "
+                "the replies separate.\n\n") if len(blocks) > 1 else ""
+        return head + "\n\n\n".join(blocks) + "\n"
 
     # ── writing the missing cards, into the bottom of this same screen ───────
 
