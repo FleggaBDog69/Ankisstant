@@ -143,6 +143,20 @@ def _normalise(item: dict) -> dict:
         tp = _default_type_for_source(out["source"])
     out["type"] = tp
 
+    # Group — free-text label naming the batch this gap belongs to ("SRS 4",
+    # "Week 3", "Cardio revision"). Blank means ungrouped.
+    #
+    # A TOP-LEVEL key rather than an entry in `fields`, deliberately: fields are
+    # per-type content, and a group has to be filterable, sortable and
+    # bulk-assignable across every type at once. It's also a third axis, not a
+    # rename of an existing one — status is how far along a gap is, type is what
+    # kind of thing it is, group is which batch of work it came in with.
+    #
+    # There is no managed list of group objects. The set of live groups is
+    # derived (see groups() below), because a managed list means a second CRUD
+    # screen to maintain and the entire point here is less management.
+    out["group"] = str(out.get("group") or "").strip()
+
     tags = out.get("tags") or []
     out["tags"] = [str(t).strip() for t in tags if str(t).strip()]
 
@@ -194,6 +208,63 @@ def field(kg: dict, key: str, default: str = "") -> str:
         # Backward-compat: legacy entries that haven't been normalised yet.
         val = kg.get(key, default)
     return val if val is not None else default
+
+
+# ── groups ───────────────────────────────────────────────────────────────────
+
+def group_sort_key(name: str):
+    """Sort groups the way a human reads them: SRS 2 before SRS 12.
+
+    A plain alphabetical sort puts "SRS 12" above "SRS 2", which is wrong
+    everywhere a group is shown. Splitting digit runs out and comparing them
+    numerically fixes it without needing the labels to follow any scheme."""
+    import re as _re
+    parts = _re.split(r"(\d+)", (name or "").strip().lower())
+    return [(1, int(p)) if p.isdigit() else (0, p) for p in parts if p != ""]
+
+
+def groups(items: list[dict] | None = None) -> list[str]:
+    """Every group in use, naturally sorted. Derived, never stored — deleting
+    the last gap in a group is how a group stops existing."""
+    src = items if items is not None else load_all()
+    names = {str(it.get("group") or "").strip()
+             for it in src if isinstance(it, dict)}
+    names.discard("")
+    return sorted(names, key=group_sort_key)
+
+
+def in_group(name: str, items: list[dict] | None = None) -> list[dict]:
+    """Every KG in `name`. Pass name="" for the ungrouped ones."""
+    src = items if items is not None else load_all()
+    want = (name or "").strip()
+    return [it for it in src
+            if isinstance(it, dict) and str(it.get("group") or "").strip() == want]
+
+
+def set_group(item_ids: list[str], name: str) -> int:
+    """Assign (or, with name="", clear) the group on many KGs in one pass.
+
+    One load/save for the whole selection: update() re-reads and re-writes the
+    file per call, which is 40 full rewrites when you group a term's worth of
+    LOs. Returns how many actually changed."""
+    want = (name or "").strip()
+    wanted = set(item_ids or [])
+    if not wanted:
+        return 0
+    items = load_all()
+    changed = 0
+    for i, it in enumerate(items):
+        if it.get("id") not in wanted:
+            continue
+        if str(it.get("group") or "").strip() == want:
+            continue
+        merged = dict(it)
+        merged["group"] = want
+        items[i] = _normalise(merged)
+        changed += 1
+    if changed:
+        save_all(items)
+    return changed
 
 
 # ── CRUD ─────────────────────────────────────────────────────────────────────

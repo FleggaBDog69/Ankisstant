@@ -727,7 +727,8 @@ class BulkSearchDialog(QDialog):
         for m in ordered:
             try:
                 tag = autotag.tag_from_levels(m.point.tag_levels,
-                                              kg_type_key=plan.kg_type)
+                                              kg_type_key=plan.kg_type,
+                                              group=plan.group)
             except Exception as e:
                 log.warn(f"bulk search: tag_from_levels failed: {e}")
                 tag = ""
@@ -1033,6 +1034,7 @@ class BulkSearchDialog(QDialog):
                 "explanation": kg_store.field(kg, "explanation") or "",
                 "images":      list((kg.get("fields") or {}).get("images") or []),
                 "kg_type":     (kg.get("type") or "").lower(),
+                "group":       str(kg.get("group") or "").strip(),
                 "tags":        [t for t in (kg.get("tags") or []) if t],
                 # Structured copy of the same thing, for when Create learns to
                 # generate one card per uncovered point.

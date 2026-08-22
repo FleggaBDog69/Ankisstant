@@ -146,6 +146,10 @@ class KGPlan:
     kg_id: str
     title: str                       # the KG's raw title, untouched
     kg_type: str = "kg"              # the KG's type key — the tag's type segment
+    # The KG's group label ("SRS 4"), carried so every tag this plan produces
+    # lands in the group's branch. Raw label, not a segment — autotag.group_segment
+    # does the normalising, in one place.
+    group: str = ""
     concept: str = ""                # the cleaned reading of it
     scope: str = DEFAULT_SCOPE
     cards: int = 0                   # per-KG card target (user-editable)
@@ -566,6 +570,7 @@ def _plan_from_obj(obj: dict, kg: dict, *,
         kg_id=kg_id,
         title=title,
         kg_type=str(kg.get("type") or "kg").strip().lower() or "kg",
+        group=str(kg.get("group") or "").strip(),
         concept=str(obj.get("concept") or "").strip() or title,
         scope=scope,
         breadth=breadth,
@@ -653,6 +658,7 @@ def parse_reply(reply, kgs: list[dict], *,
             plans.append(KGPlan(
                 kg_id=str(kg.get("id") or ""), title=title,
                 kg_type=str(kg.get("type") or "kg").strip().lower() or "kg",
+                group=str(kg.get("group") or "").strip(),
                 concept=title,
                 breadth=(_clean_breadth(lock["breadth"]) if (creating and lock.get("breadth"))
                          else DEFAULT_BREADTH),
@@ -810,6 +816,25 @@ def triage_create(kgs: list[dict], *, model: str | None = None,
     return plans
 
 
+def _group_for_queued(gap: dict, kg_id: str) -> str:
+    """The group for a gap that came off a queue.
+
+    Queue entries are snapshots, so the group is read back from the store when
+    the snapshot doesn't carry one — a gap queued before it was grouped should
+    still tag into its group when it's finally generated. Silent on failure:
+    no group is a worse outcome than no cards."""
+    snap = str(gap.get("group") or "").strip()
+    if snap or not kg_id:
+        return snap
+    try:
+        from . import store as kg_store
+        kg = kg_store.get(kg_id)
+        return str((kg or {}).get("group") or "").strip()
+    except Exception as e:
+        log.warn(f"triage: group lookup failed for {kg_id}: {e}")
+        return ""
+
+
 def plan_from_queued_gap(gap: dict) -> KGPlan | None:
     """Rebuild a KGPlan from a queued gap that already carries `points` and
     `target_cards`, with no AI call.
@@ -867,6 +892,7 @@ def plan_from_queued_gap(gap: dict) -> KGPlan | None:
         kg_id=kg_id,
         title=title,
         kg_type=str(gap.get("kg_type") or gap.get("type") or "kg").strip().lower() or "kg",
+        group=_group_for_queued(gap, kg_id),
         concept=str(gap.get("concept") or "").strip() or title,
         breadth=breadth,
         depth_band=breadth_meta(breadth)["band"],

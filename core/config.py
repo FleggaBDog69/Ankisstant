@@ -268,7 +268,17 @@ DEFAULTS: dict = {
             # Cards from Create or Browse therefore sit together under
             # <base>::MQ / <base>::KG, distinguished by type, not by tool.
             "auto_tag_base": "!Ankisstant",
+            # {group} is optional and not in the default template: existing
+            # users have their template saved verbatim, so instead of rewriting
+            # it, format_hierarchical_tag injects the slot after {type} when a
+            # gap actually has a group. Naming {group} here yourself overrides
+            # that and puts it exactly where you want.
             "tag_scheme_template": "{base}::{type}::{system}::{subsystem}::{topic}",
+            # Two-line list rows: title, then the start of the gap's notes.
+            "show_notes_in_list": True,
+            # Group headers the user has collapsed on the KG page. Derived UI
+            # state, written by the page rather than the settings screen.
+            "collapsed_groups": [],
             # Configurable list of KG types. Each item:
             #   key         — stable id (slug); used by KG entries
             #   name        — display label
@@ -951,14 +961,45 @@ def tool_model_for(tool_key: str, family: str | None = None, *,
 _DEFAULT_TAG_TEMPLATE = "{base}::{type}::{system}::{subsystem}::{topic}"
 
 
+def _template_with_group(template: str) -> str:
+    """Ensure `template` has a {group} slot, inserting one if it doesn't.
+
+    Existing users have their rendered template saved in meta.json — the
+    default predates groups and reads
+    `{base}::{type}::{system}::{subsystem}::{topic}`. Rewriting a saved setting
+    underneath someone is not on, so instead a template that omits {group} gets
+    the slot injected here, immediately after {type} (or after {base} when the
+    template has no type segment).
+
+    That position is the whole point of the feature: the group sits ABOVE the
+    content hierarchy, so one group is one contiguous branch of the sidebar
+    holding every system it touches — not a leaf scattered under each of them.
+
+    A template that already names {group} is left exactly as written; that is
+    the escape hatch for anyone who wants it somewhere else.
+    """
+    if "{group}" in template:
+        return template
+    for anchor in ("{type}", "{base}", "{prefix}"):
+        if anchor in template:
+            return template.replace(anchor, anchor + "::{group}", 1)
+    return template
+
+
 def format_hierarchical_tag(prefix: str, levels: dict, template: str | None = None,
-                            type_seg: str = "") -> str:
-    """Render a hierarchical Anki tag from a base prefix, a type segment, and
-    {system, subsystem, topic} levels, using `template` (defaults to the shared
-    knowledge_gaps tag_scheme_template). Empty placeholders collapse away and
-    each level is sanitised (no spaces/'::'/slashes). `prefix` fills both {base}
-    and the legacy {prefix} alias. Shared by Create and Browse so the one tag
-    scheme stays consistent."""
+                            type_seg: str = "", group_seg: str = "") -> str:
+    """Render a hierarchical Anki tag from a base prefix, a type segment, an
+    optional group segment, and {system, subsystem, topic} levels, using
+    `template` (defaults to the shared knowledge_gaps tag_scheme_template).
+    Empty placeholders collapse away and each level is sanitised (no
+    spaces/'::'/slashes). `prefix` fills both {base} and the legacy {prefix}
+    alias. Shared by Create and Browse so the one tag scheme stays consistent.
+
+    `group_seg` defaults to "" and collapses away exactly like any other empty
+    level, so every pre-group caller renders a byte-identical tag. It is the one
+    segment allowed to contain '::' internally ("SRS::04" is two levels by
+    design), so it is sanitised more gently than the rest — see
+    autotag.group_segment, which is what builds it."""
     import re as _re
     if template is None:
         try:
@@ -966,13 +1007,19 @@ def format_hierarchical_tag(prefix: str, levels: dict, template: str | None = No
                         or _DEFAULT_TAG_TEMPLATE)
         except Exception:
             template = _DEFAULT_TAG_TEMPLATE
+    if group_seg:
+        template = _template_with_group(template)
     levels = levels or {}
     sanitise = lambda s: _re.sub(r"[\s/]+", "_", _re.sub(r":+", "_", str(s))).strip("_")
+    # The group keeps its '::' (it is deliberately multi-level) but is otherwise
+    # cleaned the same way.
+    group_safe = _re.sub(r"[\s/]+", "_", str(group_seg or "")).strip("_:")
     base = (prefix or "").strip().strip("_")
     safe = {
         "base":      base,
         "prefix":    base,  # back-compat alias for templates still using {prefix}
         "type":      sanitise(type_seg),
+        "group":     group_safe,
         "system":    sanitise(levels.get("system", "")),
         "subsystem": sanitise(levels.get("subsystem", "")),
         "topic":     sanitise(levels.get("topic", "")),
@@ -980,8 +1027,9 @@ def format_hierarchical_tag(prefix: str, levels: dict, template: str | None = No
     try:
         rendered = template.format(**safe)
     except (KeyError, IndexError):
-        rendered = "::".join(p for p in (safe["base"], safe["type"], safe["system"],
-                                         safe["subsystem"], safe["topic"]) if p)
+        rendered = "::".join(p for p in (safe["base"], safe["type"], safe["group"],
+                                         safe["system"], safe["subsystem"],
+                                         safe["topic"]) if p)
     return _re.sub(r":{3,}", "::", rendered).strip(":")
 
 

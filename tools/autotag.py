@@ -171,12 +171,82 @@ def classify(material: str, *, model: str | None = None) -> dict | None:
     return resp if isinstance(resp, dict) else None
 
 
+# ── Group segment ────────────────────────────────────────────────────────────
+# A KG's group ("SRS 4") contributes ONE segment to its tag. This is the piece
+# with a real judgement call in it, so the rule is written down and shown to the
+# user live ("will tag as: SRS::04") rather than being discovered after 200 gaps
+# have been tagged.
+
+import re as _re
+
+_TRAILING_NUM_RE = _re.compile(r"^(.*?)[\s_\-:]*(\d+)$")
+
+
+def group_segment(name: str) -> str:
+    """Turn a free-text group label into its tag segment.
+
+        SRS 4            -> SRS::04     trailing integer splits off, pads to 2
+        SRS 12           -> SRS::12
+        Week 3           -> Week::03
+        Cardio revision  -> Cardio_revision   no trailing number, one segment
+        SRS::04          -> SRS::04     already tag-shaped, passed through
+        SRS 100          -> SRS::100    two-digit padding only
+
+    The zero-padding is the entire reason this function exists: Anki's sidebar
+    sorts tags as strings, so without it "SRS::12" sorts above "SRS::4" and a
+    term's worth of groups reads in the wrong order. Padding to two digits gets
+    the common case (1–99) right; beyond that the numbers are already the same
+    width as each other.
+
+    A label that already contains '::' is taken as deliberate and passed through
+    untouched (bar whitespace cleanup) — the escape hatch for anyone whose
+    scheme this guess doesn't fit."""
+    label = (name or "").strip()
+    if not label:
+        return ""
+    clean = lambda s: _re.sub(r"[\s/]+", "_", s).strip("_")
+    if "::" in label:
+        parts = [clean(p) for p in label.split("::")]
+        return "::".join(p for p in parts if p)
+    m = _TRAILING_NUM_RE.match(label)
+    if not m:
+        return clean(label)
+    head, num = m.group(1).strip(), m.group(2)
+    padded = num.zfill(2)
+    if not head:
+        return padded              # the label is just a number ("4" -> "04")
+    return f"{clean(head)}::{padded}"
+
+
+def group_tag_prefix(group: str) -> str:
+    """The tag branch a group's cards live under, as an Anki search pattern.
+
+    A group spans types — an SRS batch holds MQ, KG and LO gaps alike — and the
+    type segment sits above the group in the tag, so there is no single literal
+    prefix covering all of them. The '*' is doing real work here:
+
+        !!Fleg::*::SRS::04
+
+    Feed it to matcher.scope_query("tag", ...) to get a scope query. Returns ''
+    when there's no base or no group, which every caller treats as no scope."""
+    base = auto_tag_base()
+    seg = group_segment(group)
+    if not base or not seg:
+        return ""
+    return f"{base.rstrip(':')}::*::{seg}"
+
+
 def tag_from_levels(levels: dict | None, kg_type_key: str | None = None,
-                    type_meta: dict | None = None) -> str:
+                    type_meta: dict | None = None, group: str = "") -> str:
     """Format {system, subsystem, topic} levels into the shared hierarchical tag
-    under the configured base + the KG type's segment. Returns '' when unusable
-    (no base, no levels, or it collapses to just the base). Pass either a type
-    key OR the resolved type_meta dict."""
+    under the configured base + the KG type's segment + (optionally) the KG's
+    group segment. Returns '' when unusable (no base, no levels, or it collapses
+    to just the base). Pass either a type key OR the resolved type_meta dict.
+
+    `group` is the KG's raw group LABEL ("SRS 4"), not a segment — the
+    normalisation lives in group_segment() so every caller gets the same answer.
+    Default '' renders exactly what this function rendered before groups
+    existed."""
     base = auto_tag_base()
     if not base or not levels:
         return ""
@@ -184,7 +254,8 @@ def tag_from_levels(levels: dict | None, kg_type_key: str | None = None,
         type_seg = type_meta.get("name") or type_meta.get("key") or ""
     else:
         type_seg, _enabled = kg_type_info((kg_type_key or default_type_key()))
-    tag = format_hierarchical_tag(base, levels, type_seg=type_seg)
+    tag = format_hierarchical_tag(base, levels, type_seg=type_seg,
+                                  group_seg=group_segment(group))
     if not tag or tag == base:
         return ""
     return tag

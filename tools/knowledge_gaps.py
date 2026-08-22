@@ -14,25 +14,31 @@
 from __future__ import annotations
 
 import html as _html
+import re
 from typing import Callable
 
 from aqt import mw
 from aqt.qt import (
-    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QFileDialog, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QInputDialog,
-    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QPlainTextEdit,
-    QPushButton, QScrollArea, QSizePolicy, QSplitter, Qt, QTextEdit,
-    QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
+    QDialogButtonBox, QFileDialog, QFont, QFontMetrics, QFrame, QGridLayout,
+    QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
+    QColor, QListWidgetItem, QMenu, QPlainTextEdit, QPushButton, QRect,
+    QScrollArea,
+    QSizePolicy, QSplitter, QStyle, QStyledItemDelegate, QStyleOptionViewItem,
+    Qt, QTextEdit, QTimer, QVBoxLayout, QWidget,
 )
 from aqt.utils import askUser, showWarning, tooltip
 
 from ..core import anki_utils
-from ..core.config import active_family, tool_config, tool_model_for
+from ..core.config import (
+    active_family, save_tool_config, tool_config, tool_model_for,
+)
 from ..core.qt_utils import (
     attach_tag_completer, make_help_button, make_setup_banner,
     provider_configured, refresh_deck_browser, run_claude_json,
     set_ai_buttons_enabled, theme_dialog,
 )
+from . import autotag
 from .kg import store as kg_store
 
 
@@ -276,6 +282,215 @@ def open_add_kg_dialog() -> None:
 
 # ── KG list item ─────────────────────────────────────────────────────────────
 
+# ── group rows and two-line items ────────────────────────────────────────────
+# The list used to be one flat line per gap: title, type prefix, status suffix,
+# everything else buried in a tooltip. With a term's worth of PBL LOs in it
+# there was no way to see what a gap SAID, and no way to act on "all the ones
+# from this SRS" as a unit. Groups fix the second; the notes preview fixes the
+# first.
+#
+# Both are done with a delegate over the existing QListWidget rather than a
+# QTreeWidget rewrite: every selection, context-menu and refresh path already
+# works against QListWidget, and a header is just an item that isn't selectable.
+
+NO_GROUP = "(no group)"
+
+_HEADER_ROLE = Qt.ItemDataRole.UserRole + 1   # group name, on header rows
+_NOTES_ROLE = Qt.ItemDataRole.UserRole + 2    # notes preview, on gap rows
+
+
+def _notes_preview(kg: dict, limit: int = 110) -> str:
+    """The first line or so of a gap's notes, for the list's second row.
+
+    MQ gaps keep their content in stem_html rather than notes, so they fall back
+    to it — otherwise every captured missed question would show a blank second
+    line, which is the majority of the list for a QBank-heavy week."""
+    raw = kg_store.field(kg, "notes") or ""
+    if not str(raw).strip() and (kg.get("type") or "").lower() == "mq":
+        raw = kg_store.field(kg, "stem_html") or ""
+    text = _html.unescape(re.sub(r"<[^>]+>", " ", str(raw)))
+    text = " ".join(text.split())
+    if not text:
+        return ""
+    return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
+class _KGGroupHeader(QListWidgetItem):
+    """A non-selectable section row: `▸ SRS 4 · 12 gaps · 9 open`.
+
+    Enabled but not selectable, so it can still be right-clicked and clicked to
+    collapse while never entering `selectedItems()` — which is what keeps every
+    existing bulk action working untouched."""
+
+    def __init__(self, name: str, total: int, open_n: int, collapsed: bool):
+        super().__init__()
+        self.group_name = name
+        self.collapsed = collapsed
+        self.setData(_HEADER_ROLE, name)
+        self.setFlags(Qt.ItemFlag.ItemIsEnabled)
+        arrow = "▸" if collapsed else "▾"
+        label = name or NO_GROUP
+        bits = [f"{total} gap" + ("s" if total != 1 else "")]
+        if open_n:
+            bits.append(f"{open_n} open")
+        self.setText(f"{arrow}  {label}   ·   " + "   ·   ".join(bits))
+        self.setToolTip(
+            f"{label} — click to {'expand' if collapsed else 'collapse'}, "
+            "right-click for group actions."
+        )
+
+
+class _KGItemDelegate(QStyledItemDelegate):
+    """Draws group headers, and gaps that have a notes preview, as two lines.
+
+    A gap with no notes falls through to the default painter untouched, so the
+    common single-line row is byte-for-byte what it has always been — the new
+    drawing code can only affect rows that have something extra to show."""
+
+    _PAD = 4
+
+    def _sub_font(self, base: QFont) -> QFont:
+        f = QFont(base)
+        f.setPointSize(max(8, base.pointSize() - 2) if base.pointSize() > 0
+                       else f.pointSize())
+        return f
+
+    def sizeHint(self, option, index):
+        size = super().sizeHint(option, index)
+        if index.data(_HEADER_ROLE) is not None:
+            size.setHeight(size.height() + self._PAD * 2)
+        elif index.data(_NOTES_ROLE):
+            sub = QFontMetrics(self._sub_font(option.font))
+            size.setHeight(size.height() + sub.height())
+        return size
+
+    def paint(self, painter, option, index):
+        group = index.data(_HEADER_ROLE)
+        preview = index.data(_NOTES_ROLE)
+        if group is None and not preview:
+            super().paint(painter, option, index)
+            return
+
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        text = opt.text
+        opt.text = ""
+        widget = opt.widget
+        style = widget.style() if widget is not None else QApplication.style()
+        # Draw the row chrome (background, alternating colour, selection) with
+        # no text, then place the text by hand.
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, widget)
+
+        selected = bool(opt.state & QStyle.StateFlag.State_Selected)
+        fg = (opt.palette.highlightedText().color() if selected
+              else opt.palette.text().color())
+        custom = index.data(Qt.ItemDataRole.ForegroundRole)
+        if custom is not None and not selected:
+            try:
+                fg = custom.color()
+            except AttributeError:
+                pass
+
+        rect = opt.rect.adjusted(self._PAD + 2, 0, -self._PAD, 0)
+        painter.save()
+        if group is not None:
+            f = QFont(opt.font)
+            f.setBold(True)
+            painter.setFont(f)
+            painter.setPen(fg)
+            painter.drawText(rect, int(Qt.AlignmentFlag.AlignVCenter
+                                       | Qt.AlignmentFlag.AlignLeft), text)
+            painter.restore()
+            return
+
+        title_font = QFont(opt.font)
+        sub_font = self._sub_font(opt.font)
+        title_h = QFontMetrics(title_font).height()
+        sub_h = QFontMetrics(sub_font).height()
+        top = rect.top() + max(0, (rect.height() - title_h - sub_h) // 2)
+
+        painter.setFont(title_font)
+        painter.setPen(fg)
+        painter.drawText(QRect(rect.left(), top, rect.width(), title_h),
+                         int(Qt.AlignmentFlag.AlignVCenter
+                             | Qt.AlignmentFlag.AlignLeft),
+                         QFontMetrics(title_font).elidedText(
+                             text, Qt.TextElideMode.ElideRight, rect.width()))
+
+        sub_colour = QColor(fg)
+        sub_colour.setAlpha(150)
+        painter.setFont(sub_font)
+        painter.setPen(sub_colour)
+        painter.drawText(QRect(rect.left(), top + title_h, rect.width(), sub_h),
+                         int(Qt.AlignmentFlag.AlignVCenter
+                             | Qt.AlignmentFlag.AlignLeft),
+                         QFontMetrics(sub_font).elidedText(
+                             str(preview), Qt.TextElideMode.ElideRight,
+                             rect.width()))
+        painter.restore()
+
+
+class _GroupAssignDialog(QDialog):
+    """Pick (or type) the group for a selection. Blank means ungroup.
+
+    Shows the tag segment live, because the SRS 4 -> SRS::04 rule is a guess
+    about what you meant and you should see it before 40 gaps carry it."""
+
+    def __init__(self, existing: list[str], current: str = "", n: int = 1,
+                 parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Group knowledge gaps")
+        theme_dialog(self)
+        root = QVBoxLayout(self)
+        label = "1 gap" if n == 1 else f"{n} gaps"
+        head = QLabel(f"<b>Put {label} in a group</b>")
+        head.setTextFormat(Qt.TextFormat.RichText)
+        root.addWidget(head)
+        blurb = QLabel(
+            "A group is the batch a gap came in with — an SRS, a week, a "
+            "revision block. It's independent of type and status, and it adds "
+            "one level to the auto-tag so the whole batch is one branch of "
+            "your tag tree."
+        )
+        blurb.setStyleSheet("color: gray; font-size: 11px;")
+        blurb.setWordWrap(True)
+        root.addWidget(blurb)
+
+        self.combo = QComboBox()
+        self.combo.setEditable(True)
+        self.combo.addItem("")                       # blank = ungrouped
+        for g in existing:
+            self.combo.addItem(g)
+        self.combo.setCurrentText(current or "")
+        self.combo.editTextChanged.connect(self._refresh_hint)
+        root.addWidget(self.combo)
+
+        self._hint = QLabel("")
+        self._hint.setStyleSheet("color: gray; font-size: 11px;")
+        self._hint.setWordWrap(True)
+        root.addWidget(self._hint)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+        self._refresh_hint()
+        self.resize(420, self.sizeHint().height())
+
+    def _refresh_hint(self, *_a) -> None:
+        name = self.combo.currentText().strip()
+        if not name:
+            self._hint.setText("Leave blank to remove these gaps from their group.")
+            return
+        seg = autotag.group_segment(name)
+        self._hint.setText(f"Will tag as:  <code>{_html.escape(seg)}</code>")
+        self._hint.setTextFormat(Qt.TextFormat.RichText)
+
+    def value(self) -> str:
+        return self.combo.currentText().strip()
+
+
 class _KGListItem(QListWidgetItem):
     def __init__(self, kg: dict):
         super().__init__()
@@ -302,6 +517,15 @@ class _KGListItem(QListWidgetItem):
             text += "   · sent, in progress"
         self.setText(text)
 
+        # Second line, drawn by _KGItemDelegate. Empty means the row stays a
+        # single line, so nothing gets taller for gaps with nothing to show.
+        try:
+            show_notes = bool(tool_config("knowledge_gaps")
+                              .get("show_notes_in_list", True))
+        except Exception:
+            show_notes = True
+        self.setData(_NOTES_ROLE, _notes_preview(kg) if show_notes else "")
+
         # Grey done items so they stay visible but recede.
         if status == "done":
             brush = QBrush(QColor(150, 150, 150))
@@ -320,6 +544,9 @@ class _KGListItem(QListWidgetItem):
             f"Source: {source_label}",
             f"Status: {status_label}",
         ]
+        group = str(kg.get("group") or "").strip()
+        if group:
+            tt_lines.append(f"Group: {group}  →  {autotag.group_segment(group)}")
         levels = _format_levels(kg)
         if levels:
             tt_lines.append(f"Path: {levels}")
@@ -621,6 +848,18 @@ class KGDetailPane(QWidget):
         )
         meta_row.addWidget(self._dismissed)
         meta_row.addSpacing(8)
+        # Group. A button rather than a combo: it opens the same dialog the
+        # list's right-click uses, so there is exactly one place the SRS 4 ->
+        # SRS::04 rule is shown and exactly one code path that assigns.
+        self._group_btn = QPushButton("Group: —")
+        self._group_btn.setAutoDefault(False)
+        self._group_btn.setStyleSheet("font-size: 11px; padding: 2px 8px;")
+        self._group_btn.setToolTip(
+            "The batch this gap belongs to. Adds one level to its auto-tag."
+        )
+        self._group_btn.clicked.connect(self._on_group_clicked)
+        meta_row.addWidget(self._group_btn)
+        meta_row.addSpacing(8)
         self._source_lbl = QLabel("")
         self._source_lbl.setStyleSheet("color: gray; font-size: 11px;")
         meta_row.addWidget(self._source_lbl)
@@ -740,6 +979,7 @@ class KGDetailPane(QWidget):
         self._empty_lbl.setVisible(False)
 
         self._title_input.setText(kg.get("title", ""))
+        self._refresh_group_btn(kg)
 
         # Type combo — may have changed since panel was built. Block
         # signals during load so the auto-save handler doesn't fire on
@@ -800,7 +1040,8 @@ class KGDetailPane(QWidget):
 
     def _set_widgets_visible(self, visible: bool) -> None:
         for w in (self._title_input, self._type, self._source_lbl, self._status,
-                  self._dismissed, self._created_lbl, self._tags_input,
+                  self._dismissed, self._group_btn, self._created_lbl,
+                  self._tags_input,
                   self._schema_container, self._res_box, self._browse_btn,
                   self._create_btn, self._delete_btn, self._save_btn):
             w.setVisible(visible)
@@ -1212,6 +1453,26 @@ class KGDetailPane(QWidget):
         if ids:
             self._parent_panel._bulk_send_to_create(ids)
 
+    def _on_group_clicked(self) -> None:
+        self.flush()
+        ids = self._send_ids()
+        if ids:
+            self._parent_panel._assign_group(ids)
+
+    def _refresh_group_btn(self, kg: dict | None) -> None:
+        name = str((kg or {}).get("group") or "").strip()
+        if not name:
+            self._group_btn.setText("Group: —")
+            self._group_btn.setToolTip(
+                "Not in a group. Click to put it in one."
+            )
+            return
+        self._group_btn.setText(f"Group: {name}")
+        self._group_btn.setToolTip(
+            f"In “{name}” — tags as {autotag.group_segment(name)}. "
+            "Click to move or remove it."
+        )
+
 
 # ── Bulk import modal ──────────────────────────────────────────────────────────
 
@@ -1527,6 +1788,13 @@ class KnowledgeGapsPanel(QWidget):
         self._type_chip_row_holder = QHBoxLayout()
         root.addLayout(self._type_chip_row_holder)
         self._rebuild_type_chip_row()
+        # Groups row. Unlike types (a settings-managed list) groups are derived
+        # from the gaps themselves, so this rebuilds whenever the set of live
+        # groups changes — see refresh_list.
+        self._group_chip_row_holder = QHBoxLayout()
+        root.addLayout(self._group_chip_row_holder)
+        self._known_groups: list[str] = []
+        self._rebuild_group_chip_row()
         if self._filter in self._chip_buttons:
             self._chip_buttons[self._filter].setChecked(True)
         self._refresh_include_dismissed_visibility()
@@ -1549,6 +1817,8 @@ class KnowledgeGapsPanel(QWidget):
         self._list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._list.customContextMenuRequested.connect(self._on_list_context_menu)
         self._list.itemSelectionChanged.connect(self._on_select)
+        self._list.setItemDelegate(_KGItemDelegate(self._list))
+        self._list.itemClicked.connect(self._on_item_clicked)
         lcol.addWidget(self._list, 1)
         sel_hint = QLabel(
             "Shift/Cmd-click to select several, then right-click for bulk actions."
@@ -1762,6 +2032,8 @@ class KnowledgeGapsPanel(QWidget):
             return True
         if f.startswith("type:"):
             return kg.get("type", "kg") == f.split(":", 1)[1]
+        if f.startswith("group:"):
+            return str(kg.get("group") or "").strip() == f.split(":", 1)[1]
         return True
 
     def refresh_list(self, preserve_selection: str | None = None) -> None:
@@ -1789,14 +2061,31 @@ class KnowledgeGapsPanel(QWidget):
             if isinstance(sel, _KGListItem):
                 prev_id = sel.kg_id
 
+        # Keep the group chips in step with what actually exists. Rebuilt only
+        # when the set changes, and deferred a tick: refresh_list can be called
+        # FROM a chip's own clicked handler, and tearing that button down inside
+        # its own signal is a crash rather than a bug.
+        live_groups = kg_store.groups(items)
+        if live_groups != self._known_groups:
+            self._known_groups = live_groups
+            QTimer.singleShot(0, self._rebuild_group_chip_row)
+
+        collapsed = set(self._collapsed_groups())
         self._list.blockSignals(True)
         self._list.clear()
         target_row = -1
-        for i, kg in enumerate(visible):
-            li = _KGListItem(kg)
-            self._list.addItem(li)
-            if prev_id and kg.get("id") == prev_id:
-                target_row = i
+        for name, members in self._sections(visible):
+            is_collapsed = name in collapsed
+            open_n = sum(1 for k in members if k.get("status") == "open")
+            self._list.addItem(
+                _KGGroupHeader(name, len(members), open_n, is_collapsed))
+            if is_collapsed:
+                continue
+            for kg in members:
+                li = _KGListItem(kg)
+                self._list.addItem(li)
+                if prev_id and kg.get("id") == prev_id:
+                    target_row = self._list.count() - 1
         self._list.blockSignals(False)
 
         if target_row >= 0:
@@ -1807,10 +2096,247 @@ class KnowledgeGapsPanel(QWidget):
             li = self._list.item(target_row)
             if isinstance(li, _KGListItem):
                 self._detail.load(kg_store.get(li.kg_id))
-        elif visible:
-            self._list.setCurrentRow(0)
         else:
-            self._detail.load(None)
+            # Row 0 is a group header now, and headers aren't selectable — so
+            # fall to the first actual gap rather than to a row that can't take
+            # a selection (which would leave the detail pane blank).
+            first = next((i for i in range(self._list.count())
+                          if isinstance(self._list.item(i), _KGListItem)), -1)
+            if first >= 0:
+                self._list.setCurrentRow(first)
+            else:
+                self._detail.load(None)
+
+    # ── groups ───────────────────────────────────────────────────────────────
+
+    def _sections(self, visible: list[dict]) -> list[tuple[str, list[dict]]]:
+        """Split the visible gaps into (group name, members), groups first in
+        natural order and the ungrouped ones last.
+
+        Ungrouped last on purpose: they're the inbox — things not yet filed —
+        and burying the filed batches under a long unsorted pile is exactly the
+        problem groups exist to solve. Within a section the incoming order is
+        preserved, so the status/date sort from refresh_list still holds."""
+        buckets: dict[str, list[dict]] = {}
+        for kg in visible:
+            buckets.setdefault(str(kg.get("group") or "").strip(), []).append(kg)
+        named = sorted((g for g in buckets if g), key=kg_store.group_sort_key)
+        out = [(g, buckets[g]) for g in named]
+        if "" in buckets:
+            out.append(("", buckets[""]))
+        return out
+
+    def _collapsed_groups(self) -> list[str]:
+        try:
+            raw = tool_config("knowledge_gaps").get("collapsed_groups") or []
+            return [str(g) for g in raw]
+        except Exception:
+            return []
+
+    def _set_group_collapsed(self, name: str, collapsed: bool) -> None:
+        """Persist one group's collapse state.
+
+        Read-modify-write of the whole tool slice, the house pattern here — it
+        must never drop the other knowledge_gaps settings on the floor."""
+        try:
+            cfg = tool_config("knowledge_gaps")
+            current = [str(g) for g in (cfg.get("collapsed_groups") or [])]
+            if collapsed and name not in current:
+                current.append(name)
+            elif not collapsed and name in current:
+                current = [g for g in current if g != name]
+            cfg["collapsed_groups"] = current
+            save_tool_config("knowledge_gaps", cfg)
+        except Exception as e:
+            # A failed save costs the collapse state, not the click.
+            print(f"[ankisstant] couldn't save collapse state: {e}")
+
+    def _on_item_clicked(self, item) -> None:
+        if isinstance(item, _KGGroupHeader):
+            self._set_group_collapsed(item.group_name, not item.collapsed)
+            self.refresh_list()
+
+    def _rebuild_group_chip_row(self) -> None:
+        """Rebuild the group filter chips. Mirrors _rebuild_type_chip_row, with
+        the difference that the entries are derived from the gaps rather than
+        read from settings — so the row disappears entirely when nothing is
+        grouped, instead of showing an empty 'Groups:' label forever."""
+        for key in list(self._chip_buttons.keys()):
+            if key.startswith("group:"):
+                btn = self._chip_buttons.pop(key)
+                btn.setParent(None)
+                btn.deleteLater()
+        while self._group_chip_row_holder.count():
+            item = self._group_chip_row_holder.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        groups = self._known_groups
+        if not groups:
+            # Nothing grouped yet — and if the active filter was a group chip
+            # that has just stopped existing, fall back to All rather than
+            # showing an empty list with no way to tell why.
+            if self._filter.startswith("group:"):
+                self._set_filter("all")
+                if "all" in self._chip_buttons:
+                    self._chip_buttons["all"].setChecked(True)
+            return
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        prefix = QLabel("Groups:")
+        prefix.setStyleSheet("color: gray; font-size: 11px;")
+        wrapper = QWidget()
+        wrapper.setLayout(row)
+        row.addWidget(prefix)
+        for g in groups:
+            self._add_chip(row, (f"group:{g}", g))
+        row.addStretch(1)
+        self._group_chip_row_holder.addWidget(wrapper)
+        if self._filter in self._chip_buttons:
+            self._chip_buttons[self._filter].setChecked(True)
+
+    def _group_ids(self, name: str) -> list[str]:
+        """Every KG id in a group — the whole group, not just the rows the
+        current filter happens to be showing. A group action reading "12 gaps"
+        off the header must act on those 12."""
+        return [str(kg.get("id") or "")
+                for kg in kg_store.in_group(name) if kg.get("id")]
+
+    def _assign_group(self, ids: list[str]) -> None:
+        if not ids:
+            return
+        current = ""
+        if len(ids) == 1:
+            current = str((kg_store.get(ids[0]) or {}).get("group") or "")
+        else:
+            # Prefill only when the whole selection already agrees; offering one
+            # gap's group as the default for twelve would silently retag eleven.
+            groups = {str((kg_store.get(i) or {}).get("group") or "") for i in ids}
+            current = groups.pop() if len(groups) == 1 else ""
+        dlg = _GroupAssignDialog(kg_store.groups(), current=current,
+                                 n=len(ids), parent=self.window())
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        name = dlg.value()
+        changed = kg_store.set_group(ids, name)
+        if not changed:
+            tooltip("No change — they were already there.")
+            return
+        if name:
+            tooltip(f"{changed} gap(s) → {name}  ({autotag.group_segment(name)})")
+        else:
+            tooltip(f"{changed} gap(s) ungrouped.")
+        self.refresh_list()
+
+    def _retag_group(self, name: str) -> None:
+        """Recompute every KG's auto-tag in this group, previewing first.
+
+        Preview-first is not politeness: these gaps may already have cards
+        carrying the old tag, and the rename below moves those cards too. You
+        should see the list before it happens."""
+        members = [kg for kg in kg_store.in_group(name) if kg.get("id")]
+        if not members:
+            tooltip("That group is empty.")
+            return
+
+        changes: list[tuple[dict, str, str]] = []
+        skipped = 0
+        for kg in members:
+            levels = {k: kg_store.field(kg, k) for k in ("system", "subsystem", "topic")}
+            if not any(str(v).strip() for v in levels.values()):
+                skipped += 1        # never classified — nothing to build a tag from
+                continue
+            new = autotag.tag_from_levels(
+                levels, kg_type_key=(kg.get("type") or "kg"),
+                group=str(kg.get("group") or ""))
+            old = str(kg_store.field(kg, "auto_tag") or "").strip()
+            if new and new != old:
+                changes.append((kg, old, new))
+        if not changes:
+            showWarning(
+                f"Nothing to retag in “{name}”.\n\n"
+                + (f"{skipped} gap(s) have no system/subsystem/topic yet, so "
+                   "there's no tag to build — they get one the first time they "
+                   "go through Browse or Create."
+                   if skipped else "Every tag is already up to date."))
+            return
+
+        note_counts = self._note_counts([old for _kg, old, _new in changes if old])
+        lines = []
+        for kg, old, new in changes[:12]:
+            n = note_counts.get(old, 0)
+            moved = f"   [{n} card{'s' if n != 1 else ''}]" if n else ""
+            lines.append(f"• {(old or '(no tag yet)')}\n      →  {new}{moved}")
+        more = len(changes) - len(lines)
+        total_notes = sum(note_counts.get(old, 0) for _k, old, _n in changes)
+        body = (
+            f"Retag {len(changes)} gap(s) in “{name}”?\n\n"
+            + "\n".join(lines)
+            + (f"\n… and {more} more" if more > 0 else "")
+            + (f"\n\n{skipped} gap(s) skipped — not classified yet." if skipped else "")
+            + (f"\n\n{total_notes} existing card(s) carry the old tags and will be "
+               "moved to the new ones." if total_notes else
+               "\n\nNo existing cards carry these tags yet.")
+        )
+        if not askUser(body, defaultno=True, title="Retag group"):
+            return
+
+        for kg, old, new in changes:
+            fields = dict(kg.get("fields") or {})
+            fields["auto_tag"] = new
+            tags = [t for t in (kg.get("tags") or []) if t]
+            if old and old in tags:
+                tags = [new if t == old else t for t in tags]
+            kg_store.update(kg["id"], fields=fields, tags=tags)
+
+        moved = self._rename_note_tags([(old, new) for _kg, old, new in changes if old])
+        self.refresh_list()
+        tooltip(f"Retagged {len(changes)} gap(s)"
+                + (f" and moved {moved} card(s)." if moved else "."), period=3500)
+
+    def _note_counts(self, tags: list[str]) -> dict[str, int]:
+        """How many notes sit under each tag (including its subtree). Best
+        effort — the preview is more useful slightly wrong than absent."""
+        out: dict[str, int] = {}
+        try:
+            if mw is None or mw.col is None:
+                return out
+            for t in tags:
+                q = f'"tag:{t}" OR "tag:{t}::*"'
+                out[t] = len(mw.col.find_notes(q))
+        except Exception as e:
+            print(f"[ankisstant] tag count failed: {e}")
+        return out
+
+    def _rename_note_tags(self, pairs: list[tuple[str, str]]) -> int:
+        """Move existing notes from each old tag to its new one.
+
+        col.tags.rename moves a tag AND its subtree in one backend operation,
+        which is the only safe way to do this — looping note-by-note over tag
+        writes is what turns a retag into an out-of-memory crash."""
+        if not pairs:
+            return 0
+        try:
+            if mw is None or mw.col is None:
+                return 0
+            moved = 0
+            for old, new in pairs:
+                if not old or old == new:
+                    continue
+                try:
+                    res = mw.col.tags.rename(old, new)
+                    # Modern Anki returns OpChangesWithCount; older builds
+                    # returned a bare int. Both are handled rather than pinned
+                    # to whichever this profile happens to run.
+                    moved += int(getattr(res, "count", res) or 0)
+                except Exception as e:
+                    print(f"[ankisstant] tag rename {old} -> {new} failed: {e}")
+            if moved:
+                refresh_deck_browser()
+            return moved
+        except Exception as e:
+            print(f"[ankisstant] tag rename failed: {e}")
+            return 0
 
     def refresh_row(self, kg_id: str) -> None:
         """Re-render one list row from the store. Used after an autosave, where
@@ -1858,6 +2384,13 @@ class KnowledgeGapsPanel(QWidget):
         return ids
 
     def _on_list_context_menu(self, pos) -> None:
+        # A right-click on a group header is about the GROUP, not the selection
+        # (headers can't be selected, so the selection is whatever was clicked
+        # last and acting on it here would be indefensible).
+        clicked = self._list.itemAt(pos)
+        if isinstance(clicked, _KGGroupHeader):
+            self._on_group_context_menu(clicked, pos)
+            return
         ids = self._selected_ids()
         if not ids:
             return
@@ -1883,6 +2416,15 @@ class KnowledgeGapsPanel(QWidget):
             "broad it is, you set how many cards it's worth, and the whole batch "
             "is reviewed together before anything is added."
         )
+        menu.addSeparator()
+        grp = menu.addAction(f"Group {label}…",
+                             lambda: self._assign_group(ids))
+        grp.setToolTip(
+            "Put these in a named batch — an SRS, a week, a revision block. "
+            "The group adds one level to their auto-tag, so the whole batch "
+            "ends up as one branch of your tag tree."
+        )
+        menu.addSeparator()
         menu.addAction(f"Send {label} to Create",
                        lambda: self._bulk_send_to_create(ids))
         menu.addAction(f"Send {label} to Browse",
@@ -1899,6 +2441,45 @@ class KnowledgeGapsPanel(QWidget):
         menu.addSeparator()
         menu.addAction(f"Delete {label}…",
                        lambda: self._bulk_delete(ids))
+        menu.exec(self._list.mapToGlobal(pos))
+
+    def _on_group_context_menu(self, header, pos) -> None:
+        """Actions on a whole group. This is the point of groups — the batch is
+        the unit of work, so the tools that run on a batch are one click from
+        its header rather than requiring you to select twelve rows first."""
+        name = header.group_name
+        ids = self._group_ids(name)
+        label = name or NO_GROUP
+        n = len(ids)
+        menu = QMenu(self._list)
+        menu.addAction("Collapse" if not header.collapsed else "Expand",
+                       lambda: self._on_item_clicked(header))
+        menu.addSeparator()
+        if not ids:
+            menu.exec(self._list.mapToGlobal(pos))
+            return
+        menu.addAction(f"🔍 Bulk search {label} ({n})",
+                       lambda: self._bulk_search(ids))
+        menu.addAction(f"⚡ Mass AI Create {label} ({n})…",
+                       lambda: self._mass_create(ids))
+        menu.addSeparator()
+        menu.addAction(f"Send {label} to Create",
+                       lambda: self._bulk_send_to_create(ids))
+        menu.addAction(f"Send {label} to Browse",
+                       lambda: self._bulk_send_to_browse(ids))
+        menu.addSeparator()
+        menu.addAction(f"Regroup {label}…", lambda: self._assign_group(ids))
+        if name:
+            retag = menu.addAction(f"Retag {label}…",
+                                   lambda: self._retag_group(name))
+            retag.setToolTip(
+                "Rebuild every tag in this group so it carries the group "
+                "segment. Shows you what changes before writing, and moves any "
+                "cards already under the old tags."
+            )
+        menu.addSeparator()
+        menu.addAction(f"Mark {label} Done",
+                       lambda: self._bulk_set_status(ids, "done", dismissed=False))
         menu.exec(self._list.mapToGlobal(pos))
 
     def _bulk_set_status(self, ids: list[str], status: str, dismissed: bool) -> None:
@@ -1994,6 +2575,7 @@ class KnowledgeGapsPanel(QWidget):
                 "explanation": kg_store.field(kg, "explanation") or "",
                 "images":      list(images),
                 "kg_type":     (kg.get("type") or "").lower(),
+                "group":       str(kg.get("group") or "").strip(),
                 "tags":        [t for t in (kg.get("tags") or []) if t],
             })
             sent.append(kid)

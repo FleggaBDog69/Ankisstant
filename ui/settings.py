@@ -2319,6 +2319,18 @@ class _KnowledgeGapsTab(QWidget):
         self._confirm_on_delete.setChecked(bool(kg_cfg.get("confirm_on_delete", True)))
         form.addRow(self._confirm_on_delete)
 
+        self._show_notes_in_list = QCheckBox(
+            "Show a line of notes under each gap in the list")
+        self._show_notes_in_list.setToolTip(
+            "Two-line rows: the title, then the start of the gap's notes "
+            "(or, for captured missed questions, the stem). Gaps with no "
+            "notes stay a single line, so the list only grows where there's "
+            "something to read."
+        )
+        self._show_notes_in_list.setChecked(
+            bool(kg_cfg.get("show_notes_in_list", True)))
+        form.addRow(self._show_notes_in_list)
+
         self._default_type_on_add = QComboBox()
         self._rebuild_default_type_combo(
             str(kg_cfg.get("default_type_on_add") or "kg")
@@ -2537,6 +2549,7 @@ class _KnowledgeGapsTab(QWidget):
         return {
             "show_home_button":      self._show_home_button.isChecked(),
             "confirm_on_delete":     self._confirm_on_delete.isChecked(),
+            "show_notes_in_list":    self._show_notes_in_list.isChecked(),
             "default_status_on_add": "open",
             "default_type_on_add":   self._default_type_on_add.currentData() or "kg",
             "auto_tag_base":         self._auto_tag_base.text().strip(),

@@ -297,12 +297,38 @@ def _kg_type_meta(kg_type_key: str) -> dict | None:
     return None
 
 
+def _gap_group(gap: dict | None) -> str:
+    """The group label for a queued gap.
+
+    Queue entries are SNAPSHOTS taken when the gap was queued, so the group may
+    have been assigned (or changed) since — hence the store read, with the
+    snapshot's own value preferred when it has one. Returns '' for a manually
+    typed gap with no KG behind it, which tags exactly as it always did."""
+    if not gap:
+        return ""
+    snap = str(gap.get("group") or "").strip()
+    if snap:
+        return snap
+    kg_id = gap.get("kg_id") or gap.get("id")
+    if not kg_id:
+        return ""
+    try:
+        from .kg import store as kg_store
+        kg = kg_store.get(str(kg_id))
+        return str((kg or {}).get("group") or "").strip()
+    except Exception as e:
+        print(f"[ankisstant] group lookup failed for {kg_id}: {e}")
+        return ""
+
+
 def _apply_tag_levels(gap: dict, type_meta: dict, levels: dict) -> str:
     """Format {system, subsystem, topic} levels into the consolidated
-    {base}::{type}::… tag, cache it on the gap, and persist it to the KG store.
-    Whether to tag at all is the caller's call (the Auto-tag checkbox); this only
-    needs the type's name segment. Returns '' if unusable (no base/levels)."""
-    tag = autotag.tag_from_levels(levels, type_meta=type_meta)
+    {base}::{type}::[group]::… tag, cache it on the gap, and persist it to the
+    KG store. Whether to tag at all is the caller's call (the Auto-tag
+    checkbox); this only needs the type's name segment. Returns '' if unusable
+    (no base/levels)."""
+    tag = autotag.tag_from_levels(levels, type_meta=type_meta,
+                                  group=_gap_group(gap))
     if not tag:
         return ""
     gap["auto_tag"] = tag
@@ -320,14 +346,18 @@ def _apply_tag_levels(gap: dict, type_meta: dict, levels: dict) -> str:
     return tag
 
 
-def _topic_tag_from_levels(levels: dict, type_meta: dict | None) -> str:
-    """Build a {base}::{type}::… hierarchical tag from classification levels
-    for a NO-GAP generation (plain topic/source, or pasted cards). Uses the
-    given KG type's segment, falling back to the default type. Returns '' when
-    unusable (no base, no levels, or it collapses to just the base). Unlike
+def _topic_tag_from_levels(levels: dict, type_meta: dict | None,
+                           group: str = "") -> str:
+    """Build a {base}::{type}::[group]::… hierarchical tag from classification
+    levels for a NO-GAP generation (plain topic/source, or pasted cards). Uses
+    the given KG type's segment, falling back to the default type. Returns ''
+    when unusable (no base, no levels, or it collapses to just the base). Unlike
     _apply_tag_levels this has no gap to cache on, so it's a pure format. Thin
-    wrapper over the shared autotag formatter so Create and Browse agree."""
-    return autotag.tag_from_levels(levels, type_meta=type_meta)
+    wrapper over the shared autotag formatter so Create and Browse agree.
+
+    `group` is normally '' here — a no-gap generation has no KG and so no group.
+    Mass AI Create passes one when a whole batch is being written into a group."""
+    return autotag.tag_from_levels(levels, type_meta=type_meta, group=group)
 
 
 def _tag_material(gap: dict | None, topic_label: str | None,

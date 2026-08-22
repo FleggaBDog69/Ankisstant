@@ -234,6 +234,9 @@ class BrowsePanel(QWidget):
         self._linked_kg_images: list[str] = []
         self._linked_kg_stem_html: str = ""
         self._linked_kg_type: str = ""
+        # The linked KG's group label, so a tag built here lands in the same
+        # branch as one built by Create for the same gap.
+        self._linked_kg_group: str = ""
         # MQ KGs lead the appended content with the specific concept missed and
         # an AI-written explanation of it (above the stem/screenshot), matching
         # the Create flow. The explanation is folded into the search request.
@@ -254,6 +257,7 @@ class BrowsePanel(QWidget):
             fields_blob.get("stem_html") or kg.get("stem_html") or ""
         )
         self._linked_kg_type = (kg.get("type") or "").lower()
+        self._linked_kg_group = str(kg.get("group") or "").strip()
         self._linked_kg_concept = str(fields_blob.get("concept") or "").strip()
         self._linked_kg_explanation = str(fields_blob.get("explanation") or "").strip()
         # Carry the KG's tag over so "Tag & Unsuspend" reuses it. We're
@@ -887,7 +891,10 @@ class BrowsePanel(QWidget):
         routed = engine.route(reply, plan)
         terms = routed.terms if routed.terms else (reply if isinstance(reply, list) else None)
         if merge_tag and isinstance(routed.tag_levels, dict):
-            tag = autotag.tag_from_levels(routed.tag_levels, kg_type_key=kg_type_key)
+            tag = autotag.tag_from_levels(
+                routed.tag_levels, kg_type_key=kg_type_key,
+                group=(getattr(self, "_linked_kg_group", "")
+                       if getattr(self, "_linked_kg_id", None) else ""))
             if tag:
                 self.tag_input.setText(tag)
         if merge_explanation:
@@ -1594,6 +1601,7 @@ class BrowsePanel(QWidget):
             self._linked_kg_images = []
             self._linked_kg_stem_html = ""
             self._linked_kg_type = ""
+            self._linked_kg_group = ""
             # Advance the Browse queue (if this KG came from one).
             try:
                 self._advance_queue_after_done(done_id)
