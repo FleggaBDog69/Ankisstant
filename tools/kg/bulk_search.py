@@ -181,6 +181,7 @@ class BulkSearchDialog(QDialog):
         self._gen_groups: list = []          # mass_create._KGGroup, one per gap
         self._gen_active = False             # jobs still running
         self._gen_rendered = False           # the written cards are on screen
+        self._gen_phase = ""                 # "" | "writing" | "cards"
         self._applied = False
         self._poll = QTimer(self)
         self._poll.setInterval(750)
@@ -188,6 +189,11 @@ class BulkSearchDialog(QDialog):
 
         self._build()
         self._fill_plan_table()
+        if provider_configured() and not is_manual_provider():
+            self._set_status(
+                "Nothing has been sent to the AI yet. Edit any gap's notes "
+                "first — they're the biggest thing the read goes on — then "
+                "press Read gaps with AI.")
         theme_dialog(self)
 
     # ── construction ─────────────────────────────────────────────────────────
@@ -446,7 +452,7 @@ class BulkSearchDialog(QDialog):
         th.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         th.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
         th.setStretchLastSection(False)
-        self._tree.setColumnWidth(1, 170)
+        self._tree.setColumnWidth(1, 210)
         self._tree.setTextElideMode(Qt.TextElideMode.ElideRight)
         self._tree.itemChanged.connect(self._on_tree_item_changed)
         self._tree.itemDoubleClicked.connect(self._on_tree_double_clicked)
@@ -521,13 +527,26 @@ class BulkSearchDialog(QDialog):
         col.addWidget(self._gen_scroll, 1)
         return w
 
-    def _show_gen_pane(self) -> None:
-        if self._gen_pane.isVisible():
-            return
+    def _show_gen_pane(self, phase: str = "writing") -> None:
+        """Reveal the written half, sized for what is in it.
+
+        While the jobs run it holds three lines of status, so handing it half
+        the window buries the found cards — the very thing you are meant to be
+        reading during the wait. It takes its real share once there are cards in
+        it. Only ever set when the phase CHANGES, so a size you dragged
+        yourself is not overwritten on the next poll."""
+        first = not self._gen_pane.isVisible()
         self._gen_pane.setVisible(True)
+        # The buttons do nothing until there are cards to bulk-approve.
+        for b in (self._gen_approve_all, self._gen_reject_all):
+            b.setEnabled(phase == "cards")
+        if not first and phase == self._gen_phase:
+            return
+        self._gen_phase = phase
         try:
             h = max(1, self._split.height())
-            self._split.setSizes([int(h * 0.55), int(h * 0.45)])
+            top = 0.80 if phase == "writing" else 0.45
+            self._split.setSizes([int(h * top), int(h * (1 - top))])
         except Exception:
             pass
 
@@ -588,8 +607,8 @@ class BulkSearchDialog(QDialog):
                 f"· up to {budget} card(s)")
         else:
             self._title.setText(
-                f"<b>{n} knowledge gap(s)</b> — read them, then search your deck "
-                "for cards that already cover them.")
+                f"<b>{n} knowledge gap(s)</b> — check the notes below, then "
+                "<b>Read gaps with AI</b> to split them into searchable points.")
 
     def _checked_rows(self) -> list[int]:
         out = []
@@ -1019,8 +1038,15 @@ class BulkSearchDialog(QDialog):
             f = top.font(0)
             f.setBold(True)
             top.setFont(0, f)
-            top.setToolTip(0, f"{plan.concept}\n\nScope: {plan.scope} · "
-                              f"target {plan.cards} card(s)")
+            notes = ""
+            try:
+                notes = kg_store.field(kg_store.get(plan.kg_id) or {}, "notes")
+            except Exception:
+                notes = ""
+            top.setToolTip(0, "\n\n".join(x for x in (
+                plan.concept,
+                (f"Your notes:\n{notes}" if notes else ""),
+                f"Scope: {plan.scope} · target {plan.cards} card(s)") if x))
 
             # Each gap carries its OWN tag — unrelated gaps must not share one.
             tag_edit = QLineEdit()
@@ -1633,7 +1659,7 @@ class BulkSearchDialog(QDialog):
         if self._gen_groups:
             self._gen_groups[0].set_expanded(True)
         self._gen_rendered = True
-        self._show_gen_pane()
+        self._show_gen_pane("cards")
         self._refresh_gen_head()
 
     def _refresh_gen_head(self) -> None:
@@ -2368,10 +2394,8 @@ def open_bulk_search(kgs: list[dict], parent=None, *, unified: bool = False) -> 
     dlg.show()
     dlg.raise_()
     dlg.activateWindow()
-    # Read straight away, as Mass AI Create does. Until the gaps are read this
-    # screen has nothing on it worth deciding about — every row shows a default
-    # scope and no points. singleShot(0) so the window paints before the busy
-    # state lands on it; the enabled-check mirrors _refresh_buttons, so a
-    # missing or manual provider still just shows its explanation.
-    if dlg._read_btn.isEnabled():
-        QTimer.singleShot(0, lambda: (not dlg._closed) and dlg._on_read())
+    # DELIBERATELY does not read on open. It used to, on the theory that an
+    # unread table has nothing worth deciding about — but that spends an AI call
+    # the moment the window appears, and it skips straight past the one screen
+    # where the notes and the tick boxes can still be corrected. Opening a
+    # window is not consent to spend tokens. Press "Read gaps with AI".
