@@ -2957,8 +2957,15 @@ class KnowledgeGapsPanel(QWidget):
         if not items:
             self._detail.load(None)
             return
-        li = items[0]
-        if not isinstance(li, _KGListItem):
+        # The gap you just CLICKED, not selectedItems()[0] — that's list order,
+        # so extending a multi-select downwards left the pane pinned to the
+        # topmost row while you were looking at the bottom one. Every field on
+        # screen then belonged to a different gap, which reads as "my notes
+        # aren't showing" rather than as the wrong record.
+        li = self._list.currentItem()
+        if not isinstance(li, _KGListItem) or li not in items:
+            li = next((x for x in items if isinstance(x, _KGListItem)), None)
+        if li is None:
             return
         self._detail.refresh_send_labels(len(items))
         # Extending a selection over the gap that's already loaded must not

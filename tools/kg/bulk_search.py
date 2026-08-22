@@ -57,6 +57,11 @@ from . import store as kg_store, triage as kg_triage
 # tail he can promote from if it got one wrong.
 EXTRA_CANDIDATES_PER_POINT = 6
 
+# Plan-table columns, named because the table is index-addressed in a dozen
+# places and inserting one by hand is how the scope combo ends up in the card
+# spinner's column.
+C_GAP, C_NOTES, C_READ, C_SCOPE, C_CARDS, C_PTS = range(6)
+
 
 def create_record_for(kg: dict, concept: str, points: list[dict]) -> dict:
     """One gap, flattened into the record shape the generation side reads.
@@ -253,25 +258,30 @@ class BulkSearchDialog(QDialog):
         col = QVBoxLayout(w)
         col.setContentsMargins(0, 0, 0, 0)
 
-        self._table = QTableWidget(0, 5)
+        self._table = QTableWidget(0, 6)
         self._table.setHorizontalHeaderLabels(
-            ["Gap", "What the AI read it as", "Scope", "Cards", "Pts"])
+            ["Gap", "Your notes", "What the AI read it as", "Scope", "Cards", "Pts"])
         self._table.verticalHeader().setVisible(False)
         self._table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self._table.setWordWrap(True)
         hh = self._table.horizontalHeader()
-        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
-        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        for c in (2, 3, 4):
+        hh.setSectionResizeMode(C_GAP, QHeaderView.ResizeMode.Interactive)
+        hh.setSectionResizeMode(C_NOTES, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(C_READ, QHeaderView.ResizeMode.Stretch)
+        for c in (C_SCOPE, C_CARDS, C_PTS):
             hh.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
-        self._table.setColumnWidth(0, 250)
-        self._table.itemChanged.connect(self._on_row_toggled)
+        self._table.setColumnWidth(C_GAP, 220)
+        self._table.itemChanged.connect(self._on_table_item_changed)
         col.addWidget(self._table, 1)
 
         self._table_hint = QLabel(
-            "Untick any gap to skip it. After reading, edit the reading or the "
-            "card count on any row — those numbers are what bounds the search. "
-            "Rows marked ⚠ are ones the AI wasn't sure it understood."
+            "Untick any gap to skip it. <b>Your notes are editable here</b> and "
+            "are saved back to the gap — they're the main thing the AI reads, so "
+            "this is the place to fix a gap it's about to misunderstand. After "
+            "reading, edit the reading or the card count on any row too. Rows "
+            "marked ⚠ are ones the AI wasn't sure it understood."
         )
+        self._table_hint.setTextFormat(Qt.TextFormat.RichText)
         self._table_hint.setStyleSheet("color: gray; font-size: 11px;")
         self._table_hint.setWordWrap(True)
         col.addWidget(self._table_hint)
@@ -512,16 +522,31 @@ class BulkSearchDialog(QDialog):
             cell.setCheckState(Qt.CheckState.Checked)
             notes = kg_store.field(kg, "notes")
             cell.setToolTip(f"{title}\n\n{notes[:400]}" if notes else title)
-            self._table.setItem(row, 0, cell)
+            self._table.setItem(row, C_GAP, cell)
+            self._table.setItem(row, C_NOTES, self._notes_cell(kg))
             hint = QTableWidgetItem("— not read yet —")
             hint.setFlags(hint.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self._table.setItem(row, 1, hint)
-            for c in (2, 3, 4):
+            self._table.setItem(row, C_READ, hint)
+            for c in (C_SCOPE, C_CARDS, C_PTS):
                 blank = QTableWidgetItem("")
                 blank.setFlags(blank.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 self._table.setItem(row, c, blank)
         self._table.blockSignals(False)
+        self._table.resizeRowsToContents()
         self._refresh_title()
+
+    def _notes_cell(self, kg: dict) -> QTableWidgetItem:
+        """This gap's notes, editable in place.
+
+        Notes are the single biggest input to how the AI reads a gap — a
+        two-word title plus "the vascular ones keep tripping me up" is a
+        completely different search from the title alone. They were readable
+        only as a hover tooltip, on the one screen where you are deciding what
+        to run, which is exactly where you notice they're wrong."""
+        cell = QTableWidgetItem(kg_store.field(kg, "notes") or "")
+        cell.setToolTip("Editable. Saved back onto the gap before the AI reads "
+                        "it, so what you type here shapes the run.")
+        return cell
 
     def _refresh_title(self) -> None:
         n = len(self._kgs)
@@ -540,19 +565,62 @@ class BulkSearchDialog(QDialog):
     def _checked_rows(self) -> list[int]:
         out = []
         for row in range(self._table.rowCount()):
-            it = self._table.item(row, 0)
+            it = self._table.item(row, C_GAP)
             if it is not None and it.checkState() == Qt.CheckState.Checked:
                 out.append(row)
         return out
 
-    def _on_row_toggled(self, item) -> None:
-        if item is None or item.column() != 0:
+    def _on_table_item_changed(self, item) -> None:
+        if item is None:
+            return
+        if item.column() == C_NOTES:
+            self._table.resizeRowToContents(item.row())
+            return
+        if item.column() != C_GAP:
             return
         row = item.row()
         if 0 <= row < len(self._plans):
             self._plans[row].included = item.checkState() == Qt.CheckState.Checked
         self._refresh_buttons()
         self._refresh_title()
+
+    def _sync_notes(self) -> int:
+        """Write edited notes back onto the gaps. Returns how many changed.
+
+        Runs BEFORE the read and before the search, not at the end: the whole
+        point is that the AI sees what you just typed. Writing to the store as
+        well as to the in-memory record means the edit survives the run, so you
+        fix a badly-worded gap once rather than every time you look at it."""
+        changed = 0
+        for row, kg in enumerate(self._kgs):
+            cell = self._table.item(row, C_NOTES)
+            if cell is None:
+                continue
+            typed = cell.text().strip()
+            if typed == (kg_store.field(kg, "notes") or "").strip():
+                continue
+            fields = dict(kg.get("fields") or {})
+            if typed:
+                fields["notes"] = typed
+            else:
+                fields.pop("notes", None)
+            kg["fields"] = fields          # the in-memory copy triage reads
+            kg.pop("notes", None)          # never let a legacy top-level key win
+            try:
+                updated = kg_store.update(str(kg.get("id") or ""), fields=fields)
+                if updated:
+                    self._kgs[row] = updated
+            except Exception as e:
+                log.warn(f"bulk search: couldn't save notes for "
+                         f"{kg.get('id')}: {e}")
+            changed += 1
+        if changed:
+            try:
+                from .. import knowledge_gaps
+                knowledge_gaps._refresh_open_panel()
+            except Exception:
+                pass
+        return changed
 
     def _active_plans(self) -> list:
         return [p for p in self._plans if p.ok and p.included]
@@ -570,8 +638,13 @@ class BulkSearchDialog(QDialog):
         if not rows:
             tooltip("Tick at least one gap first.")
             return
+        # Notes first: they are the biggest input to how each gap is read, and
+        # an edit sitting in a cell that hasn't been committed yet would be
+        # invisible to the call that's about to run.
+        saved = self._sync_notes()
         kgs = [self._kgs[r] for r in rows]
-        self._set_busy(True, f"Reading {len(kgs)} gap(s) with AI…")
+        self._set_busy(True, (f"Saved notes on {saved} gap(s). " if saved else "")
+                       + f"Reading {len(kgs)} gap(s) with AI…")
         from ...core.config import tool_model_for
         model = tool_model_for("lecture_extract")
 
@@ -668,7 +741,15 @@ class BulkSearchDialog(QDialog):
                 tip.append("Points:\n" + "\n".join(
                     f"  · {pt.concept}   {pt.terms}" for pt in p.points))
             cell.setToolTip("\n\n".join(t for t in tip if t))
-            self._table.setItem(row, 0, cell)
+            self._table.setItem(row, C_GAP, cell)
+            # Rebuilt from what's ON SCREEN, not from the store: the read
+            # happens after _sync_notes, so the cell is already authoritative
+            # and re-reading the record would undo an edit made mid-run.
+            keep = self._table.item(row, C_NOTES)
+            self._table.setItem(row, C_NOTES, QTableWidgetItem(
+                keep.text() if keep is not None else
+                (kg_store.field(self._kgs[row], "notes")
+                 if row < len(self._kgs) else "")))
 
             reading = QTableWidgetItem(
                 "— not read —" if unread else p.concept)
@@ -679,15 +760,15 @@ class BulkSearchDialog(QDialog):
                     "Edit if the AI misread your shorthand. This is what the tag "
                     "is built from. (The search terms it already wrote aren't "
                     "regenerated — re-read the gaps if you need those changed.)")
-            self._table.setItem(row, 1, reading)
+            self._table.setItem(row, C_READ, reading)
 
             if unread:
-                for c in (2, 3, 4):
+                for c in (C_SCOPE, C_CARDS, C_PTS):
                     blank = QTableWidgetItem("")
                     blank.setFlags(blank.flags() & ~Qt.ItemFlag.ItemIsEditable)
                     self._table.setItem(row, c, blank)
-                self._table.removeCellWidget(row, 2)
-                self._table.removeCellWidget(row, 3)
+                self._table.removeCellWidget(row, C_SCOPE)
+                self._table.removeCellWidget(row, C_CARDS)
                 continue
 
             scope = QComboBox()
@@ -698,7 +779,7 @@ class BulkSearchDialog(QDialog):
             si = scope.findData(p.scope)
             scope.setCurrentIndex(si if si >= 0 else 0)
             scope.currentIndexChanged.connect(lambda _i, r=row: self._on_scope_changed(r))
-            self._table.setCellWidget(row, 2, scope)
+            self._table.setCellWidget(row, C_SCOPE, scope)
 
             cards = QSpinBox()
             cards.setRange(kg_triage.MIN_CARDS, kg_triage.MAX_CARDS)
@@ -706,7 +787,7 @@ class BulkSearchDialog(QDialog):
             cards.setToolTip("How many existing cards this gap should pull. "
                              "Changing the scope resets it to that scope's default.")
             cards.valueChanged.connect(lambda _v, r=row: self._on_cards_changed(r))
-            self._table.setCellWidget(row, 3, cards)
+            self._table.setCellWidget(row, C_CARDS, cards)
 
             pts = QTableWidgetItem(str(len(p.points)))
             pts.setFlags(pts.flags() & ~Qt.ItemFlag.ItemIsEditable)
@@ -714,7 +795,7 @@ class BulkSearchDialog(QDialog):
                 "How many searchable points this gap was split into. A broad gap "
                 "splits into several — that's what actually finds more cards, "
                 "since one point only matches cards about one thing.")
-            self._table.setItem(row, 4, pts)
+            self._table.setItem(row, C_PTS, pts)
         self._table.blockSignals(False)
         self._table.resizeRowsToContents()
 
@@ -734,7 +815,8 @@ class BulkSearchDialog(QDialog):
         'narrow' would be the confusing outcome."""
         if not (0 <= row < len(self._plans)):
             return
-        combo, spin = self._table.cellWidget(row, 2), self._table.cellWidget(row, 3)
+        combo = self._table.cellWidget(row, C_SCOPE)
+        spin = self._table.cellWidget(row, C_CARDS)
         if combo is None or spin is None:
             return
         scope = combo.currentData() or kg_triage.DEFAULT_SCOPE
@@ -743,7 +825,7 @@ class BulkSearchDialog(QDialog):
 
     def _on_cards_changed(self, row: int) -> None:
         if 0 <= row < len(self._plans):
-            spin = self._table.cellWidget(row, 3)
+            spin = self._table.cellWidget(row, C_CARDS)
             if spin is not None:
                 self._plans[row].cards = spin.value()
         self._refresh_title()
@@ -751,18 +833,18 @@ class BulkSearchDialog(QDialog):
     def _sync_plans(self) -> None:
         """Fold the table's edits back in, so what's on screen is what runs."""
         for row, p in enumerate(self._plans):
-            it0 = self._table.item(row, 0)
+            it0 = self._table.item(row, C_GAP)
             if it0 is not None:
                 p.included = it0.checkState() == Qt.CheckState.Checked
-            it1 = self._table.item(row, 1)
+            it1 = self._table.item(row, C_READ)
             if it1 is not None and p.ok:
                 txt = it1.text().strip()
                 if txt and txt != "— not read —":
                     p.concept = txt
-            combo = self._table.cellWidget(row, 2)
+            combo = self._table.cellWidget(row, C_SCOPE)
             if combo is not None:
                 p.scope = combo.currentData() or p.scope
-            spin = self._table.cellWidget(row, 3)
+            spin = self._table.cellWidget(row, C_CARDS)
             if spin is not None:
                 p.cards = spin.value()
 
@@ -771,6 +853,7 @@ class BulkSearchDialog(QDialog):
     def _on_search(self) -> None:
         if not anki_utils.require_col() or self._busy:
             return
+        self._sync_notes()
         self._sync_plans()
         plans = self._active_plans()
         if not plans:
