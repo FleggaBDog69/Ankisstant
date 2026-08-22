@@ -182,7 +182,45 @@ import re as _re
 _TRAILING_NUM_RE = _re.compile(r"^(.*?)[\s_\-:]*(\d+)$")
 
 
+def _clean_seg(text: str) -> str:
+    """One tag segment, safe to sit between '::' separators."""
+    return _re.sub(r"[\s/]+", "_", str(text or "")).strip("_")
+
+
+def clean_segment_path(text: str) -> str:
+    """Clean a typed '::'-separated segment path into something a tag can hold.
+    Empty parts drop out, so 'Cardio :: :: SRS 4' -> 'Cardio::SRS_4'."""
+    parts = [_clean_seg(p) for p in str(text or "").split("::")]
+    return "::".join(p for p in parts if p)
+
+
+def group_tag_overrides() -> dict:
+    """The user's per-group segment overrides, {label: segment}. Never raises —
+    a broken/absent config means "no overrides", not a dead tag."""
+    try:
+        raw = tool_config("knowledge_gaps").get("group_tag_overrides") or {}
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): str(v or "").strip() for k, v in raw.items()}
+
+
+def group_segment_override(name: str) -> str:
+    """The explicit segment set for this group, or '' if it uses the derived
+    one. Cleaned the same way a derived segment is, so an override can't put a
+    space or a stray slash into a tag."""
+    raw = group_tag_overrides().get(str(name or "").strip(), "")
+    return clean_segment_path(raw) if raw else ""
+
+
 def group_segment(name: str) -> str:
+    """The tag segment for a group: the user's override if they set one, else
+    the derived rule. This is what every tag-building caller goes through."""
+    return group_segment_override(name) or derive_group_segment(name)
+
+
+def derive_group_segment(name: str) -> str:
     """Turn a free-text group label into its tag segment.
 
         SRS 4            -> SRS::04     trailing integer splits off, pads to 2
@@ -204,7 +242,7 @@ def group_segment(name: str) -> str:
     label = (name or "").strip()
     if not label:
         return ""
-    clean = lambda s: _re.sub(r"[\s/]+", "_", s).strip("_")
+    clean = _clean_seg
     if "::" in label:
         parts = [clean(p) for p in label.split("::")]
         return "::".join(p for p in parts if p)
@@ -237,7 +275,8 @@ def group_tag_prefix(group: str) -> str:
 
 
 def tag_from_levels(levels: dict | None, kg_type_key: str | None = None,
-                    type_meta: dict | None = None, group: str = "") -> str:
+                    type_meta: dict | None = None, group: str = "",
+                    group_seg: str | None = None) -> str:
     """Format {system, subsystem, topic} levels into the shared hierarchical tag
     under the configured base + the KG type's segment + (optionally) the KG's
     group segment. Returns '' when unusable (no base, no levels, or it collapses
@@ -246,7 +285,11 @@ def tag_from_levels(levels: dict | None, kg_type_key: str | None = None,
     `group` is the KG's raw group LABEL ("SRS 4"), not a segment — the
     normalisation lives in group_segment() so every caller gets the same answer.
     Default '' renders exactly what this function rendered before groups
-    existed."""
+    existed.
+
+    `group_seg` is the escape hatch: pass a segment to use it verbatim instead
+    of resolving `group` through group_segment(). The Groups manager needs it to
+    preview what a NEW name or override would produce before it saves either."""
     base = auto_tag_base()
     if not base or not levels:
         return ""
@@ -254,8 +297,9 @@ def tag_from_levels(levels: dict | None, kg_type_key: str | None = None,
         type_seg = type_meta.get("name") or type_meta.get("key") or ""
     else:
         type_seg, _enabled = kg_type_info((kg_type_key or default_type_key()))
+    seg = group_segment(group) if group_seg is None else str(group_seg or "")
     tag = format_hierarchical_tag(base, levels, type_seg=type_seg,
-                                  group_seg=group_segment(group))
+                                  group_seg=seg)
     if not tag or tag == base:
         return ""
     return tag

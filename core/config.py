@@ -279,6 +279,19 @@ DEFAULTS: dict = {
             # Group headers the user has collapsed on the KG page. Derived UI
             # state, written by the page rather than the settings screen.
             "collapsed_groups": [],
+            # Per-group tag segment overrides: {"SRS 4": "Cardio::SRS4"}.
+            # The segment is normally DERIVED from the group label
+            # (autotag.derive_group_segment), which is a guess; this is the
+            # escape hatch for a group whose label reads well in the list but
+            # should file somewhere else in the tag tree. Empty/missing = use
+            # the derived one. Keyed by the group's label, so renaming a group
+            # migrates the key.
+            "group_tag_overrides": {},
+            # Groups put away from the main list ("SRS 1, finished in March").
+            # The gaps are untouched — archiving only hides them from the list
+            # and the chip row. They stay visible in the Groups manager, and
+            # opening one from there un-hides it for that filter.
+            "archived_groups": [],
             # Configurable list of KG types. Each item:
             #   key         — stable id (slug); used by KG entries
             #   name        — display label
