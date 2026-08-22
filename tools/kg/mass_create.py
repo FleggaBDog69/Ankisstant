@@ -1373,6 +1373,36 @@ class MassCreateDialog(QDialog):
             pass
 
 
+def commit_ctx_for(job: dict, profile: dict, tags: list):
+    """A job's CommitCtx — the batch's profile, but this gap's own tags and KG
+    content, so an MQ gap still composes its Missed Questions field correctly
+    inside a mixed batch.
+
+    Module-level because two surfaces now build cards from the same job records:
+    this dialog's review blocks, and the unified pass, which renders the written
+    cards straight into its results tree and so has no block to ask."""
+    from .. import card_creator as cc
+    return cc.CommitCtx(
+        profile=profile,
+        tags=list(tags),
+        mode="topic",
+        source_label=None,
+        panel_image_paths=[],
+        kg_image_filenames=list(job.get("kg_image_filenames") or []),
+        kg_type_for_image=(job.get("kg_type_for_image") or "").lower(),
+        kg_stem_html=str(job.get("kg_stem_html") or ""),
+        kg_notes=str(job.get("kg_notes") or ""),
+        kg_concept=str(job.get("kg_concept") or ""),
+        kg_explanation=str(job.get("kg_explanation") or ""),
+        type_meta=job.get("type_meta") if isinstance(job.get("type_meta"), dict) else None,
+        # From the GAP, not the job: the worker persists AI-written field values
+        # back onto the gap record (create_jobs._apply_result_main_thread), so
+        # that is where a freshly-written explanation actually lives.
+        kg_field_values=cc._gap_field_values(
+            job.get("gap") if isinstance(job.get("gap"), dict) else None),
+    )
+
+
 # ── one gap's cards, in the review page ──────────────────────────────────────
 
 class _KGGroup(QFrame):
@@ -1580,31 +1610,9 @@ class _KGGroup(QFrame):
         return [c for c in cards if id(c) in keep_ids]
 
     def commit_ctx(self, profile: dict):
-        """This gap's CommitCtx — the batch's profile, but this gap's own tags
-        and KG content, so an MQ gap still composes its Missed Questions field
-        correctly inside a mixed batch."""
-        from .. import card_creator as cc
+        """This gap's CommitCtx, built from the tag box on this block."""
         tags = [t.strip() for t in self.tag_edit.text().split(",") if t.strip()]
-        job = self.job
-        return cc.CommitCtx(
-            profile=profile,
-            tags=tags,
-            mode="topic",
-            source_label=None,
-            panel_image_paths=[],
-            kg_image_filenames=list(job.get("kg_image_filenames") or []),
-            kg_type_for_image=(job.get("kg_type_for_image") or "").lower(),
-            kg_stem_html=str(job.get("kg_stem_html") or ""),
-            kg_notes=str(job.get("kg_notes") or ""),
-            kg_concept=str(job.get("kg_concept") or ""),
-            kg_explanation=str(job.get("kg_explanation") or ""),
-            type_meta=job.get("type_meta") if isinstance(job.get("type_meta"), dict) else None,
-            # From the GAP, not the job: the worker persists AI-written field
-            # values back onto the gap record (create_jobs._apply_result_main_thread),
-            # so this is where a freshly-written explanation actually lives.
-            kg_field_values=cc._gap_field_values(
-                job.get("gap") if isinstance(job.get("gap"), dict) else None),
-        )
+        return commit_ctx_for(self.job, profile, tags)
 
     def _refresh_head(self) -> None:
         n = self.count_total()
