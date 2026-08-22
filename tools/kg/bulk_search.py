@@ -487,8 +487,12 @@ class BulkSearchDialog(QDialog):
         self._gen_reject_all.setAutoDefault(False)
         self._gen_reject_all.clicked.connect(lambda: self._written_bulk(False))
         ctl.addWidget(self._gen_reject_all)
-        for w in (self._written_lbl, self._gen_approve_all, self._gen_reject_all):
-            w.setVisible(False)
+        # NB: not `for w in ...` — `w` is this pane's QWidget, and rebinding it
+        # drops Python's only reference to an unparented widget, so Qt deletes it
+        # (taking `col` with it) mid-build.
+        for _wgt in (self._written_lbl, self._gen_approve_all,
+                     self._gen_reject_all):
+            _wgt.setVisible(False)
         ctl.addStretch(1)
         self._sel_lbl = QLabel("")
         self._sel_lbl.setStyleSheet("color: gray; font-size: 11px;")
@@ -1793,9 +1797,10 @@ class BulkSearchDialog(QDialog):
         self._update_selection_count()
 
     def _show_written_ui(self) -> None:
-        for w in (self._written_lbl, self._gen_approve_all, self._gen_reject_all):
-            w.setVisible(True)
-            w.setEnabled(self._gen_rendered)
+        for _wgt in (self._written_lbl, self._gen_approve_all,
+                     self._gen_reject_all):
+            _wgt.setVisible(True)
+            _wgt.setEnabled(self._gen_rendered)
         self._gen_note.setVisible(True)
 
     def _gen_note_text(self) -> str:
