@@ -33,6 +33,8 @@
 
 from __future__ import annotations
 
+import threading
+
 from aqt import mw
 from aqt.qt import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QHBoxLayout,
@@ -1687,11 +1689,11 @@ class BulkSearchDialog(QDialog):
         written for, and nothing reaches the collection until Apply."""
         if self._closed or self._gen_batch_id:
             return
-        if not provider_configured() or is_manual_provider():
+        if not provider_configured():
             self._show_written_ui()
             self._gen_note.setText(
-                "Writing the missing cards needs a CLI or API provider — set "
-                "one up in Ankisstant Settings.")
+                "Writing the missing cards needs a provider — set one up in "
+                "Ankisstant Settings.")
             return
         payload = self._create_payload()
         if not payload:
@@ -1759,10 +1761,16 @@ class BulkSearchDialog(QDialog):
             return
 
         self._gen_batch_id = records[0]["batch_id"]
-        self._gen_active = True
-        create_jobs.enqueue_batch(records)
         self._mark_in_progress([r.get("kg_id") for r in records])
         self._show_written_ui()
+        if is_manual_provider():
+            # No background worker: the paste provider IS a modal, so it has to
+            # run on the main thread, one gap at a time.
+            self._render_written_placeholders(records)
+            self._run_manual(records)
+            return
+        self._gen_active = True
+        create_jobs.enqueue_batch(records)
         pts = sum(len(p.points) for p in plans)
         self._found_head.setText(
             "What your deck has for these gaps \u2014 and, marked NEW, the "
@@ -1795,9 +1803,9 @@ class BulkSearchDialog(QDialog):
         concept = str(node.data(0, self.ROLE_CONCEPT) or "")
         if not kg_id or not concept:
             return
-        if not provider_configured() or is_manual_provider():
-            showWarning("Writing a card needs a CLI or API provider — set one "
-                        "up in Ankisstant Settings.")
+        if not provider_configured():
+            showWarning("Writing a card needs a provider — set one up in "
+                        "Ankisstant Settings.")
             return
         notetype_name = (self._notetype.currentText().strip()
                          if self._notetype is not None else "")
@@ -1859,20 +1867,66 @@ class BulkSearchDialog(QDialog):
             return
 
         self._gen_batch_id = records[0]["batch_id"]
-        self._gen_active = True
-        create_jobs.enqueue_batch(records)
         self._mark_in_progress([kg_id])
         self._tree.blockSignals(True)
         row = self._pending_row(node, kg_id, self._WRITING)
         row.setData(0, self.ROLE_KEY, str(records[0].get("id") or ""))
         self._tree.blockSignals(False)
         self._show_written_ui()
+        if is_manual_provider():
+            # One point, one paste — the case the paste provider suits best.
+            self._run_manual(records)
+            return
+        self._gen_active = True
+        create_jobs.enqueue_batch(records)
         self._progress.setRange(0, 100)
         self._progress.setVisible(True)
         self._stop_btn.setVisible(True)
         self._stop_btn.setEnabled(True)
         self._poll.start()
         self._update_selection_count()
+
+    def _run_manual(self, records: list[dict]) -> None:
+        """The paste provider, gap by gap, on the main thread.
+
+        create_jobs runs its worker off-thread with uses_collection=False, and
+        the manual provider is a modal dialog — Qt on a worker thread is not a
+        thing. So manual takes the same records and walks them here instead,
+        writing each result back through the SAME _apply_result_main_thread the
+        background path uses, so a pasted reply is routed, graded and tagged
+        identically to a generated one.
+
+        Each gap renders the moment its paste is accepted, so a five-gap run
+        shows its answers as you go rather than all at the end."""
+        from .. import create_jobs
+        self._gen_active = True
+        self._progress.setRange(0, len(records))
+        self._progress.setValue(0)
+        self._progress.setVisible(True)
+        self._stop_btn.setVisible(False)      # Cancel the paste dialog instead
+        for i, rec in enumerate(records, 1):
+            if self._closed:
+                return
+            self._gen_note.setText(
+                f"Paste gap {i} of {len(records)} — "
+                f"“{rec.get('title') or 'this gap'}”. Cancel the "
+                "paste box to stop; anything already pasted is kept.")
+            QApplication.processEvents()
+            job = create_jobs.add(**rec, status=create_jobs.RUNNING)
+            try:
+                result = create_jobs._worker(job, threading.Event())
+            except Exception as e:
+                log.error(f"work through (manual): {rec.get('title')!r}: {e}")
+                create_jobs.update(job["id"], status=create_jobs.ERROR,
+                                   error=str(e))
+                self._on_gen_poll()
+                continue
+            create_jobs._apply_result_main_thread(job["id"], result)
+            self._progress.setValue(i)
+            self._on_gen_poll()
+        self._gen_active = False
+        self._progress.setVisible(False)
+        self._on_gen_poll()
 
     def _mark_in_progress(self, kg_ids) -> None:
         """Handed to a tool, so no longer untouched \u2014 same rule the KG page

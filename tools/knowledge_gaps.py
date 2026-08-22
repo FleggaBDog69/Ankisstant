@@ -30,9 +30,10 @@ from aqt.qt import (
 )
 from aqt.utils import askUser, showWarning, tooltip
 
-from ..core import anki_utils
+from ..core import anki_utils, log
 from ..core.config import (
-    active_family, auto_tag_base, save_tool_config, tool_config, tool_model_for,
+    active_family, auto_tag_base, month_tag, save_tool_config, tool_config,
+    tool_model_for,
 )
 from ..core.qt_utils import (
     attach_tag_completer, make_help_button, make_setup_banner,
@@ -40,7 +41,7 @@ from ..core.qt_utils import (
     set_ai_buttons_enabled, theme_dialog,
 )
 from . import autotag
-from .kg import store as kg_store
+from .kg import importers, store as kg_store
 
 
 NAME = "Knowledge Gaps"
@@ -1316,8 +1317,18 @@ class KGDetailPane(QWidget):
         actions_row.addWidget(self._browse_btn)
         self._create_btn = QPushButton("＋ Create card from this KG")
         self._create_btn.setAutoDefault(False)
+        self._create_btn.setToolTip(
+            "Send this gap to AI Create, with its notes attached, and let the "
+            "AI write the card.")
         self._create_btn.clicked.connect(self._send_to_create)
         actions_row.addWidget(self._create_btn)
+        self._own_btn = QPushButton("✎ Write my own card")
+        self._own_btn.setAutoDefault(False)
+        self._own_btn.setToolTip(
+            "Write the card yourself. No AI in the path at all — it lands in "
+            "the same deck, with the same tags, as a generated one would.")
+        self._own_btn.clicked.connect(self._write_own_card)
+        actions_row.addWidget(self._own_btn)
         actions_row.addStretch(1)
         self._delete_btn = QPushButton("🗑 Delete")
         self._delete_btn.setAutoDefault(False)
@@ -1431,7 +1442,8 @@ class KGDetailPane(QWidget):
                   self._dismissed, self._group_btn, self._created_lbl,
                   self._tags_input,
                   self._schema_container, self._res_box, self._browse_btn,
-                  self._create_btn, self._delete_btn, self._save_btn):
+                  self._create_btn, self._own_btn, self._delete_btn,
+                  self._save_btn):
             w.setVisible(visible)
         # The LO analyser stays hidden when nothing is selected; load() re-
         # shows it only for type=lo KGs.
@@ -1841,6 +1853,26 @@ class KGDetailPane(QWidget):
         if ids:
             self._parent_panel._bulk_send_to_create(ids)
 
+    def _write_own_card(self) -> None:
+        """No AI: type the card, it goes straight into the collection."""
+        self.flush()
+        if self._current is None:
+            return
+        kg = kg_store.get(self._current.get("id")) or self._current
+        dlg = _WriteOwnCardDialog(kg, parent=self.window())
+        dlg.exec()
+        if not dlg.created_ids:
+            return
+        n = len(dlg.created_ids)
+        if dlg._done_cb.isChecked():
+            try:
+                kg_store.update(kg["id"], status="done")
+            except Exception as e:
+                log.warn(f"write-your-own: couldn't mark {kg.get('id')} done: {e}")
+        tooltip(f"Added {n} card(s) — Ctrl+Z in the main window undoes the "
+                "last one.", period=4000)
+        self._parent_panel.refresh_list(preserve_selection=kg.get("id"))
+
     def _on_group_clicked(self) -> None:
         self.flush()
         ids = self._send_ids()
@@ -1862,15 +1894,247 @@ class KGDetailPane(QWidget):
         )
 
 
+class _WriteOwnCardDialog(QDialog):
+    """Write a card for this gap yourself — no AI anywhere in the path.
+
+    Not a fallback for when the AI is unavailable. Plenty of gaps are one line
+    you already know how to phrase, and for those the AI round trip is slower
+    than typing it and worse at it — it doesn't know the wording your deck
+    already uses. The gap's own notes sit above the editor, because they are
+    usually the answer you wrote down at the time.
+
+    It commits through the same commit_cards / CommitCtx path AI Create uses,
+    so the note lands with the same fields, the same tags and the same shape a
+    generated one would have.
+    """
+
+    def __init__(self, kg: dict, parent=None):
+        super().__init__(parent)
+        self._kg = dict(kg or {})
+        self.created_ids: list = []
+        self.setWindowTitle("Write your own card")
+        self.setMinimumSize(700, 620)
+        self._build()
+        theme_dialog(self)
+
+    def _build(self) -> None:
+        from .kg.mass_create import _deck_names, _notetype_profiles
+        cc_cfg = tool_config("card_creator")
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 12, 14, 12)
+        root.setSpacing(8)
+
+        title = str(self._kg.get("title") or "(untitled)")
+        head = QLabel(f"<b>{_html.escape(title)}</b>")
+        head.setWordWrap(True)
+        root.addWidget(head)
+
+        notes = kg_store.field(self._kg, "notes") or ""
+        stem = kg_store.field(self._kg, "stem_html") or ""
+        if notes or stem:
+            ref = QTextEdit()
+            ref.setReadOnly(True)
+            ref.setMaximumHeight(120)
+            ref.setHtml(stem if stem else _html.escape(notes).replace("\n", "<br>"))
+            ref.setToolTip("What you wrote down about this gap. Read-only here "
+                           "— edit it on the gap itself.")
+            root.addWidget(ref)
+
+        strip = QHBoxLayout()
+        strip.addWidget(QLabel("Into"))
+        self._deck = QComboBox()
+        self._deck.setEditable(True)
+        self._deck.addItems(_deck_names())
+        self._deck.setCurrentText(cc_cfg.get("default_deck") or "Default")
+        strip.addWidget(self._deck, 1)
+        strip.addWidget(QLabel("as"))
+        self._notetype = QComboBox()
+        for prof in _notetype_profiles(cc_cfg):
+            self._notetype.addItem(prof["name"])
+        want = (cc_cfg.get("selected_notetype")
+                or cc_cfg.get("default_notetype") or "").strip()
+        ix = self._notetype.findText(want)
+        if ix >= 0:
+            self._notetype.setCurrentIndex(ix)
+        strip.addWidget(self._notetype, 1)
+        root.addLayout(strip)
+
+        self._front = QPlainTextEdit()
+        self._front.setPlaceholderText(
+            "The front. Use {{c1::…}} for a cloze card — whatever the notetype "
+            "you picked expects.")
+        root.addWidget(QLabel("<b>Front</b>"))
+        root.addWidget(self._front, 2)
+
+        self._back = QPlainTextEdit()
+        self._back.setPlaceholderText("The back / Extra — the mechanism or the "
+                                      "clinical 'so what'. Optional.")
+        root.addWidget(QLabel("<b>Back / Extra</b>"))
+        root.addWidget(self._back, 1)
+
+        tag_row = QHBoxLayout()
+        tag_row.addWidget(QLabel("Tag"))
+        self._tag = QLineEdit(self._suggest_tag())
+        self._tag.setPlaceholderText("no tag")
+        self._tag.setToolTip(
+            "Prefilled from this gap's own type, group and levels — the same "
+            "tag AI Create would give a card written for it. Edit or clear it.")
+        attach_tag_completer(self._tag, multi=False)
+        tag_row.addWidget(self._tag, 1)
+        root.addLayout(tag_row)
+
+        self._done_cb = QCheckBox("Mark this gap done once the card is added")
+        self._done_cb.setChecked(True)
+        root.addWidget(self._done_cb)
+
+        self._status = QLabel("")
+        self._status.setStyleSheet("color: gray; font-size: 11px;")
+        self._status.setWordWrap(True)
+        root.addWidget(self._status)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.setAutoDefault(False)
+        cancel.clicked.connect(self.reject)
+        row.addWidget(cancel)
+        self._again_btn = QPushButton("Add and write another")
+        self._again_btn.setAutoDefault(False)
+        self._again_btn.setToolTip("Add this card and clear the editor, so one "
+                                   "gap can produce several cards in a row.")
+        self._again_btn.clicked.connect(lambda: self._commit(keep_open=True))
+        row.addWidget(self._again_btn)
+        ok = QPushButton("Add card")
+        ok.setDefault(True)
+        ok.clicked.connect(lambda: self._commit(keep_open=False))
+        row.addWidget(ok)
+        root.addLayout(row)
+
+    def _suggest_tag(self) -> str:
+        """The tag AI Create would give a card written for this gap."""
+        try:
+            levels = {k: kg_store.field(self._kg, k) or ""
+                      for k in ("system", "subsystem", "topic")}
+            if not any(levels.values()):
+                levels["topic"] = str(self._kg.get("title") or "")
+            key = str(self._kg.get("type") or "kg")
+            return autotag.tag_from_levels(
+                levels, kg_type_key=key, type_meta=_type_meta(key),
+                group=str(self._kg.get("group") or ""))
+        except Exception as e:
+            log.warn(f"write-your-own: couldn't suggest a tag: {e}")
+            return ""
+
+    def _commit(self, *, keep_open: bool) -> None:
+        from . import card_creator as cc
+        front = self._front.toPlainText().strip()
+        if not front:
+            self._status.setText("A card needs a front.")
+            return
+        if not anki_utils.require_col():
+            return
+        profile = cc._resolved_profile(tool_config("card_creator"),
+                                       self._notetype.currentText().strip())
+        nt = cc.resolve_notetype(profile)
+        if nt is None:
+            self._status.setText(
+                "That notetype profile doesn't resolve to a notetype in this "
+                "collection — check Settings → AI Create.")
+            return
+
+        tags = [t.strip() for t in (tool_config("card_creator")
+                                    .get("default_tags") or []) if str(t).strip()]
+        box = self._tag.text().strip()
+        if box and box.lower() not in {t.lower() for t in tags}:
+            tags.append(box)
+        mtag = month_tag()
+        if mtag and mtag.lower() not in {t.lower() for t in tags}:
+            tags.append(mtag)
+        for t in (self._kg.get("tags") or []):
+            t = str(t).strip()
+            if t and t.lower() not in {x.lower() for x in tags}:
+                tags.append(t)
+
+        ctx = cc.CommitCtx(
+            profile=profile, tags=tags, mode="topic",
+            kg_stem_html=kg_store.field(self._kg, "stem_html") or "",
+            kg_notes=kg_store.field(self._kg, "notes") or "",
+            kg_concept=str(self._kg.get("title") or ""),
+            kg_type_for_image=str(self._kg.get("type") or ""),
+            type_meta=_type_meta(str(self._kg.get("type") or "kg")),
+            kg_field_values=dict(self._kg.get("fields") or {}),
+        )
+        card = {"front": front, "extra": self._back.toPlainText().strip()}
+        try:
+            mw.checkpoint("Ankisstant: write your own card")
+            ids = cc.commit_cards([card], ctx=ctx,
+                                  deck_name=self._deck.currentText().strip()
+                                  or "Default",
+                                  notetype=nt)
+        except Exception as e:
+            log.error(f"write-your-own: commit failed: {e}")
+            self._status.setText(f"Couldn't add that card: {e}")
+            return
+        self.created_ids.extend(ids)
+        try:
+            mw.col.reset()
+            mw.reset()
+        except Exception:
+            pass
+
+        if keep_open:
+            self._front.setPlainText("")
+            self._back.setPlainText("")
+            self._front.setFocus()
+            self._status.setText(
+                f"Added. {len(self.created_ids)} card(s) so far — "
+                "Ctrl+Z in the main window undoes the last one.")
+            return
+        self.accept()
+
+
 # ── Bulk import modal ──────────────────────────────────────────────────────────
 
+# The instruction that matters here is the one telling the model NOT to write.
+# "A concise, cleaned-up gap title" is an invitation to improve, and improving a
+# gap means widening it: "Clomiphine hyperstimulation of ovaries" comes back as
+# "Ovulation induction", which is a topic, not a gap. A gap's whole value is
+# that it names the one thing the student didn't know — so the only edits
+# allowed are ones that leave that thing exactly where it was.
 _BULK_PARSE_SYSTEM = (
-    "You normalise a student's rough list of knowledge gaps. You are given a "
-    "numbered list of raw lines. For EACH line, return one JSON object with: "
-    "\"title\" (a concise, cleaned-up gap title), and best-effort medical "
-    "\"system\", \"subsystem\", and \"topic\" strings (empty string if unsure). "
+    "You are given a medical student's own list of knowledge gaps, as a "
+    "numbered list of raw lines. Each line names ONE specific thing they "
+    "didn't know. Your job is spelling and legibility ONLY.\n"
+    "\n"
+    "For EACH line return one JSON object:\n"
+    '  {"title": "...", "system": "...", "subsystem": "...", "topic": "..."}\n'
     "Return ONLY a JSON array, one object per input line, in the same order. "
-    "Do not merge, split, or drop lines."
+    "Never merge, split, drop, reorder or add lines.\n"
+    "\n"
+    "TITLE — you may ONLY:\n"
+    "  • fix a misspelling            ('Mirizzi Syndorme' -> 'Mirizzi syndrome')\n"
+    "  • expand an abbreviation the line already uses ('TRT SEs' -> "
+    "'TRT (testosterone replacement) side effects')\n"
+    "  • fix capitalisation and spacing\n"
+    "\n"
+    "You may NOT:\n"
+    "  • make it broader, more general, or more 'proper'\n"
+    "  • replace a specific entity with its category — 'Lymphoedema tardum' is "
+    "NOT 'Types of lymphoedema'; '4-2-1 child fluids rule' is NOT 'Paediatric "
+    "fluid management'\n"
+    "  • turn a phrase into a question, or a question into a phrase\n"
+    "  • add words that were not implied by the line\n"
+    "  • drop a qualifier — 'after age 35', 'in pregnancy', 'first-line' are "
+    "the whole point of the gap\n"
+    "\n"
+    "If a line is already clear, return it BYTE-FOR-BYTE unchanged. Returning "
+    "the line untouched is the correct answer far more often than not, and is "
+    "always better than a tidier line that means something wider.\n"
+    "\n"
+    "system / subsystem / topic: your best guess at where this sits in "
+    "medicine, for filing. Empty string if unsure — a wrong guess is worse "
+    "than none. These never change the title."
 )
 
 
@@ -1901,19 +2165,29 @@ def _coerce_parsed_list(parsed) -> list | None:
 
 
 class _BulkImportDialog(QDialog):
-    """Paste many gaps at once — one per line. Optionally let Claude clean the
-    titles and infer System/Subsystem/Topic for each line."""
+    """Bring many gaps in at once — pasted, from a PDF, or from Things 3.
+
+    All three sources land in the same preview table before anything is
+    written, because every one of them can be wrong in a way you only see when
+    you look at it: a markdown paste can mis-read a nested list, a PDF can
+    invent an item, and the AI clean-up pass can quietly widen a gap. The table
+    IS the review step; Import writes exactly what it shows.
+    """
+
+    C_TITLE, C_GROUP, C_NOTES = range(3)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.imported_count = 0
-        # title -> {system, subsystem, topic} captured from a PDF load, so the
-        # inferred levels survive into the import without a second Claude call.
-        self._pdf_enrich: dict[str, dict] = {}
+        # The parsed candidates currently on show. Rebuilt from the text box on
+        # demand; edited in place by the table.
+        self._rows: list[dict] = []
         self.setWindowTitle("Bulk import knowledge gaps")
-        self.setMinimumSize(560, 480)
+        self.setMinimumSize(820, 620)
         self._build()
         theme_dialog(self)
+
+    # ── build ───────────────────────────────────────────────────────────────
 
     def _build(self) -> None:
         root = QVBoxLayout(self)
@@ -1921,9 +2195,10 @@ class _BulkImportDialog(QDialog):
         root.setSpacing(8)
 
         intro = QLabel(
-            "Paste your gaps below — <b>one per line</b>, or <b>load a PDF</b> "
-            "of LOs / gaps and let AI pull them out. Each line becomes a "
-            "Knowledge Gap of the chosen type."
+            "Paste your gaps — <b>one per line</b>, or as <b>markdown</b> where "
+            "<code>#&nbsp;Headings</code> become groups and indented text under "
+            "an item becomes that gap's notes. Or pull them straight out of "
+            "<b>Things</b>, or a <b>PDF</b> of LOs."
         )
         intro.setTextFormat(Qt.TextFormat.RichText)
         intro.setWordWrap(True)
@@ -1931,50 +2206,159 @@ class _BulkImportDialog(QDialog):
 
         self._text = QPlainTextEdit()
         self._text.setPlaceholderText(
-            "e.g.\n"
-            "Digoxin toxicity worsened by hypokalaemia\n"
-            "Mechanism of action of beta-blockers in heart failure\n"
-            "When to image a headache with neuro deficit"
+            "# SRS 12 Jaundice\n"
+            "- [ ] Mirizzi syndrome\n"
+            "    GB stone -> biliary obstruction\n"
+            "- [ ] Patterns of hepatic disease\n"
+            "\n"
+            "# SRS 11 SOB\n"
+            "- Clubbing causes"
         )
-        root.addWidget(self._text, 1)
+        self._text.setMaximumHeight(150)
+        self._text.textChanged.connect(self._on_text_changed)
+        root.addWidget(self._text)
 
-        type_row = QHBoxLayout()
-        type_row.addWidget(QLabel("Type:"))
+        # ── source row ──────────────────────────────────────────────────────
+        src = QHBoxLayout()
+        src.addWidget(QLabel("Type:"))
         self._type = QComboBox()
         for t in _load_types():
             self._type.addItem(t["name"], t["key"])
-        # Default to the configured default-on-add type if present.
-        default_key = (tool_config("knowledge_gaps").get("default_type_on_add") or "kg")
-        idx = max(0, self._type.findData(default_key))
-        self._type.setCurrentIndex(idx)
-        type_row.addWidget(self._type)
-        type_row.addStretch(1)
-        self._pdf_btn = QPushButton("📄 Load from PDF…")
+        default_key = (tool_config("knowledge_gaps").get("default_type_on_add")
+                       or "kg")
+        self._type.setCurrentIndex(max(0, self._type.findData(default_key)))
+        src.addWidget(self._type)
+        src.addSpacing(12)
+
+        self._things_btn = QPushButton("⇪  Import from Things…")
+        self._things_btn.setAutoDefault(False)
+        if importers.available():
+            self._things_btn.setToolTip(
+                "Read every Things to-do carrying a tag (default “KG”). Each "
+                "one's PROJECT becomes its group, and its notes and checklist "
+                "come with it. Nothing in Things is changed or completed.")
+            self._things_btn.clicked.connect(self._on_load_things)
+        else:
+            self._things_btn.setEnabled(False)
+            self._things_btn.setToolTip("Things 3 isn't installed on this Mac.")
+        src.addWidget(self._things_btn)
+
+        self._pdf_btn = QPushButton("📄  Load from PDF…")
         self._pdf_btn.setAutoDefault(False)
         self._pdf_btn.setEnabled(provider_configured())
         if not provider_configured():
             self._pdf_btn.setToolTip("Set up an AI provider in Settings first.")
         self._pdf_btn.clicked.connect(self._on_load_pdf)
-        type_row.addWidget(self._pdf_btn)
-        root.addLayout(type_row)
+        src.addWidget(self._pdf_btn)
+        src.addStretch(1)
+        root.addLayout(src)
+
+        # ── options ─────────────────────────────────────────────────────────
+        opt = QHBoxLayout()
+        self._use_groups = QCheckBox("Keep groups")
+        self._use_groups.setChecked(True)
+        self._use_groups.setToolTip(
+            "A markdown heading, or a Things project, becomes the gap's group "
+            "— the unit Bulk search, Mass AI Create and the tag tree all work "
+            "on. Untick to import everything ungrouped.")
+        self._use_groups.stateChanged.connect(lambda _s: self._fill_table())
+        opt.addWidget(self._use_groups)
+
+        opt.addSpacing(10)
+        opt.addWidget(QLabel("Put all in group:"))
+        self._group_override = QLineEdit()
+        self._group_override.setPlaceholderText("(leave blank to keep the ones above)")
+        self._group_override.setMaximumWidth(220)
+        self._group_override.textChanged.connect(lambda _t: self._fill_table())
+        opt.addWidget(self._group_override)
+        opt.addStretch(1)
+        root.addLayout(opt)
 
         self._use_claude = QCheckBox(
-            "Use AI to clean up titles and infer System / Subsystem / Topic"
-        )
+            "Use AI to fix spelling and infer System / Subsystem / Topic")
         self._use_claude.setEnabled(provider_configured())
+        self._use_claude.setToolTip(
+            "Spelling and legibility only — it is told, at length, not to make "
+            "a gap broader or more 'proper'. Run it and check the table: the "
+            "titles should look like yours, only spelled right.")
         if not provider_configured():
             self._use_claude.setToolTip("Set up an AI provider in Settings first.")
         root.addWidget(self._use_claude)
 
+        # ── the preview ─────────────────────────────────────────────────────
+        self._table = QTableWidget(0, 3)
+        self._table.setHorizontalHeaderLabels(["Gap", "Group", "Notes"])
+        self._table.verticalHeader().setVisible(False)
+        self._table.setAlternatingRowColors(True)
+        th = self._table.horizontalHeader()
+        th.setSectionResizeMode(self.C_TITLE, QHeaderView.ResizeMode.Stretch)
+        th.setSectionResizeMode(self.C_GROUP, QHeaderView.ResizeMode.Interactive)
+        th.setSectionResizeMode(self.C_NOTES, QHeaderView.ResizeMode.Stretch)
+        self._table.setColumnWidth(self.C_GROUP, 150)
+        self._table.itemChanged.connect(self._on_cell_changed)
+        root.addWidget(self._table, 1)
+
+        self._status = QLabel("")
+        self._status.setStyleSheet("color: gray; font-size: 11px;")
+        self._status.setWordWrap(True)
+        root.addWidget(self._status)
+
         bb = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel)
         self._import_btn = bb.button(QDialogButtonBox.StandardButton.Ok)
         self._import_btn.setText("Import")
         self._import_btn.setAutoDefault(False)
         bb.accepted.connect(self._on_import)
         bb.rejected.connect(self.reject)
         root.addWidget(bb)
+        self._refresh_status()
+
+    # ── sources ─────────────────────────────────────────────────────────────
+
+    def _on_text_changed(self) -> None:
+        """Re-parse the text box, leaving loaded rows alone.
+
+        Rows are tagged with where they came from, so typing a line replaces
+        only what the text box itself contributed. Without that, one keystroke
+        after a Things import silently threw the whole import away — and the
+        rows carry uuids and notes the text box never held, so it isn't
+        recoverable by retyping."""
+        pasted = importers.parse_markdown(self._text.toPlainText())
+        for rec in pasted:
+            rec["_src"] = "text"
+        self._rows = [r for r in self._rows
+                      if r.get("_src") != "text"] + pasted
+        self._fill_table()
+
+    def _on_load_things(self) -> None:
+        tag, ok = QInputDialog.getText(
+            self, "Import from Things",
+            "Import every Things to-do tagged:", text=importers.DEFAULT_TAG)
+        if not ok:
+            return
+        tag = tag.strip() or importers.DEFAULT_TAG
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            items = importers.fetch(tag)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not items:
+            names = importers.list_tags()
+            showWarning(
+                f"No open to-dos are tagged “{tag}” in Things.\n\n"
+                + ("Tags on this Mac: " + ", ".join(names[:25])
+                   if names else "Couldn't read your Things database."))
+            return
+        for rec in items:
+            rec["_src"] = "things"
+        # Replace a previous Things load rather than stacking a second copy of
+        # the same to-dos on top of it.
+        self._rows = [r for r in self._rows
+                      if r.get("_src") != "things"] + items
+        self._fill_table()
+        tooltip(f"Loaded {len(items)} gap(s) from Things — review, then Import.",
+                period=3500)
 
     def _on_load_pdf(self) -> None:
         if not provider_configured():
@@ -1982,102 +2366,178 @@ class _BulkImportDialog(QDialog):
             return
         path, _ = QFileDialog.getOpenFileName(
             self, "Choose a PDF of LOs / knowledge gaps", "",
-            "PDF (*.pdf);;All files (*)",
-        )
+            "PDF (*.pdf);;All files (*)")
         if not path:
             return
         parsed = _coerce_parsed_list(run_claude_json(
             self._pdf_btn, "Reading PDF…",
             prompt="Extract the knowledge gaps / learning objectives from the "
                    "attached PDF.",
-            system=_PDF_EXTRACT_SYSTEM, max_tokens=8000,
-            attachments=[path],
-        ))
+            system=_PDF_EXTRACT_SYSTEM, max_tokens=8000, attachments=[path]))
         if not parsed:
             tooltip("Couldn't pull any items from that PDF.", period=4000)
             return
-        titles: list[str] = []
-        enrich: dict[str, dict] = {}
+        rows = []
         for obj in parsed:
             if not isinstance(obj, dict):
                 continue
-            title = str(obj.get("title") or "").strip()
+            title = importers.clean_title(str(obj.get("title") or ""))
             if not title:
                 continue
-            titles.append(title)
-            levels = {k: str(obj.get(k) or "").strip()
-                      for k in ("system", "subsystem", "topic")}
-            enrich[title] = {k: v for k, v in levels.items() if v}
-        if not titles:
+            rows.append({
+                "title": title,
+                "notes": str(obj.get("notes") or "").strip(),
+                "group": str(obj.get("group") or "").strip(),
+                "things_uuid": "", "done": False,
+                "levels": {k: str(obj.get(k) or "").strip()
+                           for k in ("system", "subsystem", "topic")
+                           if str(obj.get(k) or "").strip()},
+            })
+        if not rows:
             tooltip("Couldn't pull any items from that PDF.", period=4000)
             return
-        self._pdf_enrich = enrich
-        # Append to whatever's already in the box so a PDF adds to a manual list.
-        existing = self._text.toPlainText().strip()
-        block = "\n".join(titles)
-        self._text.setPlainText(f"{existing}\n{block}" if existing else block)
-        tooltip(f"Loaded {len(titles)} item(s) from PDF — review, then Import.",
+        for rec in rows:
+            rec["_src"] = "pdf"
+        self._rows = self._rows + rows
+        self._fill_table()
+        tooltip(f"Loaded {len(rows)} item(s) from PDF — review, then Import.",
                 period=3500)
 
-    def _lines(self) -> list[str]:
-        seen: list[str] = []
-        for raw in self._text.toPlainText().splitlines():
-            line = raw.strip().lstrip("-•*").strip()
-            if line:
-                seen.append(line)
-        return seen
+    # ── the preview table ───────────────────────────────────────────────────
+
+    def _effective_group(self, rec: dict) -> str:
+        override = self._group_override.text().strip()
+        if override:
+            return override
+        if not self._use_groups.isChecked():
+            return ""
+        return str(rec.get("group") or "").strip()
+
+    def _fill_table(self) -> None:
+        self._table.blockSignals(True)
+        self._table.setRowCount(len(self._rows))
+        for i, rec in enumerate(self._rows):
+            title = QTableWidgetItem(str(rec.get("title") or ""))
+            title.setToolTip("Edit this before importing if the AI changed it "
+                             "more than you wanted.")
+            self._table.setItem(i, self.C_TITLE, title)
+            self._table.setItem(i, self.C_GROUP,
+                                QTableWidgetItem(self._effective_group(rec)))
+            notes = str(rec.get("notes") or "")
+            cell = QTableWidgetItem(" ⏎ ".join(notes.splitlines()))
+            cell.setToolTip(notes or "no notes")
+            self._table.setItem(i, self.C_NOTES, cell)
+        self._table.blockSignals(False)
+        self._refresh_status()
+
+    def _on_cell_changed(self, item) -> None:
+        """The table is editable and its edits are what import."""
+        row = item.row()
+        if not (0 <= row < len(self._rows)):
+            return
+        col = item.column()
+        if col == self.C_TITLE:
+            self._rows[row]["title"] = item.text().strip()
+        elif col == self.C_GROUP:
+            self._rows[row]["group"] = item.text().strip()
+        elif col == self.C_NOTES:
+            self._rows[row]["notes"] = item.text().replace(" ⏎ ", "\n").strip()
+        self._refresh_status()
+
+    def _refresh_status(self) -> None:
+        rows = [r for r in self._rows if str(r.get("title") or "").strip()]
+        if not rows:
+            self._status.setText("Nothing to import yet.")
+            self._import_btn.setEnabled(False)
+            return
+        try:
+            fresh, dupes = importers.dedupe_against_store(
+                [{**r, "group": self._effective_group(r)} for r in rows],
+                kg_store.load_all())
+        except Exception as e:
+            log.warn(f"bulk import: dedupe failed: {e}")
+            fresh, dupes = rows, []
+        groups = {self._effective_group(r) for r in rows}
+        groups.discard("")
+        bits = [f"{len(fresh)} gap(s) to import"]
+        if groups:
+            bits.append(f"{len(groups)} group(s): "
+                        + ", ".join(sorted(groups)[:6])
+                        + ("…" if len(groups) > 6 else ""))
+        if dupes:
+            bits.append(f"{len(dupes)} already in your list — skipped")
+        n_notes = sum(1 for r in rows if str(r.get("notes") or "").strip())
+        if n_notes:
+            bits.append(f"{n_notes} with notes")
+        self._status.setText("  ·  ".join(bits))
+        self._import_btn.setEnabled(bool(fresh))
+
+    # ── import ──────────────────────────────────────────────────────────────
+
+    def _run_ai_cleanup(self) -> None:
+        """Spelling only — and the table shows exactly what it did.
+
+        Applied per index against the ORIGINAL row, so a reply of the wrong
+        length can only fail to improve a line, never shift every title onto
+        the wrong gap."""
+        lines = [str(r.get("title") or "").strip() for r in self._rows]
+        lines = [ln for ln in lines if ln]
+        if not lines:
+            return
+        numbered = "\n".join(f"{i + 1}. {ln}" for i, ln in enumerate(lines))
+        budget = min(8000, max(2000, len(lines) * 120))
+        parsed = _coerce_parsed_list(run_claude_json(
+            self._import_btn, "Checking spelling…",
+            prompt=numbered, system=_BULK_PARSE_SYSTEM, max_tokens=budget))
+        if parsed is None:
+            tooltip("AI couldn't structure the list — importing your titles "
+                    "as they are.", period=4000)
+            return
+        changed = 0
+        for i, rec in enumerate(self._rows):
+            obj = parsed[i] if i < len(parsed) else None
+            if not isinstance(obj, dict):
+                continue
+            new = str(obj.get("title") or "").strip()
+            if new and new != rec.get("title"):
+                rec["title"] = new
+                changed += 1
+            levels = {k: str(obj.get(k) or "").strip()
+                      for k in ("system", "subsystem", "topic")
+                      if str(obj.get(k) or "").strip()}
+            if levels:
+                rec.setdefault("levels", {}).update(levels)
+        self._fill_table()
+        if changed:
+            tooltip(f"AI changed {changed} of {len(self._rows)} title(s) — "
+                    "check them in the table before importing.", period=5000)
 
     def _on_import(self) -> None:
-        lines = self._lines()
-        if not lines:
+        if not self._rows:
             tooltip("Nothing to import — paste some lines first.")
             return
-        type_key = self._type.currentData() or "kg"
-        parsed = None
         if self._use_claude.isChecked() and provider_configured():
-            numbered = "\n".join(f"{i + 1}. {ln}" for i, ln in enumerate(lines))
-            # Scale the token budget with the list length so long lists don't
-            # get truncated mid-JSON (which previously parsed to None and
-            # silently fell back to raw titles).
-            budget = min(8000, max(2000, len(lines) * 120))
-            raw_parsed = run_claude_json(
-                self._import_btn, "Structuring…",
-                prompt=numbered, system=_BULK_PARSE_SYSTEM, max_tokens=budget,
-            )
-            parsed = _coerce_parsed_list(raw_parsed)
-            if parsed is None:
-                # Claude was requested but produced nothing usable — tell the
-                # user instead of silently importing raw lines.
-                tooltip("AI couldn't structure the list — importing raw titles.",
-                        period=4000)
+            self._run_ai_cleanup()
 
-        records: list[dict] = []
-        for i, ln in enumerate(lines):
-            title = ln
-            fields: dict = {}
-            # Apply per-index: even if Claude returned a different count, we
-            # use whatever lines up and fall back to the raw line otherwise.
-            obj = parsed[i] if (parsed is not None and i < len(parsed)) else None
-            if isinstance(obj, dict):
-                title = str(obj.get("title") or ln).strip() or ln
-                for k in ("system", "subsystem", "topic"):
-                    v = str(obj.get(k) or "").strip()
-                    if v:
-                        fields[k] = v
-            # Reuse System/Subsystem/Topic captured at PDF-load time for any
-            # line that still matches its extracted title (no re-call needed).
-            elif ln in self._pdf_enrich:
-                for k, v in self._pdf_enrich[ln].items():
-                    fields[k] = v
-            records.append({
-                "title":  title,
-                "source": "manual",
-                "type":   type_key,
-                "status": "open",
-                "fields": fields,
-            })
+        staged = [{**r, "group": self._effective_group(r)}
+                  for r in self._rows if str(r.get("title") or "").strip()]
+        fresh, dupes = importers.dedupe_against_store(staged,
+                                                      kg_store.load_all())
+        if not fresh:
+            tooltip("Every one of those is already in your gap list.",
+                    period=4000)
+            return
+        records = importers.to_store_records(
+            fresh, type_key=self._type.currentData() or "kg",
+            use_groups=True)
+        # System/Subsystem/Topic ride in the type's own fields, alongside notes.
+        for rec, src in zip(records, fresh):
+            for k, v in (src.get("levels") or {}).items():
+                rec["fields"].setdefault(k, v)
         kg_store.add_many(records)
         self.imported_count = len(records)
+        if dupes:
+            tooltip(f"Skipped {len(dupes)} already in your list.", period=4000)
         self.accept()
 
 
@@ -2221,14 +2681,30 @@ class KnowledgeGapsPanel(QWidget):
         add_btn.clicked.connect(self._on_add_kg)
         import_btn = QPushButton("⇪ Bulk import")
         import_btn.setAutoDefault(False)
-        import_btn.setToolTip("Paste a list of gaps (one per line) to add them all at once.")
+        import_btn.setToolTip(
+            "Add many gaps at once — pasted one per line, as markdown with "
+            "groups and notes, from a PDF, or straight from Things.")
         import_btn.clicked.connect(self._on_bulk_import)
+        # A direct route for the source used most often, so the common case
+        # isn't a dialog you have to open and then press a second button in.
+        self._things_btn = None
+        if importers.available():
+            self._things_btn = QPushButton("⇪ From Things")
+            self._things_btn.setAutoDefault(False)
+            self._things_btn.setToolTip(
+                "Pull in every Things to-do tagged “KG”. Each one's project "
+                "becomes its group; its notes and checklist come with it. "
+                "Already-imported gaps are skipped, and nothing in Things is "
+                "changed.")
+            self._things_btn.clicked.connect(self._on_import_things)
         refresh_btn = QPushButton("⟳")
         refresh_btn.setFixedWidth(28)
         refresh_btn.setAutoDefault(False)
         refresh_btn.clicked.connect(lambda: self.refresh_list())
         btn_row.addWidget(add_btn)
         btn_row.addWidget(import_btn)
+        if self._things_btn is not None:
+            btn_row.addWidget(self._things_btn)
         # Capture from SynapsePro's AI chat. This is the robust half of that
         # feature — it reads one private global, where the button injected into
         # the chat header needs four — so it stays even if a SynapsePro update
@@ -3313,6 +3789,52 @@ class KnowledgeGapsPanel(QWidget):
         if n:
             tooltip(f"Imported {n} knowledge gap(s).")
             self.refresh_list()
+
+    def _on_import_things(self) -> None:
+        """One press: read Things, show what's new, import it.
+
+        Still a confirm, not a silent write — it can add fifty gaps and create
+        a dozen groups, and the tag tree is built off those groups."""
+        tag = importers.DEFAULT_TAG
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            items = importers.fetch(tag)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not items:
+            names = importers.list_tags()
+            showWarning(
+                f"No open to-dos are tagged “{tag}” in Things.\n\n"
+                + ("Tags on this Mac: " + ", ".join(names[:25]) + "\n\n"
+                   "Use Bulk import to pick a different tag."
+                   if names else "Couldn't read your Things database."))
+            return
+        fresh, dupes = importers.dedupe_against_store(items,
+                                                      kg_store.load_all())
+        if not fresh:
+            tooltip(f"All {len(items)} tagged to-do(s) are already in your "
+                    "gap list.", period=4000)
+            return
+        groups = sorted({str(r.get("group") or "").strip() for r in fresh}
+                        - {""})
+        n_notes = sum(1 for r in fresh if str(r.get("notes") or "").strip())
+        detail = [f"{len(fresh)} new gap(s) from Things."]
+        if groups:
+            detail.append("Groups: " + ", ".join(groups))
+        if n_notes:
+            detail.append(f"{n_notes} bring their notes across.")
+        if dupes:
+            detail.append(f"{len(dupes)} already imported — skipped.")
+        detail.append("\nNothing in Things is changed.")
+        if not askUser("\n".join(detail) + "\n\nImport them?"):
+            return
+        records = importers.to_store_records(
+            fresh,
+            type_key=(tool_config("knowledge_gaps").get("default_type_on_add")
+                      or "kg"))
+        kg_store.add_many(records)
+        tooltip(f"Imported {len(records)} gap(s) from Things.", period=4000)
+        self.refresh_list()
 
     def _on_clear_completed(self) -> None:
         items = kg_store.load_all()

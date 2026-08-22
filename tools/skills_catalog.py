@@ -132,6 +132,46 @@ def claude_project_instructions() -> str:
         return ""
 
 
+def _installed_names() -> list[str]:
+    """Every skill on this machine, bundled or the user's own."""
+    names: set[str] = set()
+    for base in (_claude_skills_dir(), _BUNDLED_DIR):
+        if not os.path.isdir(base):
+            continue
+        for name in os.listdir(base):
+            if os.path.isfile(os.path.join(base, name, "SKILL.md")):
+                names.add(name)
+    return sorted(names)
+
+
+def resolve_invocation(invocation: str) -> str:
+    """The skill name inside a free-text CLI invocation, or "".
+
+    The invocation is whatever the user typed in their notetype profile — a
+    slash command ("/malleus-anki"), a sentence ("use anki card creation
+    tool"), or the exact name. Claude Code matches a sentence like that against
+    every installed skill's description; nothing else can, so an API provider
+    has to resolve it by name or not at all.
+
+    Longest name first, so "anki-card-scorer" isn't shadowed by "anki-cards"
+    when both appear in one string."""
+    text = str(invocation or "").strip()
+    if not text:
+        return ""
+    slug = text.lstrip("/").strip()
+    names = sorted(_installed_names(), key=len, reverse=True)
+    if slug in names:
+        return slug
+    low = text.casefold()
+    # A name can be written with spaces or underscores instead of hyphens.
+    flat = re.sub(r"[\s_-]+", " ", low)
+    for name in names:
+        spaced = re.sub(r"[\s_-]+", " ", name.casefold())
+        if spaced in flat:
+            return name
+    return ""
+
+
 def portable_instructions(name: str) -> str:
     """The SKILL.md body (frontmatter stripped) for `name` — used to inline a
     skill's guidance on providers that have no native skill mechanism. Reads the

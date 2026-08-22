@@ -565,6 +565,40 @@ def _http_post_json(url: str, headers: dict, body: dict, timeout: int,
     return data
 
 
+def _with_portable_skill(system: str, invocation: str) -> str:
+    """Append the named skill's SKILL.md body to a system prompt.
+
+    Fails open: an invocation naming a skill that isn't installed leaves the
+    prompt exactly as it was, because a missing skill should degrade to
+    today's behaviour rather than take the call down."""
+    try:
+        from ..tools import skills_catalog
+        name = skills_catalog.resolve_invocation(invocation)
+        if not name:
+            # Worth saying out loud. Claude Code can match a loose sentence
+            # against a skill's DESCRIPTION; nothing else can, so an invocation
+            # that names no installed skill means this provider is being given
+            # a plainer brief than the CLI would get — and the difference shows
+            # up as "the cards are a bit worse on Gemini".
+            from . import log as _log
+            _log.warn(
+                f"skill: {invocation!r} doesn't name an installed skill, so "
+                "this provider gets no skill instructions. Installed: "
+                + ", ".join(skills_catalog._installed_names()))
+            return system
+        body = skills_catalog.portable_instructions(name)
+        if not body:
+            return system
+    except Exception as e:
+        from . import log as _log
+        _log.warn(f"skill inline failed for {invocation!r}: {e}")
+        return system
+    header = (f"\n\n--- INSTRUCTIONS FROM THE '{name}' SKILL ---\n"
+              "Follow these as part of your instructions above. Where they are "
+              "more specific than anything above, they win.\n\n")
+    return (system or "") + header + body
+
+
 def _call_gemini(api_key: str, model: str, system: str, user: str,
                  max_tokens: int, temperature: float = 0.4,
                  attachments: list[str] | None = None) -> str:
@@ -767,6 +801,20 @@ def ask_claude(
         provider, family = "anthropic", "anthropic"
     model = resolve_model(model, family)
     system_str = system or ""
+
+    # ── skill parity ────────────────────────────────────────────────────────
+    # On the CLI, `skill_invocation` is prepended to the prompt and Claude Code
+    # loads the matching SKILL.md from ~/.claude/skills/ by description. No
+    # other provider has that machinery, so the same request through Gemini,
+    # OpenAI, Ollama or the raw Anthropic API silently arrived WITHOUT the
+    # skill's instructions — the cards came out to a different spec depending
+    # on which provider happened to be selected. Inline the skill body into the
+    # system prompt instead, so every path is given the same brief.
+    #
+    # Not applied when skill_id is set: that routes to Anthropic's server-side
+    # skill, which loads the real thing and would then be given it twice.
+    if skill_invocation and not skill_id and provider not in ("auto", "cli"):
+        system_str = _with_portable_skill(system_str, skill_invocation)
 
     cli_path = ""
     if provider in ("auto", "cli"):
