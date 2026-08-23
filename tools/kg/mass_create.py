@@ -44,6 +44,7 @@ from .. import create_jobs
 from . import gen_prompt
 from . import store as kg_store
 from . import triage as kg_triage
+from .. import commit
 from .. import pipeline
 
 
@@ -1167,19 +1168,23 @@ class MassCreateDialog(QDialog):
             return
 
         # ONE checkpoint around the whole batch — the point of committing here
-        # rather than gap by gap is that a single Ctrl+Z unrolls the lot.
+        # rather than gap by gap is that a single Ctrl+Z unrolls the lot. Opened
+        # once here, and each gap's plan then runs inside it with
+        # checkpoint=False; nesting one per gap would defeat the whole thing.
         if hasattr(mw, "checkpoint"):
             mw.checkpoint("Mass AI Create")
         created_by_kg: dict[str, list] = {}
         for group, cards in batches:
-            try:
-                ids = cc.commit_cards(cards, ctx=group.commit_ctx(profile),
-                                      deck_name=group.deck_name or deck, notetype=nt)
-            except Exception as e:
-                log.error(f"mass create: committing '{group.title}' failed: {e}")
-                continue
-            created_by_kg[group.kg_id] = ids
-        mw.reset()
+            cplan = pipeline.CommitPlan(
+                label="Mass AI Create", new_cards=list(cards),
+                deck_name=group.deck_name or deck,
+                commit_ctx=group.commit_ctx(profile), notetype=nt)
+            res = commit.run(cplan, checkpoint=False)
+            if res.errors:
+                log.error(f"mass create: committing '{group.title}': "
+                          + "; ".join(res.errors))
+            created_by_kg[group.kg_id] = list(cplan.created_ids)
+        commit.refresh()
 
         n = sum(len(v) for v in created_by_kg.values())
         for kg_id, ids in created_by_kg.items():

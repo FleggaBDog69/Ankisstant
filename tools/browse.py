@@ -28,6 +28,7 @@ from ..core.qt_utils import (
     set_ai_buttons_enabled,
 )
 from . import autotag
+from . import commit
 from . import pipeline
 from .kg import engine
 
@@ -1610,39 +1611,30 @@ class BrowsePanel(QWidget):
                 tooltip("No notes selected.")
                 return
 
-        cids = []
-        for nid in nids:
-            try:
-                note = mw.col.get_note(nid)
-            except Exception:
-                continue
-            cids.extend(note.card_ids() if hasattr(note, "card_ids") else [c.id for c in note.cards()])
+        cids = commit.cards_of(nids)
 
-        if hasattr(mw, "checkpoint"):
-            mw.checkpoint("AI Browse: tag + unsuspend")
-        # Always apply the user-typed tag (that's the point of clicking
-        # Confirm). The audit tag and unsuspend are gated by toggles.
-        anki_utils.tag_notes(nids, tag)
+        # Stage 8, through the ONE commit. The tag order (the user's own tag
+        # first, then the audit and month tags) is commit.tag_ops_for's, which
+        # is the same order every other surface now uses — it used to be
+        # re-implemented here with its own small differences.
         apply_audit = bool(self.cb_audit.isChecked())
         audit_tag = (self.cfg.get("audit_tag") or "").strip()
-        if apply_audit and audit_tag and audit_tag != tag:
-            anki_utils.tag_notes(nids, audit_tag)
-        # Month tag for temporality (global toggle in Settings → Global).
         mtag = month_tag()
-        if mtag and mtag != tag:
-            anki_utils.tag_notes(nids, mtag)
-
         do_unsuspend = bool(self.cb_unsuspend.isChecked())
-        if do_unsuspend:
-            pre_cards = [mw.col.get_card(cid) for cid in cids]
-            before_suspended = sum(1 for c in pre_cards if c.queue == -1)
-            unsuspend_ok = anki_utils.unsuspend_cards(cids) if cids else True
-            after_suspended = sum(1 for cid in cids if mw.col.get_card(cid).queue == -1)
-            actually_unsuspended = before_suspended - after_suspended
-        else:
-            before_suspended = 0
-            unsuspend_ok = True
-            actually_unsuspended = 0
+        before_suspended = sum(
+            1 for cid in cids if mw.col.get_card(cid).queue == -1
+        ) if do_unsuspend else 0
+        cplan = pipeline.CommitPlan(
+            label="AI Browse: tag + unsuspend",
+            tag_ops=commit.tag_ops_for(
+                per_item=[(tag, list(nids))],
+                audit=(audit_tag if (apply_audit and audit_tag != tag) else ""),
+                month=(mtag if mtag != tag else "")),
+            unsuspend_nids=list(nids) if do_unsuspend else [],
+        )
+        res = commit.run(cplan)
+        actually_unsuspended = res.unsuspended
+        unsuspend_ok = not any("unsuspend" in e for e in res.errors)
 
         # Persist last_used_tag.
         self.cfg["last_used_tag"] = tag

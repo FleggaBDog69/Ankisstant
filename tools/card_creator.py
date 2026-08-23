@@ -30,6 +30,7 @@ from aqt.utils import askUser, showWarning, tooltip
 from . import autotag
 from . import pdf_render
 from . import quality_pass as qp
+from . import commit
 from . import pipeline
 from ..grounding import guidelines as grounding
 from ..core import anki_utils, api as core_api, log
@@ -4718,11 +4719,14 @@ class ReviewDialog(QDialog):
         nt = self._get_notetype()
         if nt is None:
             return
-        if hasattr(mw, "checkpoint"):
-            mw.checkpoint("AI Create")
-        created_ids = commit_cards(approved, ctx=self._ctx,
-                                   deck_name=self.deck_name, notetype=nt)
-        mw.reset()
+        # Stage 8, through the ONE commit (tools/commit.py) — the same call a
+        # sixty-point lecture ends on.
+        cplan = pipeline.CommitPlan(
+            label="AI Create", new_cards=list(approved),
+            deck_name=self.deck_name, commit_ctx=self._ctx, notetype=nt)
+        commit.run(cplan)
+        created_ids = list(cplan.created_ids)
+        commit.refresh()
         _append_session(
             mode=self.mode, source=self.source_label, topic=self.topic_label,
             cards_proposed=len(self.cards_in), cards_created=len(created_ids),

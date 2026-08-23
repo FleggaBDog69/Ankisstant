@@ -380,6 +380,16 @@ class CommitPlan:
     # than done by the caller so "the cards committed" and "the gap closed" can
     # never come apart.
     close_item_ids: list = field(default_factory=list)
+    # Opaque Anki objects for the new-card leg — the resolved notetype and the
+    # card_creator CommitCtx that maps a card dict onto its fields. The only
+    # non-data fields on this class, and they are here rather than passed
+    # alongside so that "everything this run changes" really is one object.
+    # A plan with no new_cards never needs them.
+    commit_ctx: Any = None
+    notetype: Any = None
+    # Filled by commit.run() with the note ids it created, so a door can act on
+    # the cards it just wrote (AI Lecture staples the source slide on).
+    created_ids: list = field(default_factory=list)
 
     @property
     def is_empty(self) -> bool:
@@ -548,6 +558,38 @@ def order_find_results(match, plain: list | None = None, limit: int = 0):
             if tick:
                 ticks.add(nid)
     return nids, notes, ticks, total
+
+
+# ── stage 6: checking cards you already own ──────────────────────────────────
+
+def check_found(front_html: str, max_clozes: int = 1):
+    """The deterministic quality checks, run on a card the deck ALREADY has.
+
+    Stage 6 only ever saw cards the add-on wrote. That is a strange place to
+    stop: the whole point of the find stage is that your deck's own card is
+    preferred to a new one, and preferring it without ever looking at it means
+    a card with the answer echoed in its own prompt gets unsuspended and
+    studied for another year.
+
+    Only the PREFILTERS run here, and that is deliberate rather than a first
+    cut. They are local, free and instant, so they cost a found card nothing.
+    The LLM rubric is a different matter: it is a per-card AI call, and the
+    relevance judge has already spent one on this card asking a different
+    question ("does this test the point?"). Grading every candidate on top of
+    that would multiply the slowest leg of the run for cards the user may not
+    even tick.
+
+    Returns a quality_pass.Verdict when a rule trips, else None ("no opinion").
+    Pure and importable off the main thread — quality_pass has no Qt and no
+    collection access.
+    """
+    from .quality_pass import prefilter_card
+    try:
+        return prefilter_card({"front": front_html or ""}, max_clozes)
+    except Exception:
+        # Fails OPEN, like every other optional pass: an opinion that can't be
+        # formed must never stop a card being shown.
+        return None
 
 
 # ── the run record ───────────────────────────────────────────────────────────

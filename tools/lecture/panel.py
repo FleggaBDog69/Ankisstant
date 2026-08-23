@@ -28,10 +28,12 @@ from aqt.webview import AnkiWebView
 
 from ...core import anki_utils, api as core_api, log
 from ...core.config import (
-    month_tag, save_tool_config, tool_config, tool_enabled, tool_model_for,
+    month_tag, save_tool_config, tool_config, tool_enabled,
 )
 from ...core.qt_utils import attach_tag_completer, is_manual_provider
 from . import cache, extractor, ingest, manual, matcher, media
+from .. import autotag
+from .. import commit
 from .. import pipeline
 
 
@@ -2125,6 +2127,12 @@ class LecturePanel(QWidget):
             parts.append(
                 "<button class='actbtn' onclick=\"pycmd('lec:divcreateall')\">"
                 "→ All to AI Create</button>")
+        if tool_enabled("card_creator"):
+            parts.append(
+                "<button class='actbtn' onclick=\"pycmd('lec:writeall')\" "
+                "title=\"Write cards for every unaddressed point, on the same "
+                "screen as the cards your deck already had\">"
+                "⚡ Write cards for all</button>")
         parts.append(
             "<button class='actbtn' onclick=\"pycmd('lec:exportgaps')\">"
             "⇩ Export missing…</button>")
@@ -2154,6 +2162,9 @@ class LecturePanel(QWidget):
             return
         if action == "divcreateall":
             self._divert_all("create")
+            return
+        if action == "writeall":
+            self._write_gaps()
             return
         if action == "exportgaps":
             self._export_gaps()
@@ -2625,6 +2636,166 @@ class LecturePanel(QWidget):
             concept=concept,
         )
 
+    # -- stage 5: WRITE ------------------------------------------------------
+    #
+    # AI Lecture never had a write stage. It had `_divert_all`, a stepper that
+    # opened AI Create on one gap, waited for you to finish, then opened it on
+    # the next one — precisely the grind the work-through's one screen deleted
+    # for knowledge gaps. Sixty gaps meant sixty round trips.
+    #
+    # It now lands on the SAME output page every other tool does: the found
+    # cards on top (this run's coverage, rendered by the shared results view),
+    # the written ones underneath, one Apply, one Ctrl+Z. Nothing about the
+    # search changes; this is the stage after it, which simply didn't exist.
+    #
+    # `_divert_all` stays. It is still the right tool for working ONE gap by
+    # hand with the full Create form in front of you.
+
+    def _write_gaps(self) -> None:
+        """Write cards for every uncovered point, on the shared run view."""
+        cov = self._coverage
+        gaps = list(getattr(cov, "gaps", []) or []) if cov else []
+        if not gaps:
+            tooltip("No gaps to write for — every point has a deck card.")
+            return
+        if not tool_enabled("card_creator"):
+            tooltip("Writing cards needs AI Create, which is turned off in "
+                    "Settings → Tools.")
+            return
+
+        item = self._work_item()
+        # The results view groups points by point.kg_id, so the lecture's
+        # points need the lecture's own id stamped on them. An identity stamp,
+        # idempotent, and nothing else in the pipeline reads kg_id on a
+        # file-mode point — it is empty precisely because nothing set it.
+        for m in list(cov.covered) + list(cov.gaps):
+            if not getattr(m.point, "kg_id", ""):
+                m.point.kg_id = item.id
+
+        # The type segment a free lecture's tags are built under — the same one
+        # a free AI Browse search uses, so a card written here files beside one
+        # written there rather than in a branch of its own.
+        item.type_key = autotag.default_type_key()
+
+        plan = self._plan_for(list(cov.covered) + list(cov.gaps),
+                              concept=item.title)
+        # The record the write stage reads. The uncovered points go on it so a
+        # plan can be rebuilt with no second AI call — the points measured
+        # against the deck are the points that get written.
+        record = item.to_kg_record(
+            concept=item.title,
+            points=[{"concept": m.point.concept,
+                     "terms": list(m.point.terms),
+                     "system": m.point.system, "subsystem": m.point.subsystem,
+                     "topic": m.point.topic}
+                    for m in gaps],
+            target_cards=len(gaps))
+
+        from ..run_view import open_run
+        open_run([record], plans=[plan], matches=list(self._matches),
+                 coverage=cov, door="lecture",
+                 title=f"AI Lecture — {item.title}",
+                 parent=self, on_committed=self._on_run_committed)
+
+    def _on_run_committed(self, created: dict, _found_nids: list) -> None:
+        """The lecture's own commit step, run inside the run view's checkpoint.
+
+        Written cards get their source slide stapled on, exactly as found cards
+        do — which is the one thing a lecture's cards have that a knowledge
+        gap's don't, and the reason this hook exists rather than the lecture
+        simply handing over a list of gaps and walking away.
+        """
+        pairs = [pair for pairs in (created or {}).values() for pair in pairs]
+        if not pairs:
+            return
+        try:
+            n = self._attach_slides_to_written(pairs)
+        except Exception as e:
+            # Fails CLOSED: attaching nothing is always safe, and the cards
+            # themselves have already committed.
+            log.error(f"lecture: couldn't attach slides to written cards: {e}")
+            return
+        if n:
+            log.info(f"lecture: attached slide images to {n} written card(s)")
+
+    def _attach_slides_to_written(self, pairs: list) -> int:
+        """Staple each written card's source slide onto it.
+
+        WHICH slide: the card says which learning point it answers (the
+        generation prompt asks for a "point" number — see
+        kg/gen_prompt._points_block), that point cites slides in `refs`, and
+        `refs` is intersected with the lecture's imagery-bearing pages exactly
+        as _attach_slides does for found cards. A card with no attribution gets
+        nothing rather than a guess: stapling the wrong slide onto a card is
+        worse than stapling none.
+
+        Same field resolution as _attach_slides — the slide field only, never
+        the tested Text/Extra.
+        """
+        if not self._path or not self._coverage:
+            return 0
+        imagery = self._imagery_slides_cached()
+        if not imagery:
+            return 0
+
+        # The uncovered points, in the order the record listed them — which is
+        # the order the model was asked to number them in.
+        gaps = list(getattr(self._coverage, "gaps", []) or [])
+        refs_by_index = [
+            [r for r in sorted(set(getattr(m.point, "refs", []) or []))
+             if r in imagery]
+            for m in gaps
+        ]
+
+        slides_by_nid: dict[int, list[int]] = {}
+        for nid, card in pairs:
+            try:
+                idx = int((card or {}).get("point") or 0)
+            except (TypeError, ValueError):
+                idx = 0
+            if not (1 <= idx <= len(refs_by_index)):
+                continue           # unattributed — attach nothing, not a guess
+            refs = refs_by_index[idx - 1]
+            if refs:
+                slides_by_nid[int(nid)] = list(refs)
+        if not slides_by_nid:
+            return 0
+
+        wanted = sorted({r for rs in slides_by_nid.values() for r in rs})
+        paths = ingest.render_segment_paths(self._path, wanted)
+        fname_by_slide: dict[int, str] = {}
+        for n, pth in paths.items():
+            fn = media.import_image_to_media(pth)
+            if fn:
+                fname_by_slide[n] = fn
+        if not fname_by_slide:
+            return 0
+
+        cfg_field = (self.cfg.get("slide_field") or "").strip()
+        touched = 0
+        for nid, slides in slides_by_nid.items():
+            try:
+                note = mw.col.get_note(nid)
+            except Exception:
+                continue
+            field = self._slide_field_for(note, cfg_field)
+            if not field:
+                continue
+            existing = note[field] or ""
+            frags = [f'<img src="{_esc_attr(fname_by_slide[n])}">'
+                     for n in slides
+                     if n in fname_by_slide and fname_by_slide[n] not in existing]
+            if not frags:
+                continue
+            note[field] = (existing + "<br>" if existing else "") + "<br>".join(frags)
+            try:
+                mw.col.update_note(note)
+                touched += 1
+            except Exception as e:
+                log.warn(f"lecture: could not attach slides to written note "
+                         f"{nid}: {e}")
+        return touched
+
     # -- export the gaps for a third-party generator --
     def _export_gaps(self):
         """Write the MISSING learning points to a markdown file the user can hand
@@ -2762,34 +2933,24 @@ class LecturePanel(QWidget):
         ):
             return
 
-        cids: list[int] = []
-        for nid in nids:
-            try:
-                note = mw.col.get_note(nid)
-            except Exception:
-                continue
-            cids.extend(note.card_ids() if hasattr(note, "card_ids")
-                        else [c.id for c in note.cards()])
-
-        # One checkpoint around everything, so one undo reverses the whole run.
-        if hasattr(mw, "checkpoint"):
-            mw.checkpoint("AI Lecture: tag + unsuspend")
-        anki_utils.tag_notes(nids, tag)
+        # Stage 8, through the ONE commit (tools/commit.py). One checkpoint
+        # around everything, so one undo reverses the whole run.
         audit = (self.cfg.get("audit_tag") or "").strip()
-        if audit and audit != tag:
-            anki_utils.tag_notes(nids, audit)
         mtag = month_tag()
-        if mtag and mtag != tag:
-            anki_utils.tag_notes(nids, mtag)
-
-        unsuspended = 0
-        if do_unsuspend and cids:
-            before = sum(1 for cid in cids if mw.col.get_card(cid).queue == -1)
-            anki_utils.unsuspend_cards(cids)
-            after = sum(1 for cid in cids if mw.col.get_card(cid).queue == -1)
-            unsuspended = before - after
+        cplan = pipeline.CommitPlan(
+            label="AI Lecture: tag + unsuspend",
+            tag_ops=commit.tag_ops_for(
+                per_item=[(tag, list(nids))],
+                audit=(audit if audit != tag else ""),
+                month=(mtag if mtag != tag else "")),
+            unsuspend_nids=list(nids) if do_unsuspend else [],
+        )
+        res = commit.run(cplan)
+        unsuspended = res.unsuspended
 
         # Notes before slides so the text lands above the images in the field.
+        # Inside the checkpoint commit.run just opened, so the whole run is
+        # still one undo.
         noted = self._attach_notes(nids) if do_notes else 0
         attached = self._attach_slides(nids) if do_attach else 0
 
@@ -2801,11 +2962,7 @@ class LecturePanel(QWidget):
             + (f", slides added to {attached} note(s)" if do_attach and attached else "")
             + "."
         )
-        try:
-            mw.col.reset()
-            mw.reset()
-        except Exception:
-            pass
+        commit.refresh()
 
     # -- slide-attach preview --
     def _on_attach_toggled(self, on: bool):

@@ -34,6 +34,7 @@
 from __future__ import annotations
 
 import threading
+import uuid
 
 from aqt import mw
 from aqt.qt import (
@@ -52,6 +53,7 @@ from ...core.qt_utils import (
 )
 from .. import autotag
 from . import store as kg_store, triage as kg_triage
+from .. import commit
 from .. import pipeline
 
 
@@ -171,15 +173,39 @@ class BulkSearchDialog(QDialog):
     ROLE_CONCEPT = Qt.ItemDataRole.UserRole + 3   # a point row's concept text
     ROLE_KG = Qt.ItemDataRole.UserRole + 4        # owning gap, carried by leaves
 
-    def __init__(self, kgs: list[dict], parent=None, *, unified: bool = False):
+    def __init__(self, kgs: list[dict], parent=None, *, unified: bool = False,
+                 plans=None, matches=None, coverage=None, door: str = "",
+                 title: str = "", on_committed=None):
         super().__init__(parent or mw)
+        # ── the other doors ──────────────────────────────────────────────────
+        # This dialog started as the work-through's own screen and is now THE
+        # output page: every tool lands here (see tools/run_view.py). A door
+        # that has already done some of the pipeline hands its results in
+        # rather than making the user run them again.
+        #
+        #   plans      already-read work items  -> the READ stage is skipped
+        #   matches +
+        #   coverage   an already-run deck search -> FIND is skipped too, and
+        #              the results page renders straight from them
+        #
+        # `kgs` are then FLATTENED records (WorkItem.to_kg_record), not store
+        # records — a lecture has no knowledge-gap store behind it, so every
+        # store lookup in here falls back to the records it was handed.
+        self._door = str(door or ("work-through" if unified else "bulk-search"))
+        self._on_committed = on_committed
+        self._seed_plans = list(plans or [])
+        self._seed_matches = list(matches or [])
+        self._seed_coverage = coverage
+        self._seed_title = str(title or "")
+        self._record = pipeline.RunRecord(run_id=uuid.uuid4().hex[:12],
+                                          door=self._door)
         # UNIFIED MODE is the same dialog with the hand-off automated: instead of
         # stopping at "these gaps aren't covered, send them to Create yourself",
         # committing rolls straight on into Mass AI Create carrying the points
         # your deck turned out not to have. One pass, one decision per gap.
         self._unified = bool(unified)
-        self.setWindowTitle("Work through knowledge gaps" if unified
-                            else "Bulk search — knowledge gaps")
+        self.setWindowTitle(title or ("Work through knowledge gaps" if unified
+                                      else "Bulk search — knowledge gaps"))
         self.setMinimumSize(940, 660)
         self.resize(1180, 760)
         # NOT WA_DeleteOnClose: closing while a search runs HIDES this window and
@@ -200,6 +226,15 @@ class BulkSearchDialog(QDialog):
         # fire afterwards, and touching a deleted Qt widget from one is a crash.
         self._closed = False
         self._tag_edits: dict[str, QLineEdit] = {}   # kg_id -> its tag box
+        # nid -> the deterministic quality check's one-line finding, or "".
+        # Cached because the tree is rebuilt on every tick and the check, cheap
+        # as it is, reads the note from the collection to run.
+        self._flaw_cache: dict = {}
+        try:
+            from .. import card_creator as _cc
+            self._atomicity_max = _cc._atomicity_max(tool_config("card_creator"))
+        except Exception:
+            self._atomicity_max = 1
 
         # ── the writing half of the one screen ───────────────────────────────
         # Unified mode no longer hands the uncovered points to another window:
@@ -233,13 +268,77 @@ class BulkSearchDialog(QDialog):
         self._poll.timeout.connect(self._on_gen_poll)
 
         self._build()
+        self._seed_record()
+        if self._seed_plans:
+            # Pre-planned: the door that opened this already read the material,
+            # so the plan table is filled from its plans and the AI read that
+            # would re-derive them is never spent.
+            self._plans = list(self._seed_plans)
         self._fill_plan_table()
-        if provider_configured() and not is_manual_provider():
+        if self._seed_plans:
+            self._render_plan_table()
+        if self._seed_coverage is not None:
+            # The door already searched the deck. Render its results directly —
+            # this is the same page a work-through search lands on, built from
+            # someone else's matches.
+            self._matches = list(self._seed_matches)
+            self._coverage = self._seed_coverage
+            self._run_plans = list(self._seed_plans)
+            self._wants = {p.kg_id: (True, True) for p in self._run_plans}
+            QTimer.singleShot(0, self._render_results)
+        elif provider_configured() and not is_manual_provider():
             self._set_status(
                 "Nothing has been sent to the AI yet. Edit any gap's notes "
                 "first — they're the biggest thing the read goes on — then "
                 "press Read gaps with AI.")
         theme_dialog(self)
+
+    # ── the stage strip ──────────────────────────────────────────────────────
+
+    def _seed_record(self) -> None:
+        """The run record the strip renders, stamped with what this door has
+        already done before the window even opened."""
+        r = self._record
+        r.mark(pipeline.TAKE_IN, pipeline.DONE, f"{len(self._kgs)} item(s)")
+        if self._seed_plans:
+            pts = sum(len(getattr(p, "points", []) or []) for p in self._seed_plans)
+            r.mark(pipeline.READ, pipeline.SKIPPED,
+                   f"{pts} point(s) — read already")
+            r.mark(pipeline.APPROVE, pipeline.SKIPPED)
+        if self._seed_coverage is not None:
+            cov = self._seed_coverage
+            r.mark(pipeline.FIND, pipeline.DONE,
+                   f"{len(getattr(cov, 'gaps', []) or [])} gap(s)")
+        self._sync_strip()
+
+    def _sync_strip(self) -> None:
+        strip = getattr(self, "_strip", None)
+        if strip is not None:
+            strip.set_record(self._record)
+
+    def _stage(self, key: str, state: str, count: str = "",
+               error: str = "") -> None:
+        """Move one stage and repaint the strip. Every state change in this
+        dialog goes through here, so the strip can never drift from the run."""
+        self._record.mark(key, state, count, error)
+        self._sync_strip()
+
+    def _record_for(self, kg_id: str) -> dict:
+        """The record for a work item — the ones this dialog was HANDED first,
+        the knowledge-gap store second.
+
+        The order matters: a door with no store behind it (AI Lecture) is only
+        reachable at all because the handed-in records win. It also means an
+        edit made on the plan page is what the write stage sees, rather than
+        whatever the store last persisted."""
+        kg_id = str(kg_id or "")
+        for k in self._kgs:
+            if str(k.get("id") or k.get("kg_id") or "") == kg_id:
+                return k
+        try:
+            return kg_store.get(kg_id) or {}
+        except Exception:
+            return {}
 
     # ── construction ─────────────────────────────────────────────────────────
 
@@ -247,6 +346,13 @@ class BulkSearchDialog(QDialog):
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 12, 14, 12)
         root.setSpacing(8)
+
+        # The stage strip: always the same eight boxes whatever came in the
+        # door, including the ones this run skipped. See tools/run_view.py.
+        from ..run_view import StageStrip
+        self._strip = StageStrip()
+        root.addWidget(self._strip)
+        self._sync_strip()
 
         self._title = QLabel()
         self._title.setTextFormat(Qt.TextFormat.RichText)
@@ -792,6 +898,7 @@ class BulkSearchDialog(QDialog):
         self._set_busy(True, (f"Saved notes on {saved} gap(s). " if saved else "")
                        + f"Reading {len(kgs)} gap(s) with AI…")
         model = pipeline.dial_for(pipeline.READ)
+        self._stage(pipeline.READ, pipeline.RUNNING)
 
         # A batch of gaps is one big reasoning call — measured at several minutes
         # for 17 gaps. Without a running clock a static label reads as a hang.
@@ -814,10 +921,12 @@ class BulkSearchDialog(QDialog):
         try:
             plans = fut.result()
         except core_api.ClaudeCancelled:
+            self._stage(pipeline.READ, pipeline.PENDING)
             self._status.setText("Stopped.")
             return
         except Exception as e:
             import traceback
+            self._stage(pipeline.READ, pipeline.FAILED, error=str(e))
             log.error(f"bulk search: triage failed: {e}\n{traceback.format_exc()}")
             self._status.setText("")
             friendly = getattr(e, "friendly", None) or str(e)
@@ -838,6 +947,8 @@ class BulkSearchDialog(QDialog):
                     kg_type=str(kg.get("type") or "kg").lower(),
                     concept="", included=False)
             self._plans.append(p)
+        self._stage(pipeline.READ, pipeline.DONE,
+                    f"{sum(len(p.points) for p in self._plans)} point(s)")
         self._render_plan_table()
         if self._lp_gate_cb.isChecked():
             self._open_lp_gate()
@@ -1057,6 +1168,8 @@ class BulkSearchDialog(QDialog):
 
         self._cancel_ev = threading.Event()
         cancel_ev = self._cancel_ev
+        self._stage(pipeline.APPROVE, pipeline.DONE)
+        self._stage(pipeline.FIND, pipeline.RUNNING)
         self._set_busy(True, "Starting…", progress=True, stoppable=True)
 
         def _report(msg, pct):
@@ -1103,15 +1216,19 @@ class BulkSearchDialog(QDialog):
         try:
             _lecture, matches, coverage = fut.result()
         except (Cancelled, core_api.ClaudeCancelled):
+            self._stage(pipeline.FIND, pipeline.PENDING)
             self._status.setText("Stopped.")
             return
         except Exception as e:
             import traceback
+            self._stage(pipeline.FIND, pipeline.FAILED, error=str(e))
             log.error(f"bulk search: run failed: {e}\n{traceback.format_exc()}")
             self._status.setText("")
             showWarning(f"Bulk search failed:\n\n{e}")
             return
         self._matches, self._coverage = matches, coverage
+        self._stage(pipeline.FIND, pipeline.DONE,
+                    f"{len(getattr(coverage, 'gaps', []) or [])} gap(s)")
         self._render_results()
 
     # ── stage 3: results, grouped by gap ─────────────────────────────────────
@@ -1292,9 +1409,16 @@ class BulkSearchDialog(QDialog):
                     # rest in the tooltip: deciding whether a card belongs to a
                     # gap is unreadable off a 150-character stub.
                     full = matcher.note_text(nid, 700)
-                    leaf.setText(0, f"{mark}{_short(full, 260)}")
+                    # Stage 6 CHECK, on a card you already own. Local, free and
+                    # instant (see pipeline.check_found) — no AI call — so a
+                    # found card is finally held to the same standard as a
+                    # written one before it's unsuspended and studied.
+                    flaw = self._found_flaw(nid)
+                    leaf.setText(0, f"{mark}{_short(full, 260)}"
+                                    + (f"   [{flaw}]" if flaw else ""))
                     leaf.setToolTip(0, f"{full}\n\nDouble-click to open this "
-                                       "note in the Anki browser.")
+                                       "note in the Anki browser."
+                                    + (f"\n\nQuality check: {flaw}" if flaw else ""))
                 if not chosen and not extra:
                     empty = QTreeWidgetItem(node)
                     empty.setData(0, self.ROLE_KIND, "info")
@@ -1329,6 +1453,33 @@ class BulkSearchDialog(QDialog):
         if (self._unified and self._write_cb is not None
                 and self._write_cb.isChecked() and not self._gen_batch_id):
             QTimer.singleShot(0, self._start_generation)
+
+    def _found_flaw(self, nid: int) -> str:
+        """One line of quality opinion on a card the deck already has, or "".
+
+        Words, not a colour: this appears in square brackets on the row and in
+        the tooltip. It is INFORMATIONAL only — a flawed card is still ticked
+        and still commits, because it is his card and the tool's job here is to
+        tell him, not to overrule him.
+        """
+        key = int(nid)
+        cache = self._flaw_cache
+        if key in cache:
+            return cache[key]
+        out = ""
+        try:
+            note = mw.col.get_note(key)
+            front = note.fields[0] if note.fields else ""
+            v = pipeline.check_found(front, self._atomicity_max)
+            if v is not None and getattr(v, "verdict", "") != "PASS":
+                out = str(getattr(v, "reason", "") or "").strip()
+                # The row can't hold a paragraph; the tooltip carries the rest.
+                if len(out) > 90:
+                    out = out[:89].rstrip() + "…"
+        except Exception:
+            out = ""
+        cache[key] = out
+        return out
 
     def _suggest_tag(self, plan, group) -> str:
         """This gap's hierarchical tag. Built from the point levels the triage
@@ -1795,17 +1946,8 @@ class BulkSearchDialog(QDialog):
         No checkpoint and no confirm of its own: both callers own those, and on
         the one screen this runs inside the SAME checkpoint as the newly written
         cards so one undo takes back the whole pass."""
-        cids: list[int] = []
-        for nid in all_nids:
-            try:
-                note = mw.col.get_note(nid)
-            except Exception:
-                continue
-            cids.extend(note.card_ids() if hasattr(note, "card_ids")
-                        else [c.id for c in note.cards()])
-
         plans_by_id = {p.kg_id: p for p in self._run_plans}
-        tagged = 0
+        per_item: list = []
         for kg_id, rec in ticked.items():
             if not rec["nids"]:
                 continue
@@ -1817,25 +1959,26 @@ class BulkSearchDialog(QDialog):
             if plan:
                 tags.extend(x for x in plan.tags if x and x not in tags)
             for tag in tags:
-                anki_utils.tag_notes(rec["nids"], tag)
-            if tags:
-                tagged += len(rec["nids"])
+                per_item.append((tag, list(rec["nids"])))
 
         cfg = tool_config("browse")
-        audit = (cfg.get("audit_tag") or "").strip()
-        if audit:
-            anki_utils.tag_notes(all_nids, audit)
-        mtag = month_tag()
-        if mtag:
-            anki_utils.tag_notes(all_nids, mtag)
-
-        unsuspended = 0
-        if do_unsuspend and cids:
-            before = sum(1 for cid in cids if mw.col.get_card(cid).queue == -1)
-            anki_utils.unsuspend_cards(cids)
-            after = sum(1 for cid in cids if mw.col.get_card(cid).queue == -1)
-            unsuspended = before - after
-        return tagged, unsuspended
+        cplan = pipeline.CommitPlan(
+            label="Ankisstant: work through gaps",
+            tag_ops=commit.tag_ops_for(
+                per_item=per_item,
+                audit=(cfg.get("audit_tag") or "").strip(),
+                month=month_tag(),
+                # EVERY ticked note, not just the tagged ones: a gap with an
+                # empty tag box still took part in this run and still gets the
+                # audit trail, exactly as it did before.
+                everything=list(all_nids)),
+            unsuspend_nids=list(all_nids) if do_unsuspend else [],
+        )
+        # checkpoint=False: the caller opened ONE around this and the newly
+        # written cards together, which is what makes a single Ctrl+Z take the
+        # whole pass back out.
+        res = commit.run(cplan, checkpoint=False)
+        return res.tagged, res.unsuspended
 
     # ── unified: the writing half, on the same screen ────────────────────────
 
@@ -1869,7 +2012,7 @@ class BulkSearchDialog(QDialog):
             if self._wants and not self._wants.get(kg_id, (True, True))[1]:
                 continue
             plan = plans_by_id.get(kg_id)
-            kg = kg_store.get(kg_id)
+            kg = self._record_for(kg_id)
             if plan is None or not kg:
                 continue
             out.append(create_record_for(
@@ -2029,6 +2172,9 @@ class BulkSearchDialog(QDialog):
             return
         payload = self._create_payload()
         if not payload:
+            self._stage(pipeline.WRITE, pipeline.SKIPPED,
+                        "nothing left to write")
+            self._stage(pipeline.CHECK, pipeline.SKIPPED)
             self._show_written_ui()
             self._gen_note.setText(
                 "Every point was covered by a card you already have.")
@@ -2092,6 +2238,8 @@ class BulkSearchDialog(QDialog):
             return
 
         self._gen_batch_id = records[0]["batch_id"]
+        self._stage(pipeline.WRITE, pipeline.RUNNING,
+                    f"{len(records)} item(s)")
         self._mark_in_progress([r.get("kg_id") for r in records])
         self._show_written_ui()
         if is_manual_provider():
@@ -2304,6 +2452,7 @@ class BulkSearchDialog(QDialog):
             self._stop_btn.setVisible(False)
             self._resurface()
             self._refresh_gen_head()
+            self._mark_write_done()
             return
         try:
             self._progress.setValue(
@@ -2697,6 +2846,20 @@ class BulkSearchDialog(QDialog):
             (v.get("reason") or "") if verdict in ("FAIL", "FLAG") else "",
             "Double-click to edit this card before it is added.") if x))
 
+    def _mark_write_done(self) -> None:
+        """WRITE and CHECK are finished; the cards are on screen for REVIEW.
+
+        CHECK is reported as skipped rather than done when the quality pass is
+        off — a stage that didn't run must say so, not quietly read as if it
+        had passed everything."""
+        n = len(self._written_items())
+        self._stage(pipeline.WRITE, pipeline.DONE, f"{n} card(s)")
+        graded = any((c or {}).get("grade") for _leaf, c in self._written_items())
+        self._stage(pipeline.CHECK,
+                    pipeline.DONE if graded else pipeline.SKIPPED,
+                    "graded" if graded else "not graded")
+        self._stage(pipeline.REVIEW, pipeline.RUNNING)
+
     def _refresh_gen_head(self) -> None:
         items = self._written_items()
         approved = sum(1 for it, _c in items
@@ -2855,10 +3018,25 @@ class BulkSearchDialog(QDialog):
         if hasattr(mw, "checkpoint"):
             mw.checkpoint("Ankisstant: work through gaps")
 
+        self._stage(pipeline.REVIEW, pipeline.DONE,
+                    f"{len(all_nids) + n_new} kept")
+        self._stage(pipeline.COMMIT, pipeline.RUNNING)
         tagged = unsuspended = 0
         if all_nids:
             tagged, unsuspended = self._apply_found(ticked, all_nids, do_unsuspend)
         created_by_kg = self._apply_created(batches, deck)
+
+        # The door's own commit step, INSIDE this checkpoint so one Ctrl+Z
+        # still takes the whole pass back out. AI Lecture attaches slide
+        # images here; a door with nothing extra to do passes nothing.
+        if self._on_committed is not None:
+            try:
+                self._on_committed(getattr(self, "_created_pairs", {}),
+                                   all_nids)
+            except Exception as e:
+                # Never let a door's extra step undo a commit that worked.
+                log.error(f"run view: the {self._door} door's commit step "
+                          f"failed: {e}")
 
         # A gap closes if your deck turned out to cover it, or if cards were
         # just written for it. Everything else stays open on purpose.
@@ -2866,6 +3044,8 @@ class BulkSearchDialog(QDialog):
             list(full) + [k for k, ids in created_by_kg.items() if ids])))
 
         n_created = sum(len(v) for v in created_by_kg.values())
+        self._stage(pipeline.COMMIT, pipeline.DONE,
+                    f"{len(all_nids)} tagged · {n_created} added")
         self._applied = True
         self._commit_btn.setEnabled(False)
         self._commit_btn.setText("Applied")
@@ -2903,6 +3083,11 @@ class BulkSearchDialog(QDialog):
         from .. import card_creator as cc
         from .mass_create import commit_ctx_for
         created_by_kg: dict[str, list] = {}
+        # kg_id -> [(nid, card), ...]. commit_cards adds one note per card in
+        # order, so the zip is exact — and it is the only way a door can act on
+        # the cards it just wrote (AI Lecture staples each card's source slide
+        # onto it, and needs to know WHICH card got which slide).
+        self._created_pairs = {}
         if not batches:
             return created_by_kg
         profile = self._gen_profile or cc._resolved_profile(
@@ -2922,16 +3107,20 @@ class BulkSearchDialog(QDialog):
             box = self._tag_text(kg_id)
             if box and box not in tags:
                 tags.append(box)
-            try:
-                ids = cc.commit_cards(
-                    cards, ctx=commit_ctx_for(job, profile, tags),
-                    deck_name=(job.get("deck_name") or "").strip() or deck,
-                    notetype=nt)
-            except Exception as e:
+            # checkpoint=False: _on_apply_everything already opened one around
+            # both halves of this screen.
+            cplan = pipeline.CommitPlan(
+                label="Ankisstant: work through gaps", new_cards=list(cards),
+                deck_name=(job.get("deck_name") or "").strip() or deck,
+                commit_ctx=commit_ctx_for(job, profile, tags), notetype=nt)
+            res = commit.run(cplan, checkpoint=False)
+            if res.errors:
                 log.error("work through: committing "
-                          f"'{job.get('title')}' failed: {e}")
+                          f"'{job.get('title')}': " + "; ".join(res.errors))
                 continue
+            ids = list(cplan.created_ids)
             created_by_kg[kg_id] = ids
+            self._created_pairs[kg_id] = list(zip(ids, cards))
             try:
                 cc._append_session(
                     mode="topic", source=f"work-through:{self._gen_batch_id}",

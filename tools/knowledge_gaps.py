@@ -42,6 +42,7 @@ from ..core.qt_utils import (
 )
 from . import autotag
 from .kg import importers, store as kg_store
+from . import commit
 from . import pipeline
 
 
@@ -2318,22 +2319,18 @@ class _WriteOwnCardDialog(QDialog):
             kg_field_values=dict(self._kg.get("fields") or {}),
         )
         card = {"front": front, "extra": self._back.toPlainText().strip()}
-        try:
-            mw.checkpoint("Ankisstant: write your own card")
-            ids = cc.commit_cards([card], ctx=ctx,
-                                  deck_name=self._deck.currentText().strip()
-                                  or "Default",
-                                  notetype=nt)
-        except Exception as e:
-            log.error(f"write-your-own: commit failed: {e}")
-            self._status.setText(f"Couldn't add that card: {e}")
+        cplan = pipeline.CommitPlan(
+            label="Ankisstant: write your own card", new_cards=[card],
+            deck_name=self._deck.currentText().strip() or "Default",
+            commit_ctx=ctx, notetype=nt)
+        res = commit.run(cplan)
+        if res.errors:
+            log.error("write-your-own: commit failed: " + "; ".join(res.errors))
+            self._status.setText("Couldn't add that card: "
+                                 + "; ".join(res.errors))
             return
-        self.created_ids.extend(ids)
-        try:
-            mw.col.reset()
-            mw.reset()
-        except Exception:
-            pass
+        self.created_ids.extend(cplan.created_ids)
+        commit.refresh()
 
         if keep_open:
             self._front.setPlainText("")
