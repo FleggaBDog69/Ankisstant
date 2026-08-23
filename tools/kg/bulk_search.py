@@ -52,6 +52,7 @@ from ...core.qt_utils import (
 )
 from .. import autotag
 from . import store as kg_store, triage as kg_triage
+from .. import pipeline
 
 
 # How many judge-approved-but-not-chosen cards to offer per point, under the
@@ -790,8 +791,7 @@ class BulkSearchDialog(QDialog):
         kgs = [self._kgs[r] for r in rows]
         self._set_busy(True, (f"Saved notes on {saved} gap(s). " if saved else "")
                        + f"Reading {len(kgs)} gap(s) with AI…")
-        from ...core.config import tool_model_for
-        model = tool_model_for("lecture_extract")
+        model = pipeline.dial_for(pipeline.READ)
 
         # A batch of gaps is one big reasoning call — measured at several minutes
         # for 17 gaps. Without a running clock a static label reads as a hang.
@@ -1502,7 +1502,6 @@ class BulkSearchDialog(QDialog):
         is one short call about one card, and the alternative is a row that
         silently changes some seconds after you stopped looking at it."""
         from .. import card_creator as cc
-        from ...core.config import tool_model_for
         card = leaf.data(0, self.ROLE_CARD)
         if not isinstance(card, dict):
             return
@@ -1523,7 +1522,7 @@ class BulkSearchDialog(QDialog):
         try:
             if what == "rewrite":
                 out = cc._regenerate_one(card, hint, profile, "",
-                                         tool_model_for("card_creation"))
+                                         pipeline.dial_for(pipeline.WRITE))
             elif what == "obo":
                 out = cc.one_by_one_rewrite(card, profile)
             else:
@@ -2052,7 +2051,6 @@ class BulkSearchDialog(QDialog):
         except Exception as e:
             log.warn(f"work through: vocab cache refresh failed: {e}")
 
-        from ...core.config import tool_model_for
         from .. import create_jobs
         from . import gen_prompt
 
@@ -2084,7 +2082,7 @@ class BulkSearchDialog(QDialog):
         records = gen_prompt.build_batch(
             plans=plans, gaps_by_id=gaps_by_id, deck_name=deck_name,
             notetype_name=notetype_name, base_tags=base_tags,
-            tags_by_kg=tags_by_kg, model=tool_model_for("card_creation"),
+            tags_by_kg=tags_by_kg, model=pipeline.dial_for(pipeline.WRITE),
             origin="work-through")
         if not records:
             self._show_written_ui()
@@ -2162,7 +2160,6 @@ class BulkSearchDialog(QDialog):
             log.warn(f"work through: no point matching {concept!r} on {kg_id}")
             return
 
-        from ...core.config import tool_model_for
         from .. import create_jobs
         from . import gen_prompt
         try:
@@ -2192,7 +2189,7 @@ class BulkSearchDialog(QDialog):
                         if self._deck is not None else "") or "Default"),
             notetype_name=notetype_name, base_tags=base_tags,
             tags_by_kg={kg_id: self._tag_text(kg_id)},
-            model=tool_model_for("card_creation"), origin="work-through",
+            model=pipeline.dial_for(pipeline.WRITE), origin="work-through",
             batch_id=self._gen_batch_id)
         if not records:
             showWarning("Couldn't build a generation request for that point — "
@@ -3493,7 +3490,6 @@ class _WrittenCardDialog(QDialog):
 
     def _on_regen(self) -> None:
         from aqt.qt import QInputDialog
-        from ...core.config import tool_model_for
         hint, ok = QInputDialog.getText(
             self, "Rewrite this card",
             "What was wrong with it? (optional)")
@@ -3504,7 +3500,7 @@ class _WrittenCardDialog(QDialog):
         try:
             from .. import card_creator as cc
             new = cc._regenerate_one(self.values(), hint.strip(), self._profile,
-                                     "", tool_model_for("card_creation"))
+                                     "", pipeline.dial_for(pipeline.WRITE))
         except Exception as e:
             log.error(f"work through: rewrite failed: {e}")
             self._status.setText(f"Couldn't rewrite it: {e}")

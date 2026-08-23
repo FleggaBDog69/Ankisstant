@@ -44,6 +44,7 @@ from .. import create_jobs
 from . import gen_prompt
 from . import store as kg_store
 from . import triage as kg_triage
+from .. import pipeline
 
 
 NAME = "Mass AI Create"
@@ -729,7 +730,11 @@ class MassCreateDialog(QDialog):
                     if pre_planned else "Tick at least one gap first.")
             return
 
-        model = tool_model_for("card_creation")
+        # Stage READ, resolved through the one dial. This line used to read
+        # tool_model_for("card_creation") — the same gaps that bulk_search read
+        # on `lecture_extract`, read here on the generation dial, so which model
+        # understood your shorthand depended on which button you pressed.
+        model = pipeline.dial_for(pipeline.READ)
         locks = self._locks()
         note = f" ({pre_planned} already planned by Mass AI Search)" if pre_planned else ""
         self._set_busy(True, f"Reading {len(todo)} gap(s) with AI…{note}")
@@ -853,7 +858,7 @@ class MassCreateDialog(QDialog):
         records = gen_prompt.build_batch(
             plans=plans, gaps_by_id=self._by_id, deck_name=deck_name,
             notetype_name=notetype_name, base_tags=base_tags,
-            tags_by_kg=tags_by_kg, model=tool_model_for("card_creation"),
+            tags_by_kg=tags_by_kg, model=pipeline.dial_for(pipeline.WRITE),
             focus=self._focus.text().strip())
         if not records:
             showWarning("Couldn't build a request for any of those gaps — see the log.")
@@ -1531,7 +1536,7 @@ class _KGGroup(QFrame):
     def _on_regen(self, old_card, hint: str = ""):
         from .. import card_creator as cc
         return cc._regenerate_one(old_card, hint, self.profile, "",
-                                  tool_model_for("card_creation"))
+                                  pipeline.dial_for(pipeline.WRITE))
 
     def _on_obo(self, old_card):
         from .. import card_creator as cc

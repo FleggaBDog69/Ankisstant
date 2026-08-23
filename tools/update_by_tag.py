@@ -30,6 +30,7 @@ from ..core import anki_utils, api as core_api, log
 from ..core.config import tool_config, tool_model_for
 from ..grounding import guidelines as grounding
 from . import autotag
+from . import pipeline
 from . import card_creator as cc
 from . import quality_pass as qp
 from ..core import synapse
@@ -480,7 +481,7 @@ class UpdateByTagPanel(QWidget):
         self._profile = profile
         self._nt = nt
         self._cc_cfg = tool_config("card_creator")
-        self._model = tool_model_for("card_creation")
+        self._model = pipeline.dial_for(pipeline.WRITE)
         self._deck_id = mw.col.decks.id(dest)
         self._audit_tag = (self.cfg.get("audit_tag") or "Ankisstant::AI::Updated").strip()
         self._review_tag = (self.cfg.get("review_tag") or "Ankisstant::AI::UpdateReview").strip()

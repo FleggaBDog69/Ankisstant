@@ -32,6 +32,7 @@ from ...core.config import (
 )
 from ...core.qt_utils import attach_tag_completer, is_manual_provider
 from . import cache, extractor, ingest, manual, matcher, media
+from .. import pipeline
 
 
 NAME = "AI Lecture"
@@ -457,7 +458,7 @@ def run_pipeline(path: str, cfg: dict, *, report, cancel_ev: threading.Event,
     search_scope = (cfg.get("search_scope") or "").strip()
     force_reextract = bool(cfg.get("force_reextract", False))
     lo_text = (cfg.get("lo_text") or "").strip()
-    model_x = tool_model_for("lecture_extract")
+    model_x = pipeline.dial_for(pipeline.READ)
 
     # Companion notes. The cap is what keeps them supplemental — the teaching
     # material still supplies the overwhelming majority of the points.
@@ -605,7 +606,10 @@ def run_pipeline(path: str, cfg: dict, *, report, cancel_ev: threading.Event,
             # Placed BEFORE the cache write on purpose: the collapse is paid for
             # once per extraction, and a cached run inherits the result for free
             # rather than re-judging the same points every time.
-            twin_model = tool_model_for("lecture_relevance")
+            # A READ refinement — it decides which points exist — so it belongs
+            # on the read dial, not the judge's. Same model on both families
+            # today; this stops them drifting apart later.
+            twin_model = pipeline.dial_for(pipeline.READ)
             if bool(cfg.get("ai_twin_pass", True)) and twin_model:
                 _check()
                 report("Checking for points that say the same thing…", 32)

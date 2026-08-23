@@ -30,6 +30,7 @@ from aqt.utils import askUser, showWarning, tooltip
 from . import autotag
 from . import pdf_render
 from . import quality_pass as qp
+from . import pipeline
 from ..grounding import guidelines as grounding
 from ..core import anki_utils, api as core_api, log
 from ..core.config import (
@@ -975,7 +976,7 @@ def _grader_model(cfg: dict) -> str | None:
     if set, else the generator model, else the family default (resolved later)."""
     qpc = cfg.get("quality_pass") or {}
     fam = active_family()
-    return tool_model_for("quality_pass", fam)
+    return pipeline.dial_for(pipeline.CHECK, family=fam)
 
 
 def _grader_skill(cfg: dict, profile: dict | None) -> tuple[str, str]:
@@ -2943,7 +2944,7 @@ class CreatorPanel(QWidget):
                 + (_focus_directive(focus) + "\n" if focus else "")
             )
 
-        model = tool_model_for("card_creation")
+        model = pipeline.dial_for(pipeline.WRITE)
         loading_label = (
             "Asking AI (reading attachments)…" if attachments_for_api
             else "Asking AI…"
@@ -3368,7 +3369,7 @@ class CreatorPanel(QWidget):
                    and c["_verdict"].verdict == qp.FAIL]
         if not targets:
             return
-        model = tool_model_for("card_creation")
+        model = pipeline.dial_for(pipeline.WRITE)
         focus = self.focus.text().strip() if hasattr(self, "focus") else ""
         rank = {qp.PASS: 2, qp.FLAG: 1, qp.FAIL: 0}
         with loading(self.go_btn, "Improving low-scoring cards…"):
@@ -4355,7 +4356,7 @@ def one_by_one_rewrite(old_card: dict, profile: dict) -> dict | None:
     new = core_api.ask_claude_json(
         prompt=prompt,
         system=_augment_system(ONE_BY_ONE_SYSTEM, profile),
-        max_tokens=1024, model=tool_model_for("card_creation"),
+        max_tokens=1024, model=pipeline.dial_for(pipeline.WRITE),
         skill_id=skill_id, skill_invocation=skill_invocation,
     )
     if not isinstance(new, dict) or "front" not in new or "extra" not in new:
@@ -4382,7 +4383,7 @@ def split_card(card: dict, profile: dict) -> list | None:
     new_cards = core_api.ask_claude_json(
         prompt=prompt,
         system=_augment_system(SPLIT_SYSTEM, profile),
-        max_tokens=2048, model=tool_model_for("card_creation"),
+        max_tokens=2048, model=pipeline.dial_for(pipeline.WRITE),
         skill_id=skill_id, skill_invocation=skill_invocation,
     )
     if (not isinstance(new_cards, list) or not new_cards
@@ -4614,7 +4615,7 @@ class ReviewDialog(QDialog):
         # images the user attached pre-regen.
         return _regenerate_one(
             old_card, hint, self.profile, self.focus,
-            tool_model_for("card_creation"),
+            pipeline.dial_for(pipeline.WRITE),
         )
 
     def _on_one_by_one(self, old_card):
