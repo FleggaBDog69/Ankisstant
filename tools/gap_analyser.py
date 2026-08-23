@@ -16,12 +16,13 @@ from aqt.utils import askUser, showWarning, tooltip
 
 from . import autotag
 from ..core import anki_utils
-from ..core.config import active_family, tool_config, tool_model_for, save_tool_config
+from ..core.config import active_family, tool_config, save_tool_config
 from ..core.qt_utils import (
     attach_tag_completer, make_help_button, make_setup_banner,
     provider_configured, run_claude_json, set_ai_buttons_enabled,
 )
 from .kg import store as kg_store
+from . import pipeline
 
 
 NAME = "Analyse Knowledge Gaps"
@@ -345,7 +346,7 @@ class GapAnalyserPanel(QWidget):
         self.status.setText(
             f"Asking AI what's missing from {len(card_fronts)} card(s) under '{tag}'…"
         )
-        model = tool_model_for("gap_analysis")
+        model = pipeline.dial_for(pipeline.READ)
         gaps = run_claude_json(
             self.analyse_btn, "Analysing…",
             prompt=user_msg, system=system, max_tokens=1024, model=model,

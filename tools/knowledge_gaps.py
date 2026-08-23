@@ -34,7 +34,6 @@ from aqt.utils import askUser, showWarning, tooltip
 from ..core import anki_utils, log
 from ..core.config import (
     active_family, auto_tag_base, month_tag, save_tool_config, tool_config,
-    tool_model_for,
 )
 from ..core.qt_utils import (
     attach_tag_completer, make_help_button, make_setup_banner,
@@ -43,6 +42,7 @@ from ..core.qt_utils import (
 )
 from . import autotag
 from .kg import importers, store as kg_store
+from . import pipeline
 
 
 NAME = "Knowledge Gaps"
@@ -1269,7 +1269,7 @@ class _LOAnalyserSection(QGroupBox):
         self._status.setText(
             f"Asking AI what's missing from {len(fronts)} card(s) under '{tag}'…"
         )
-        model = tool_model_for("gap_analysis")
+        model = pipeline.dial_for(pipeline.READ)
         gaps = run_claude_json(
             self._analyse_btn, "Analysing…",
             prompt=user_msg, system=system, max_tokens=1024, model=model,

@@ -28,6 +28,7 @@ from ..core.qt_utils import (
     set_ai_buttons_enabled,
 )
 from . import autotag
+from . import pipeline
 from .kg import engine
 
 
@@ -873,7 +874,7 @@ class BrowsePanel(QWidget):
         # Run the AI call in the background (no modal dialog) so the panel and
         # the rest of Anki stay usable while it thinks. _after_reply finishes on
         # the main thread once the terms come back.
-        model = tool_model_for("search")
+        model = pipeline.dial_for(pipeline.FIND)
         run_claude_json_async(
             self.search_btn,
             lambda reply: self._after_search_reply(
@@ -908,24 +909,158 @@ class BrowsePanel(QWidget):
 
         terms = [t.strip() for t in terms if t.strip()]
         self._last_terms = terms
-        self.status.setText("Searching Anki for: " + ", ".join(terms))
-        QApplication.processEvents()
+        self._find(terms)
 
+    # ── stage 4: FIND ────────────────────────────────────────────────────────
+    #
+    # Browse used to run its own search, and it was the weakest one in the
+    # add-on: a bare find_notes() per term, deduped, cut at max_results. No
+    # ranking by term specificity, no spelling variants (haemo/hemo), no tag
+    # leg, no widened retry when a term found nothing, no relevance judge — and
+    # above all no notion of a GAP. A topic your deck genuinely doesn't cover
+    # came back as "Found 0 note(s)" and stopped there.
+    #
+    # It now runs the SAME matcher the lecture and the work-through have always
+    # used. Nothing is lost in the move: the old term sweep still runs, and
+    # every note it finds that the matcher's pool didn't is kept on the end of
+    # the list, labelled. So the old result is the tail of the new one rather
+    # than the whole of it.
+
+    def _find(self, terms: list[str]) -> None:
+        """Run the topic through the shared FIND stage."""
         notetype_filter = (self.cfg.get("notetype_filter") or "").strip()
         max_results = int(self.cfg.get("max_results", 50))
 
+        # The paste provider can't do this leg: the relevance judge is an AI
+        # call on a worker thread, and manual_ai_complete must run on the main
+        # one (see pipeline.RunContext.needs_main_thread). Rather than hang,
+        # fall back to the plain term sweep — which is exactly what Browse did
+        # for everyone until now, so a paste user loses nothing they had.
+        if is_manual_provider() or not provider_configured():
+            self._plain_find(terms, notetype_filter, max_results)
+            return
+
+        topic = (self._last_topic or " ".join(terms[:2])).strip()
+        self.status.setText("Searching Anki for: " + ", ".join(terms))
+        QApplication.processEvents()
+
+        from .lecture.extractor import LearningPoint
+        from .lecture.panel import run_pipeline
+
+        point = LearningPoint(concept=topic, terms=list(terms))
+
+        cfg = dict(tool_config("lecture"))
+        cfg["lo_text"] = ""              # never the LO branch — the point wins
+        cfg["notetype_filter"] = notetype_filter
+        # One point, so the budget is just "how many cards may be pre-ticked".
+        # Deliberately generous: Browse is a place you pick from a list, not a
+        # shortlist generator, and a budget that squeezed would hide cards the
+        # judge had already approved.
+        cfg["target_cards"] = max(1, max_results)
+        cfg["auto_target_cards"] = False
+        cfg["depth"] = "thorough"
+        cfg["attach_notes"] = False      # Browse has no lecture to draw notes from
+
+        cancel_ev = threading.Event()
+        self._find_cancel = cancel_ev
+        self.search_btn.setEnabled(False)
+
+        def _report(msg, _pct=0):
+            mw.taskman.run_on_main(lambda m=msg: self.status.setText(m))
+
+        def _bg():
+            core_api.set_cancel_event(cancel_ev)
+            try:
+                _lec, matches, coverage = run_pipeline(
+                    None, cfg, report=_report, cancel_ev=cancel_ev,
+                    points=[point])
+                # The old term sweep, run alongside so the new list is a
+                # superset of the old one. Cheap: find_notes only, no AI.
+                plain, per_term = self._run_searches(
+                    terms, notetype_filter, max_results)
+                if not plain and notetype_filter:
+                    plain, per_term = self._run_searches(terms, "", max_results)
+                return matches, coverage, plain, per_term
+            finally:
+                core_api.set_cancel_event(None)
+
+        # uses_collection=False: the default executor is the one Anki's periodic
+        # backup queues behind, and the app looks hung for the whole run.
+        mw.taskman.run_in_background(_bg, self._on_find_done,
+                                     uses_collection=False)
+
+    def _on_find_done(self, fut) -> None:
+        self.search_btn.setEnabled(True)
+        terms = list(self._last_terms)
+        max_results = int(self.cfg.get("max_results", 50))
+        notetype_filter = (self.cfg.get("notetype_filter") or "").strip()
+        try:
+            matches, coverage, plain, per_term = fut.result()
+        except core_api.ClaudeCancelled:
+            self.status.setText("Stopped.")
+            self._refresh_rescope_enabled()
+            return
+        except Exception as e:
+            import traceback
+            log.error(f"browse: matched find failed: {e}\n{traceback.format_exc()}")
+            # Fails OPEN to the old behaviour. The find is the part of Browse
+            # that has to keep working — degrading to a plain term sweep is a
+            # worse result, but a missing one is not a result at all.
+            self.status.setText("")
+            self._plain_find(terms, notetype_filter, max_results)
+            return
+        self._populate_from_match(matches, coverage, plain, per_term, terms,
+                                  max_results)
+        self._refresh_rescope_enabled()
+
+    def _plain_find(self, terms, notetype_filter, max_results) -> None:
+        """The pre-matcher search, kept as the fallback path."""
+        self.status.setText("Searching Anki for: " + ", ".join(terms))
+        QApplication.processEvents()
         with loading(self.search_btn, "Searching Anki…"):
-            results, per_term = self._run_searches(terms, notetype_filter, max_results)
+            results, per_term = self._run_searches(terms, notetype_filter,
+                                                   max_results)
             if not results and notetype_filter:
                 log.info("notetype filter returned 0 — retrying without it.")
                 results, per_term = self._run_searches(terms, "", max_results)
-
         log.debug(f"per-term hits: {per_term}")
-
         capped = len(results) > max_results
-        results = results[:max_results]
-        self._populate_results(results, terms, capped, per_term)
+        self._populate_results(results[:max_results], terms, capped, per_term)
         self._refresh_rescope_enabled()
+
+    def _populate_from_match(self, matches, coverage, plain, per_term, terms,
+                             max_results) -> None:
+        """Order the find's output for the list, best-judged first.
+
+        Four bands, each labelled IN WORDS on the row rather than by position
+        alone — the list is one flat widget and a reader who scrolls into the
+        middle of it has no other way to tell which band they are in.
+        """
+        m = matches[0] if matches else None
+        nids, notes, ticks, total = pipeline.order_find_results(
+            m, plain, limit=max_results)
+        selected = list(getattr(m, "final", []) or []) if m else []
+        judged = bool(getattr(m, "scored", False)) if m else False
+        scores = dict(getattr(m, "scores", {}) or {}) if m else {}
+
+        self._populate_results(nids, terms, total > max_results, per_term,
+                               notes=notes, ticks=ticks, scores=scores)
+
+        # The gap report — the thing Browse could never say before.
+        is_gap = bool(coverage and getattr(coverage, "gaps", None))
+        head = f"Found {len(nids)} note(s)"
+        if judged:
+            head += f" — {len(selected)} the AI judged a match"
+        if is_gap:
+            head = ("Your deck has no card that tests this. "
+                    + (f"{len(nids)} related note(s) are listed below."
+                       if nids else "Nothing came back at all."))
+        elif not nids:
+            head = "Nothing came back for those terms."
+        deg = getattr(coverage, "degraded_note", "") if coverage else ""
+        if deg:
+            head += f"  ({deg})"
+        self.status.setText(head)
 
     def _refresh_rescope_enabled(self):
         # Broader / Narrower are notes-mode-only — tag-mode prompts are different.
@@ -940,7 +1075,7 @@ class BrowsePanel(QWidget):
         self.narrower_btn.setEnabled(False)
         self.status.setText("Asking AI for tag keywords…")
 
-        model = tool_model_for("search")
+        model = pipeline.dial_for(pipeline.FIND)
         run_claude_json_async(
             self.search_btn,
             self._after_tag_reply,
@@ -1301,7 +1436,19 @@ class BrowsePanel(QWidget):
             return f'"note:*{notetype_filter}*" {term}'
         return term
 
-    def _populate_results(self, nids, terms, capped, per_term=None):
+    def _populate_results(self, nids, terms, capped, per_term=None, *,
+                          notes: dict | None = None, ticks: set | None = None,
+                          scores: dict | None = None):
+        """Fill the results list.
+
+        `notes` / `ticks` / `scores` come from the matched find (_find). They
+        are optional so the plain term sweep can call this unchanged, and so
+        that a row's band is stated in WORDS on the row itself — the judge's
+        opinion must never be carried by position or colour alone.
+        """
+        notes = notes or {}
+        ticks = ticks or set()
+        scores = scores or {}
         self.results_list.blockSignals(True)
         self.results_list.clear()
         front_field = self.cfg.get("front_field", "Text")
@@ -1323,22 +1470,32 @@ class BrowsePanel(QWidget):
                 prefix_bits.append(f"[{source}]")
             prefix = " ".join(prefix_bits)
             label = f"{prefix}  {preview}" if prefix else preview
+            note_txt = notes.get(nid, "")
+            if note_txt:
+                label += f"   — {note_txt}"
             item = QListWidgetItem(label)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(Qt.CheckState.Unchecked)
+            item.setCheckState(Qt.CheckState.Checked if nid in ticks
+                               else Qt.CheckState.Unchecked)
             item.setData(Qt.ItemDataRole.UserRole, nid)
+            if nid in scores:
+                item.setToolTip(f"The AI scored this {scores[nid]} out of 3 for "
+                                "how well it tests the topic.")
             self.results_list.addItem(item)
             self._results.append((nid, preview, tags, source, susp, total))
         self.results_list.blockSignals(False)
 
-        if per_term:
-            breakdown = ", ".join(f"{t} ({n})" for t, n in per_term)
-        else:
-            breakdown = ", ".join(terms)
-        msg = f"Found {len(nids)} note(s) — {breakdown}"
-        if capped:
-            msg += f" — capped at {self.cfg.get('max_results', 50)}."
-        self.status.setText(msg)
+        # The matched find writes its own, richer status line (it can say
+        # "gap"); only the plain sweep needs this one.
+        if not notes and not ticks:
+            if per_term:
+                breakdown = ", ".join(f"{t} ({n})" for t, n in per_term)
+            else:
+                breakdown = ", ".join(terms)
+            msg = f"Found {len(nids)} note(s) — {breakdown}"
+            if capped:
+                msg += f" — capped at {self.cfg.get('max_results', 50)}."
+            self.status.setText(msg)
         self._update_count()
         self.confirm_btn.setEnabled(len(nids) > 0)
 

@@ -648,7 +648,7 @@ def run_pipeline(path: str, cfg: dict, *, report, cancel_ev: threading.Event,
     ])
     by_point = {id(m.point): m for m in matches}
     rel_batches = matcher.build_relevance_batches(items)
-    model_r = tool_model_for("lecture_relevance")
+    model_r = pipeline.dial_for(pipeline.FIND)
     workers = max(1, int(cfg.get("relevance_workers") or 1))
     try:
         for b, verdicts in score_all(rel_batches, model=model_r, report=report,
@@ -2321,7 +2321,7 @@ class LecturePanel(QWidget):
         tooltip("Re-searching…")
         cfg = self.cfg
         notetype_filter = (cfg.get("notetype_filter") or "").strip()
-        model_r = tool_model_for("lecture_relevance")
+        model_r = pipeline.dial_for(pipeline.FIND)
 
         def _bg():
             terms = matcher.research_terms(prompt, model=model_r) or [

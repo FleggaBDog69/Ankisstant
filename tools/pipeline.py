@@ -70,7 +70,8 @@ class Stage:
 
 STAGES: tuple = (
     Stage(TAKE_IN, 1, "Take in"),
-    Stage(READ,    2, "Read",    "read",  ("lecture_extract", "card_creation")),
+    Stage(READ,    2, "Read",    "read",
+          ("lecture_extract", "gap_analysis", "card_creation")),
     Stage(APPROVE, 3, "Approve"),
     Stage(FIND,    4, "Find",    "find",  ("lecture_relevance", "search")),
     Stage(WRITE,   5, "Write",   "write", ("card_creation",)),
@@ -487,6 +488,66 @@ def skill_for(stage_key: str, *, family: str | None = None,
         if s:
             return s
     return ""
+
+
+# ── stage 4: ordering what the find turned up ────────────────────────────────
+
+# Words, not colours and not position. A results list is one flat widget and a
+# reader who scrolls into the middle of it has no other way to tell which band
+# a row is in — and grey reads as "rejected" when it means "not judged".
+BAND_MATCH, BAND_ALSO, BAND_OFF, BAND_UNJUDGED = (
+    "", "also a match", "found, but the AI judged it off-topic",
+    "term match only — not judged")
+
+
+def order_find_results(match, plain: list | None = None, limit: int = 0):
+    """One point's find, flattened into the order a list should show it in.
+
+    Returns (nids, notes, ticks) — the ordered ids, the per-row label for the
+    band each one is in, and the ids to pre-tick.
+
+    Four bands, best first:
+      1. what the budget selected (plus anything the user force-included)
+      2. the rest of what the relevance judge kept
+      3. the rest of the candidate pool — found, judged, not kept
+      4. anything a plain term sweep found that the pool never contained
+
+    Band 4 is what makes moving a tool onto the matcher SAFE rather than merely
+    better. The matcher's pool is capped (matcher.resolve_candidate_cap, 20 at
+    the most generous depth) where a raw term sweep is capped only by the
+    caller's own limit, so a broad topic can genuinely turn up notes the pool
+    never held. Carrying them on the end means the new list is a superset of
+    the old one: nothing a tool used to show can be lost by the move.
+
+    Pure — no Qt, no collection. `match` is duck-typed (anything with .final /
+    .kept / .nids / .scores) so this is testable without the lecture package.
+    """
+    final = list(getattr(match, "final", []) or []) if match is not None else []
+    kept = [n for n in (getattr(match, "kept", []) or []) if n not in final] \
+        if match is not None else []
+    picked = set(final) | set(kept)
+    pool = [n for n in (getattr(match, "nids", []) or []) if n not in picked] \
+        if match is not None else []
+    seen = picked | set(pool)
+    extra = [n for n in (plain or []) if n not in seen]
+
+    bands = ((final, BAND_MATCH, True), (kept, BAND_ALSO, True),
+             (pool, BAND_OFF, False), (extra, BAND_UNJUDGED, False))
+    nids: list = []
+    notes: dict = {}
+    ticks: set = set()
+    total = 0
+    for band, note, tick in bands:
+        for nid in band:
+            total += 1
+            if limit and len(nids) >= limit:
+                continue
+            nids.append(nid)
+            if note:
+                notes[nid] = note
+            if tick:
+                ticks.add(nid)
+    return nids, notes, ticks, total
 
 
 # ── the run record ───────────────────────────────────────────────────────────

@@ -62,7 +62,8 @@ import sys
 from aqt import gui_hooks, mw
 
 from . import log, synapse
-from .config import synapse_config, tool_model_for
+from .config import synapse_config
+from ..tools import pipeline
 
 # The PYCALL action name our injected button emits. Namespaced because it
 # travels through SynapsePro's own dispatcher, where a collision with a future
@@ -322,7 +323,7 @@ def capture_last_turn(button=None) -> None:
         prompt=_prompt(answer, _user_turn_before_last_answer(), limit),
         system=_SYSTEM,
         max_tokens=700,
-        model=tool_model_for("gap_analysis"),
+        model=pipeline.dial_for(pipeline.READ),
     )
 
 
