@@ -621,3 +621,40 @@ def kgplan_from_plan(plan: Plan):
         constraints=list(plan.constraints), tags=list(plan.tags),
         included=plan.included,
     )
+
+
+def plan_from_lecture(item: WorkItem, points: list, *, cards: int = 0,
+                      constraints: list | None = None,
+                      tags: list | None = None,
+                      concept: str = "") -> Plan:
+    """A lecture's extraction, wrapped in the per-item type it never had.
+
+    The extractor returns a bare list[LearningPoint]. That list has nowhere to
+    hang a card budget, the user's constraints, or the run's tag — which is
+    precisely why lecture points could reach the FIND stage but never the WRITE
+    stage: gen_prompt.build_batch reads all three off the plan. A lecture with
+    a Plan can be generated for exactly like a knowledge gap.
+
+    ONE Plan per lecture, not one per point. A lecture is a single work item
+    that happens to decompose into dozens of points, the same way a broad gap
+    ("Graves + Tx") decomposes into several — the wrapper is the item, and the
+    points are what it decomposed into. Splitting it per point would lose the
+    shared budget, which is the one thing the allocator needs.
+
+    `cards` of 0 means "size it from the points", matching
+    matcher.auto_target_cards' reasoning rather than a fixed default.
+    """
+    pts = list(points or [])
+    if tags:
+        item.tags = [t for t in tags if t]
+    return Plan(
+        item=item,
+        concept=concept or item.title,
+        # A lecture is broad by definition — it's a whole teaching session.
+        scope="broad",
+        cards=int(cards) if cards else 0,
+        breadth="wide",
+        depth_band="essentials",
+        points=pts,
+        constraints=list(constraints or []),
+    )

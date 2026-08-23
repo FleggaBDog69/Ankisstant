@@ -2592,6 +2592,39 @@ class LecturePanel(QWidget):
             tooltip(f"Done — stepped through {min(stepped, n)} of {n} gap(s).",
                     period=2500)
 
+    # -- this run, in the shared pipeline shape --
+    def _work_item(self):
+        """This lecture as a pipeline.WorkItem — the TAKE IN stage's output."""
+        title = os.path.splitext(os.path.basename(self._path or ""))[0]
+        if not title:
+            title = ("your objectives" if (self.cfg.get("lo_text") or "").strip()
+                     else "lecture")
+        return pipeline.WorkItem.from_lecture(self._path or "", title)
+
+    def _plan_for(self, matches, *, concept: str = ""):
+        """`matches` as a pipeline.Plan.
+
+        A lecture's extraction is a bare list of points, which is why it could
+        reach the FIND stage but never the WRITE stage — gen_prompt reads the
+        card budget, the constraints and the tag off a PLAN, and a list has
+        nowhere to keep them. This is that missing wrapper, built from what the
+        run already holds.
+
+        Pass `coverage.gaps` to plan what the deck DOESN'T cover (the write
+        case) or covered+gaps for the whole lecture.
+        """
+        pts = [m.point for m in (matches or []) if getattr(m, "point", None)]
+        tag = self._tag_input.text().strip()
+        return pipeline.plan_from_lecture(
+            self._work_item(), pts,
+            # 0 means "size it from the points" — the same reasoning
+            # matcher.auto_target_cards applies, rather than a fixed default.
+            cards=(0 if self._auto_cards_cb.isChecked()
+                   else self._cards_spin.value()),
+            tags=[tag] if tag else [],
+            concept=concept,
+        )
+
     # -- export the gaps for a third-party generator --
     def _export_gaps(self):
         """Write the MISSING learning points to a markdown file the user can hand
