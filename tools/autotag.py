@@ -236,7 +236,12 @@ GROUP_LEVEL_LABELS = {
     "none":  "Nothing — the path is the whole tag",
 }
 
-_PLAN_DEFAULTS = {"path": "", "absolute": False, "levels": "full"}
+# A group's saved settings. `path` is its COURSE branch (a Curtanki case);
+# `source` is its SOURCE path (a placement, a homework set) — the one thing a
+# batch actually has to be told, since content classifies itself and the audit
+# tags write themselves. They are independent: a group can have either, both or
+# neither, and "neither" is the ordinary case.
+_PLAN_DEFAULTS = {"path": "", "absolute": False, "levels": "full", "source": ""}
 
 
 def normalise_levels(value) -> str:
@@ -263,20 +268,27 @@ def group_tag_overrides() -> dict:
 
 
 def normalise_override(raw) -> dict | None:
-    """One config entry -> {"path", "absolute", "levels"}, or None when it says
-    nothing. Fail-open on every unexpected shape: an override that can't be read
-    must fall back to the derived segment, never to a broken tag."""
+    """One config entry -> {"path", "absolute", "levels", "source"}, or None
+    when it says nothing. Fail-open on every unexpected shape: an override that
+    can't be read must fall back to the derived segment, never to a broken tag.
+
+    A SOURCE on its own is a real override. That is the ordinary group now — a
+    placement, a homework set, a day on the wards — and the reason this can no
+    longer bail out the moment there is no path: doing so threw the source
+    away and left the group looking unconfigured."""
     if isinstance(raw, str):
         path = clean_segment_path(raw)
         return dict(_PLAN_DEFAULTS, path=path) if path else None
     if isinstance(raw, dict):
         # "segment" is the key the first version of this used for a plain path.
         path = clean_segment_path(raw.get("path") or raw.get("segment") or "")
-        if not path:
+        source = clean_source_path(raw.get("source") or "")
+        if not path and not source:
             return None
         return {"path": path,
                 "absolute": bool(raw.get("absolute")),
-                "levels": normalise_levels(raw.get("levels", "full"))}
+                "levels": normalise_levels(raw.get("levels", "full")),
+                "source": source}
     return None
 
 
@@ -292,7 +304,8 @@ def group_override(name: str) -> dict | None:
 
 def group_tag_plan(name: str, *, path: str | None = None,
                    absolute: bool | None = None,
-                   levels: bool | None = None) -> dict:
+                   levels: bool | None = None,
+                   source: str | None = None) -> dict:
     """How this group tags, resolved: {"path", "absolute", "levels"}.
 
     THE single answer every tag-building caller goes through. The keyword
@@ -308,6 +321,8 @@ def group_tag_plan(name: str, *, path: str | None = None,
         plan = dict(plan, absolute=bool(absolute))
     if levels is not None:
         plan = dict(plan, levels=normalise_levels(levels))
+    if source is not None:
+        plan = dict(plan, source=clean_source_path(source))
     return plan
 
 
@@ -328,6 +343,16 @@ def group_segment_override(name: str) -> str:
     or a stray slash into a tag."""
     ov = group_override(name)
     return ov["path"] if ov else ""
+
+
+def group_source(name: str) -> str:
+    """The source path this group's cards came from, or ''.
+
+    The group is the right place to keep it: a batch has ONE provenance — the
+    placement you were on, the homework set you were marked on — and asking per
+    card is how a source axis stops being filled in."""
+    ov = group_override(name)
+    return (ov or {}).get("source", "") or ""
 
 
 def group_is_absolute(name: str) -> bool:
@@ -394,13 +419,28 @@ def group_tag_prefix(group: str) -> str:
 
         !!Curtanki::Year_3::SRS::02
 
+    A group with no course branch of its own but a SOURCE scopes to the source
+    tag — the placement's branch is where its cards actually are:
+
+        !!Fleg::Sources::Placements::GP
+
     Feed it to matcher.scope_query("tag", ...) to get a scope query. Returns ''
     when there's nothing to scope to, which every caller treats as no scope."""
     plan = group_tag_plan(group)
-    if not plan["path"]:
-        return ""
-    if plan["absolute"]:
+    if plan["absolute"] and plan["path"]:
         return plan["path"]
+    if plan.get("source"):
+        from ..core.config import source_tag
+        tag = source_tag(plan["source"])
+        if tag:
+            return tag
+    if not plan["path"] or not group_override(group):
+        # A group with no saved override has a DERIVED segment, and nothing is
+        # ever tagged with it: tags_for() applies the group's branch only when
+        # the group owns one. Scoping to it returned a query that could only
+        # ever match zero cards, which reads as "you have nothing on this"
+        # rather than "this group has no branch".
+        return ""
     base = auto_tag_base()
     if not base:
         return ""
@@ -507,6 +547,24 @@ def tag_from_levels(levels: dict | None, kg_type_key: str | None = None,
 _TYPE_SOURCES = {"mq": "MQ", "cs": "CS", "lo": "LO"}
 
 
+def clean_source_path(text: str) -> str:
+    """A typed source down to the PATH — what goes after "{base}::Sources::".
+
+    Strips the prefix if it is already there, so pasting a whole tag out of the
+    sidebar or accepting a tag completer's suggestion stores "Placements::GP"
+    rather than a value that prefixes itself on the way back out. Renders
+    through source_tag() and takes the head off again, so there is exactly one
+    definition of what the prefix is.
+    """
+    from ..core.config import auto_tag_base as _base, SOURCES_SEGMENT
+    from ..core.config import source_tag as _source_tag
+    tag = _source_tag(text)
+    if not tag:
+        return clean_segment_path(text)
+    head = f"{_base()}::{SOURCES_SEGMENT}::"
+    return tag[len(head):] if tag.startswith(head) else clean_segment_path(text)
+
+
 def source_for_type(kg_type_key: str) -> str:
     return _TYPE_SOURCES.get(str(kg_type_key or "").strip().lower(), "")
 
@@ -547,25 +605,36 @@ def set_sticky_source(tool: str, path: str) -> None:
 
 
 def source_path_for(*, tool: str = "", kg_type_key: str = "",
-                    lecture_path: str = "", override: str | None = None) -> str:
+                    lecture_path: str = "", group: str = "",
+                    override: str | None = None) -> str:
     """The source path for a card, most specific first.
 
     An explicit `override` (what the user typed for this run) always wins. Then
-    the file, then the gap type, then whatever this tool last used. "" means
-    no source tag — which is a legitimate answer, not a hole to fill with a
-    guess.
+    the file, then the GROUP's own source, then the gap type, then whatever this
+    tool last used. "" means no source tag — which is a legitimate answer, not a
+    hole to fill with a guess.
+
+    The group sits above the type deliberately: "GP Day 1" is something you
+    said about this batch, and a type segment is a default that applies to
+    every batch. A thing you chose beats a thing that was assumed.
     """
-    if override is not None and str(override).strip():
-        return str(override).strip()
+    if override is not None:
+        typed = str(override).strip()
+        # An explicit EMPTY override is the user saying "no source", and it has
+        # to beat every derived answer — including the group's. Clearing the
+        # box is the ONLY way to say "not this one" for a single run, and a
+        # value that came back anyway would make the box a lie. This check used
+        # to sit below the derivations, where it could only override the sticky
+        # value it was already below.
+        return typed
     if lecture_path:
         return source_for_lecture(lecture_path)
+    from_group = group_source(group) if group else ""
+    if from_group:
+        return from_group
     from_type = source_for_type(kg_type_key)
     if from_type:
         return from_type
-    if override is not None:
-        # An explicit EMPTY override is the user saying "no source", and must
-        # not fall through to the sticky value they cleared.
-        return ""
     return sticky_source(tool) if tool else ""
 
 
@@ -645,7 +714,8 @@ def tags_for(levels: dict | None, *, group: str = "", tool: str = "",
 
       1. content   {base}::KG::{system}::{subsystem}::{topic}
       2. course    the group's own branch, when it has an absolute one
-      3. source    {base}::Sources::{path}, when there is a source
+      3. source    {base}::Sources::{path}, when there is a source —
+                   the group's own source unless this run overrode it
 
     Deduped case-insensitively, because Anki matches tags that way and two
     spellings of one tag are one tag with twice the clutter.
@@ -665,5 +735,6 @@ def tags_for(levels: dict | None, *, group: str = "", tool: str = "",
     if plan.get("absolute") and plan.get("path"):
         add(course)
     add(source_tag_for(tool=tool, kg_type_key=kg_type_key,
-                       lecture_path=lecture_path, override=source_override))
+                       lecture_path=lecture_path, group=group,
+                       override=source_override))
     return out

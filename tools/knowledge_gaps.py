@@ -36,7 +36,8 @@ from ..core.config import (
     active_family, auto_tag_base, month_tag, save_tool_config, tool_config,
 )
 from ..core.qt_utils import (
-    attach_tag_completer, make_help_button, make_setup_banner,
+    attach_source_completer, attach_tag_completer, make_help_button,
+    make_setup_banner,
     provider_configured, refresh_deck_browser, run_claude_json,
     set_ai_buttons_enabled, theme_dialog,
 )
@@ -469,9 +470,9 @@ class _GroupAssignDialog(QDialog):
         root.addWidget(head)
         blurb = QLabel(
             "A group is the batch a gap came in with — an SRS, a week, a "
-            "revision block. It's independent of type and status, and it adds "
-            "one level to the auto-tag so the whole batch is one branch of "
-            "your tag tree."
+            "placement. It's independent of type and status. What it tags is "
+            "set on the group itself (Manage groups…): a source for where the "
+            "batch came from, and a course branch if it belongs to one."
         )
         blurb.setStyleSheet("color: gray; font-size: 11px;")
         blurb.setWordWrap(True)
@@ -504,8 +505,21 @@ class _GroupAssignDialog(QDialog):
         if not name:
             self._hint.setText("Leave blank to remove these gaps from their group.")
             return
-        seg = autotag.group_segment(name)
-        self._hint.setText(f"Will tag as:  <code>{_html.escape(seg)}</code>")
+        from ..core.config import source_tag as _source_tag
+        esc = _html.escape
+        bits = []
+        if autotag.group_is_absolute(name):
+            bits.append(f"<code>{esc(autotag.group_segment(name))}</code>")
+        src = _source_tag(autotag.group_source(name))
+        if src:
+            bits.append(f"<code>{esc(src)}</code>")
+        # Their own content tag either way — saying so stops a group with
+        # nothing set looking like a group that does nothing.
+        self._hint.setText(
+            ("Also tagged:  " + " &nbsp;+&nbsp; ".join(bits)
+             + "<br>(each gap keeps its own content tag.)") if bits else
+            ("“" + esc(name) + "” has no source or branch set yet — these gaps "
+             "keep their own content tags. Set one in Manage groups…"))
         self._hint.setTextFormat(Qt.TextFormat.RichText)
 
     def value(self) -> str:
@@ -513,22 +527,35 @@ class _GroupAssignDialog(QDialog):
 
 
 class _GroupEditDialog(QDialog):
-    """Rename a group, and choose where in the tag tree it files.
+    """Rename a group, and say the two things about it that can't be worked out.
 
-    Two separate things that both belong to "the group", which is why they share
-    one dialog: the NAME is what you read in the list, the TAG is where the
-    cards land. They are derived from each other by default (SRS 4 -> SRS::04)
-    but nothing forces them to stay that way.
+    It used to ask four. That was right when the group WAS the tag — one branch
+    per batch, and every decision about where a card filed had to be made here.
+    Under the three axes it isn't:
 
-    The dial that matters is WHERE:
+        content   !!Fleg::KG::MSK::Arthritis::Serology   classified per gap
+        course    !!Curtanki::Year_3::SRS::02::KGs       yours, typed
+        source    !!Fleg::Sources::Placements::GP        yours, typed
+        audit     !!Fleg::Ankisstant::AI::…              written by the tool
 
-      Inside the auto-tag base   !!Fleg::KG::SRS::04::System::Sub::Topic
-      Its own branch             !!Curtanki::Year_3::SRS::02::System::Sub::Topic
+    Content classifies itself and the audit tags write themselves, so the only
+    questions left are the two nobody can answer for you: where this batch came
+    from, and — for course work — which branch of your own tree it belongs to.
+    Everything else was a dial asking you to re-decide something already decided.
 
-    "Its own branch" exists because one global base is the wrong shape for a
-    collection that already has a tag tree. Without it, a group can only ever be
-    a copy of your system nested inside the add-on's prefix, which is no use to
-    the system itself."""
+    SOURCE lives on the group because provenance is a property of the BATCH, not
+    of a card. "GP Day 1" has one source; asking per card is how a source axis
+    stops being filled in.
+
+    COURSE is optional and is blank by default. A group without one contributes
+    no branch of its own — its cards are found through the content tag and the
+    source tag, which is what those axes are for. Only work that belongs to a
+    tree you already keep (a Curtanki case) needs to name it."""
+
+    # A new course branch takes the gap's topic under it, which is what every
+    # course group already set by hand. It is the one thing that keeps a case
+    # branch browsable instead of collapsing forty gaps onto one node.
+    _DEFAULT_LEVELS = "topic"
 
     def __init__(self, name: str, n_gaps: int = 0, n_cards: int = 0,
                  existing: list[str] | None = None, parent=None):
@@ -550,6 +577,8 @@ class _GroupEditDialog(QDialog):
         sub.setStyleSheet("color: gray; font-size: 11px;")
         root.addWidget(sub)
 
+        saved = autotag.group_override(name)
+
         form = QGridLayout()
         form.setColumnStretch(1, 1)
         form.addWidget(QLabel("Name"), 0, 0)
@@ -557,49 +586,61 @@ class _GroupEditDialog(QDialog):
         self._name.setToolTip("What the group is called in the list and the chips.")
         form.addWidget(self._name, 0, 1)
 
-        saved = autotag.group_override(name)
-        base = (auto_tag_base() or "").rstrip(":")
-
-        form.addWidget(QLabel("Where"), 1, 0)
-        self._where = QComboBox()
-        self._where.addItem(
-            f"Inside {base or 'the auto-tag base'}  —  a segment in the shared tree",
-            False)
-        self._where.addItem("Its own branch  —  a full tag path", True)
-        self._where.setCurrentIndex(1 if (saved and saved["absolute"]) else 0)
-        self._where.setToolTip(
-            "Inside the base: this group is one segment of the add-on's tag "
-            f"tree ({base or '(none set)'}::Type::…).\n\n"
-            "Its own branch: the group owns the path you type, outright — the "
-            "base and the gap-type segment aren't used at all. This is how a "
-            "group joins a tag tree you already had."
+        form.addWidget(QLabel("Source"), 1, 0)
+        self._source = QLineEdit(saved["source"] if saved else "")
+        self._source.setPlaceholderText("e.g. Placements::GP — optional")
+        # Source PATHS, not whole tags: the box wants what goes after
+        # "Sources::", so a completer offering finished tags would hand back a
+        # value that prefixes itself.
+        attach_source_completer(self._source)
+        self._source.setToolTip(
+            "Where this batch came from — a placement, a homework set, a "
+            "question bank.\n\n"
+            "Short and flat: it says WHERE, never what about. The body system "
+            "is already in the content tag, and repeating it here is what put "
+            "one fact in two branches.\n\n"
+            "Leave it blank for course work — the course branch already says "
+            "where it came from."
         )
-        form.addWidget(self._where, 1, 1)
+        form.addWidget(self._source, 1, 1)
 
-        form.addWidget(QLabel("Tag"), 2, 0)
+        form.addWidget(QLabel("Course"), 2, 0)
         self._seg = QLineEdit(saved["path"] if saved else "")
-        # A full path is the case you cannot type from memory — the completer is
-        # reading the tags that actually exist in the collection.
+        self._seg.setPlaceholderText(
+            "e.g. !!Curtanki::Year_3::SRS::02::KGs — optional")
+        # A full path IS the case you cannot type from memory — this completer
+        # is reading the tags that actually exist in the collection.
         attach_tag_completer(self._seg, multi=False)
+        self._seg.setToolTip(
+            "The branch of your OWN tag tree this batch belongs to — a "
+            "Curtanki case, a block.\n\n"
+            "Typed in full and used verbatim: the auto-tag base is not put in "
+            "front of it. That is how a group joins a tree you already had.\n\n"
+            "Blank for anything that isn't course work. The gaps still get "
+            "their content tag and their source tag either way."
+        )
         form.addWidget(self._seg, 2, 1)
-        root.addLayout(form)
 
-        form.addWidget(QLabel("Under it"), 3, 0)
+        self._levels_label = QLabel("Under it")
+        form.addWidget(self._levels_label, 3, 0)
         self._levels = QComboBox()
         for key in ("full", "sub", "topic", "none"):
             self._levels.addItem(autotag.GROUP_LEVEL_LABELS[key], key)
-        want = autotag.normalise_levels(saved["levels"]) if saved else "full"
+        want = (autotag.normalise_levels(saved["levels"]) if saved
+                else self._DEFAULT_LEVELS)
         ix = self._levels.findData(want)
         self._levels.setCurrentIndex(ix if ix >= 0 else 0)
         self._levels.setToolTip(
-            "How much of the gap's classification goes under the path.\n\n"
-            "All three levels are usually one too many for something already as "
-            "narrow as an SRS block or a PBL case — the block IS the system. "
-            "But dropping them entirely puts every gap in the batch on one node "
-            "with nothing to tell them apart, so “Topic only” is the middle "
-            "that usually fits."
+            "How much of the gap's classification goes under the course "
+            "branch. It does NOT affect the content tag, which always carries "
+            "all three levels.\n\n"
+            "“Topic only” is the usual answer: a case branch is already as "
+            "narrow as a system, so repeating the system under it makes a "
+            "duplicate of your content tree — but dropping the topic too puts "
+            "every gap in the case on one node with nothing to tell them apart."
         )
         form.addWidget(self._levels, 3, 1)
+        root.addLayout(form)
 
         self._preview = QLabel("")
         self._preview.setStyleSheet("color: gray; font-size: 11px;")
@@ -614,7 +655,7 @@ class _GroupEditDialog(QDialog):
 
         self._name.textChanged.connect(self._refresh_preview)
         self._seg.textChanged.connect(self._refresh_preview)
-        self._where.currentIndexChanged.connect(self._refresh_preview)
+        self._source.textChanged.connect(self._refresh_preview)
         self._levels.currentIndexChanged.connect(self._refresh_preview)
 
         buttons = QDialogButtonBox(
@@ -624,10 +665,7 @@ class _GroupEditDialog(QDialog):
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
         self._refresh_preview()
-        self.resize(460, self.sizeHint().height())
-
-    def _absolute(self) -> bool:
-        return bool(self._where.currentData())
+        self.resize(480, self.sizeHint().height())
 
     def _levels_mode(self) -> str:
         return str(self._levels.currentData() or "full")
@@ -641,45 +679,45 @@ class _GroupEditDialog(QDialog):
                 "none": ""}[self._levels_mode()]
 
     def _refresh_preview(self, *_a) -> None:
+        from ..core.config import source_tag as _source_tag
         name = self._name.text().strip()
         typed = self._seg.text().strip()
         path = autotag.clean_segment_path(typed)
-        derived = autotag.derive_group_segment(name)
-        absolute = self._absolute()
+        typed_src = self._source.text().strip()
+        src_tag = _source_tag(typed_src)
         base = (auto_tag_base() or "").rstrip(":")
         esc = _html.escape
-        tail = self._tail()
 
-        self._seg.setPlaceholderText(
-            "e.g. !!Curtanki::Year_3::SRS::02::KGs" if absolute
-            else (derived or "(from the name)"))
+        # The depth dial only shapes the course branch, so it is only on screen
+        # when there is one. Hidden rather than disabled: a greyed control reads
+        # as "broken", and this one simply has nothing to apply to.
+        has_course = bool(path)
+        self._levels_label.setVisible(has_course)
+        self._levels.setVisible(has_course)
 
-        if not name:
-            self._preview.setText("")
-        elif absolute:
-            if not path:
-                self._preview.setText(
-                    "Type the full tag path this group should own — start "
-                    "typing and it will complete from your existing tags.")
-            elif tail:
-                self._preview.setText(
-                    f"Tags land under <code>{esc(path + tail)}</code>"
-                    "<br>&nbsp;&nbsp;(its own branch"
-                    + (f" — <b>not</b> under {esc(base)}" if base else "") + ")")
-            else:
-                self._preview.setText(
-                    f"Every card in this group is tagged exactly "
-                    f"<code>{esc(path)}</code> — nothing after it.")
-        elif not base:
-            self._preview.setText(
-                f"Segment: <code>{esc(path or derived)}</code> — no auto-tag "
-                "base is set, so nothing is tagged yet. Switch to “its own "
-                "branch” to tag without one.")
-        else:
-            source = "your override" if path else "derived from the name"
-            self._preview.setText(
-                f"Tags land under <code>{esc(base)}::*::"
-                f"{esc((path or derived) + tail)}</code> &nbsp;({source})")
+        # Every tag a card in this group earns, on one screen and in commit
+        # order. The point of showing all of them — including the two nobody
+        # sets here — is that the two you DO set stop looking like the whole
+        # answer.
+        lines = []
+        content = f"{base}::KG::System::Subsystem::Topic" if base else ""
+        if content:
+            lines.append(f"<code>{esc(content)}</code> &nbsp;— "
+                         "classified per gap, automatic")
+        if has_course:
+            lines.append(f"<code>{esc(path + self._tail())}</code> &nbsp;— "
+                         "this group's branch")
+        if src_tag:
+            lines.append(f"<code>{esc(src_tag)}</code> &nbsp;— source")
+        elif not has_course:
+            lines.append("<i>no source and no branch — these gaps file by "
+                         "content alone</i>")
+        if not base and not has_course:
+            lines = ["No auto-tag base is set, so nothing is tagged yet. "
+                     "Give the group a course branch to tag without one."]
+        self._preview.setText(
+            ("Every card in this group is tagged:<br>&nbsp;&nbsp;"
+             + "<br>&nbsp;&nbsp;".join(lines)) if lines else "")
 
         msgs = []
         if not name:
@@ -688,27 +726,32 @@ class _GroupEditDialog(QDialog):
             msgs.append(
                 f"“{name}” already exists — saving merges this group into it.")
         if typed and not path:
-            msgs.append("That path has nothing usable in it.")
-        if absolute and not path:
-            msgs.append("A branch of its own needs a path to live at.")
+            msgs.append("That branch has nothing usable in it.")
+        if typed_src and not src_tag:
+            msgs.append("That source has nothing usable in it."
+                        if base else
+                        "A source needs an auto-tag base to hang off.")
         self._warn.setText("  ".join(msgs))
         if self._ok is not None:
-            self._ok.setEnabled(
-                bool(name) and not (typed and not path)
-                and not (absolute and not path))
+            self._ok.setEnabled(bool(name) and not (typed and not path))
 
     def values(self) -> tuple[str, dict | None]:
-        """(name, override) — the override is None when the group should keep
-        deriving its segment from the name, file under the base, and take all
-        three levels. Anything else is an override, INCLUDING a depth change on
-        its own: "derived path but topic only" is a real answer."""
+        """(name, override) — None when the group says nothing beyond its name.
+
+        A typed course branch is always ABSOLUTE. The relative form — a segment
+        slotted inside the auto-tag base, so the batch label sat in the middle
+        of the content hierarchy — is gone from this dialog: it put a batch
+        where a body system goes, which is the thing the content axis exists to
+        stop. An old config entry that still says relative is still honoured on
+        read; nothing here can create a new one."""
         path = autotag.clean_segment_path(self._seg.text().strip())
+        source = autotag.clean_source_path(self._source.text().strip())
         name = self._name.text().strip()
-        mode = self._levels_mode()
-        if not path and not self._absolute() and mode == "full":
+        if not path and not source:
             return name, None
-        return name, {"path": path or autotag.derive_group_segment(name),
-                      "absolute": self._absolute(), "levels": mode}
+        return name, {"path": path, "absolute": bool(path),
+                      "levels": self._levels_mode() if path else "none",
+                      "source": source}
 
 
 class _GroupManagerDialog(QDialog):
@@ -738,9 +781,12 @@ class _GroupManagerDialog(QDialog):
         self._show_archived.toggled.connect(self._reload)
         root.addWidget(self._show_archived)
 
-        self._table = QTableWidget(0, 6)
+        # One column per axis the group SETS. They used to share a column
+        # called "Tag segment", which is how a source ended up saved as a
+        # course branch: the two are different answers and they now look it.
+        self._table = QTableWidget(0, 7)
         self._table.setHorizontalHeaderLabels(
-            ["Group", "Tag segment", "Gaps", "Open", "Done", "State"])
+            ["Group", "Course branch", "Source", "Gaps", "Open", "Done", "State"])
         self._table.verticalHeader().setVisible(False)
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -748,7 +794,8 @@ class _GroupManagerDialog(QDialog):
         hh = self._table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        for c in (2, 3, 4, 5):
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        for c in (3, 4, 5, 6):
             hh.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
         self._table.itemSelectionChanged.connect(self._refresh_buttons)
         self._table.itemDoubleClicked.connect(lambda *_a: self._open_in_list())
@@ -845,21 +892,41 @@ class _GroupManagerDialog(QDialog):
                 # In words, not by being greyed out: an empty row that merely
                 # looks faint reads as "disabled", not as "this has no gaps".
                 state = "Empty — no gaps left"
-            cells = [n, autotag.group_segment(n), str(st["total"]),
+            ov = autotag.group_override(n)
+            course = (ov or {}).get("path", "") if (ov or {}).get("absolute") else ""
+            source = (ov or {}).get("source", "")
+            cells = [n, course, source, str(st["total"]),
                      str(st["open"] + st["in_progress"]), str(st["done"]), state]
             for c, text in enumerate(cells):
                 it = QTableWidgetItem(text)
                 if c == 1:
-                    ov = autotag.group_override(n)
-                    if ov:
+                    if course:
                         depth = autotag.GROUP_LEVEL_LABELS.get(
                             ov["levels"], ov["levels"])
-                        where = ("Its own branch — tagged outside the auto-tag "
-                                 "base." if ov["absolute"]
-                                 else "Overridden — not derived from the name.")
-                        it.setToolTip(f"{where}\nUnder it: {depth}")
-                        it.setText(text + ("  (own branch)" if ov["absolute"]
-                                           else "  (set)"))
+                        it.setToolTip("Its own branch — tagged outside the "
+                                      f"auto-tag base.\nUnder it: {depth}")
+                    elif ov and ov.get("path"):
+                        # A path saved as relative: it would render inside the
+                        # base, which for a rooted path is a tag with two
+                        # roots. Named in words rather than left blank.
+                        it.setText("(not a branch — " + ov["path"] + ")")
+                        it.setToolTip(
+                            "Saved as a segment inside the auto-tag base "
+                            "rather than a branch of its own. Open the group "
+                            "and press OK to file it as a branch.")
+                    else:
+                        it.setText("—")
+                        it.setToolTip("No course branch. Its gaps file by "
+                                      "content and source, which is the "
+                                      "ordinary case.")
+                if c == 2:
+                    if source:
+                        from ..core.config import source_tag as _st
+                        it.setToolTip(f"Tagged {_st(source) or source}")
+                    else:
+                        it.setText("—")
+                        it.setToolTip("No source set. Open the group to say "
+                                      "where this batch came from.")
                 if c == 0:
                     it.setToolTip(
                         f"Last touched: {st['last'][:10] or 'unknown'}")
@@ -3588,7 +3655,7 @@ class KnowledgeGapsPanel(QWidget):
         # preview below is of what OK would actually write.
         plan = new_override or {
             "path": autotag.derive_group_segment(new_name),
-            "absolute": False, "levels": True}
+            "absolute": False, "levels": True, "source": ""}
         changes, skipped = self._planned_retag(members, new_name, plan)
         if changes:
             what = (f"Rename “{name}” to “{new_name}”"

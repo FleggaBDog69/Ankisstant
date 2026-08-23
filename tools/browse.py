@@ -23,6 +23,7 @@ from ..core.config import (
     mq_explain_enabled, tool_config, tool_model_for, save_tool_config,
 )
 from ..core.qt_utils import (
+    attach_source_completer,
     attach_tag_completer, is_manual_provider, loading, make_help_button,
     make_setup_banner, provider_configured, run_claude_json_async,
     set_ai_buttons_enabled,
@@ -707,7 +708,10 @@ class BrowsePanel(QWidget):
             "type it once and it sticks.\n\nIt carries no body system — the "
             "tag above holds that.")
         self.source_input.setText(autotag.sticky_source("browse"))
-        attach_tag_completer(self.source_input, multi=False)
+        # Source PATHS, not whole tags: this box wants what goes after
+        # "Sources::", and a tag completer hands back a value that then
+        # prefixes itself.
+        attach_source_completer(self.source_input)
         confirm_row.insertWidget(1, self.source_input)
 
         # The write door. Hidden until a matched find has run — before that

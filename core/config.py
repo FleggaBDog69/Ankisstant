@@ -17,7 +17,8 @@ ADDON = __name__.split(".")[0]
 # (the lowest layer) so both core/api.py and ui/settings.py can import them
 # without a circular dependency.
 PROVIDER_MODELS: dict[str, list[str]] = {
-    "anthropic": ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
+    "anthropic": ["claude-opus-5", "claude-sonnet-5", "claude-fable-5",
+                  "claude-haiku-4-5-20251001"],
     "gemini":    ["gemini-3.5-flash", "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"],
     "openai":    ["gpt-4o", "gpt-4o-mini", "gpt-4.1-mini"],
     # Ollama runs whatever models the user has pulled locally; these are common
@@ -51,7 +52,7 @@ PROVIDER_OF: dict[str, str] = {
 FREE_TIER_GEMINI = "gemini-3.5-flash"
 
 _FAST_MODELS:  dict[str, str] = {"anthropic": "claude-haiku-4-5-20251001", "gemini": "gemini-3.5-flash", "openai": "gpt-4o-mini", "ollama": "llama3.1"}
-_SMART_MODELS: dict[str, str] = {"anthropic": "claude-sonnet-4-6",          "gemini": "gemini-3.5-flash", "openai": "gpt-4o",      "ollama": "llama3.1"}
+_SMART_MODELS: dict[str, str] = {"anthropic": "claude-sonnet-5",            "gemini": "gemini-3.5-flash", "openai": "gpt-4o",      "ollama": "llama3.1"}
 
 # ── AI tool matrix ──────────────────────────────────────────────────────────────
 # The canonical list of AI "tools" surfaced in the consolidated per-AI matrix on
@@ -670,7 +671,9 @@ def ensure_config() -> None:
     # AFTER the lecture rename, which is what produces the '{base}::AI::Lecture'
     # spelling this one then moves under Ankisstant.
     _migrate_tag_axes(merged)
+    _migrate_group_axes(merged)
     _migrate_dead_gemini_models(merged)
+    _migrate_stale_claude_models(merged)
     if merged != raw:
         mw.addonManager.writeConfig(ADDON, merged)
 
@@ -683,8 +686,10 @@ def load_config() -> dict:
     _migrate_auto_tag_scheme(cfg)
     _migrate_lecture_audit_tag(cfg)
     _migrate_tag_axes(cfg)
+    _migrate_group_axes(cfg)
     _migrate_ai_matrix(cfg)
     _migrate_dead_gemini_models(cfg)
+    _migrate_stale_claude_models(cfg)
     return cfg
 
 
@@ -786,6 +791,56 @@ def _migrate_ai_matrix(cfg: dict) -> None:
     preserve_override(qb, "card_gen_model", card_seed,   _SMART_MODELS)
 
     cfg["ai_matrix_migrated"] = True
+
+
+# Claude 4.x model IDs -> their Claude 5 replacements. Exact IDs only: a model
+# name that isn't on this list is either current or something the user typed
+# deliberately, and neither should be rewritten.
+_CLAUDE_SUCCESSORS: dict[str, str] = {
+    "claude-opus-4-7":   "claude-opus-5",
+    "claude-opus-4-6":   "claude-opus-5",
+    "claude-opus-4-5":   "claude-opus-5",
+    "claude-opus-4-1":   "claude-opus-5",
+    "claude-opus-4":     "claude-opus-5",
+    "claude-sonnet-4-6": "claude-sonnet-5",
+    "claude-sonnet-4-5": "claude-sonnet-5",
+    "claude-sonnet-4":   "claude-sonnet-5",
+}
+
+
+def _migrate_stale_claude_models(cfg: dict) -> None:
+    """Move the AI matrix's Anthropic slots onto the current Claude generation.
+
+    The matrix is saved per user, so bumping the DEFAULTS alone changes nothing
+    for anyone who has ever opened Settings — the saved 4.x IDs keep running,
+    and the "latest" in the picker is only the latest thing you could newly
+    choose. This rewrites the values themselves.
+
+    Same rule as every other migration here: EXACT legacy IDs only, mapped
+    one-to-one to the model that replaced them, and same tier — an opus dial
+    stays an opus dial. Haiku 4.5 is deliberately absent: it is still the
+    current Haiku, so there is nothing to move it to. A model the user typed
+    themselves is left exactly as typed.
+
+    Idempotent: the successors are not keys in the table.
+    """
+    if not isinstance(cfg, dict):
+        return
+
+    def heal(slot):
+        if not isinstance(slot, dict):
+            return
+        cur = str(slot.get("anthropic") or "").strip()
+        want = _CLAUDE_SUCCESSORS.get(cur)
+        if want:
+            slot["anthropic"] = want
+
+    heal(cfg.get("model_defaults"))
+    matrix = cfg.get("ai_matrix")
+    if isinstance(matrix, dict):
+        for entry in matrix.values():
+            if isinstance(entry, dict):
+                heal(entry.get("model"))
 
 
 def _migrate_dead_gemini_models(cfg: dict) -> bool:
@@ -948,6 +1003,65 @@ def _migrate_tag_axes(cfg: dict) -> None:
         tmpl = (kg.get("tag_scheme_template") or "").strip()
         if tmpl and "{content}" not in tmpl and "{type}" in tmpl:
             kg["tag_scheme_template"] = tmpl.replace("{type}", "{content}", 1)
+
+
+def _migrate_group_axes(cfg: dict) -> None:
+    """Put each group's saved override on the right axis.
+
+    A group override answers two questions that used to be one box, and the box
+    got them wrong in two specific, reproducible ways:
+
+    1. A FULL BRANCH SAVED AS RELATIVE. The path box had a tag completer on it,
+       which offers whole tags, but the "Where" dial defaulted to "inside the
+       base". Accept the completer's suggestion without touching the dial and
+       the group saved "!!Curtanki::Year_3::SRS::11" with absolute=False —
+       which renders as "!!Fleg::*::!!Curtanki::Year_3::SRS::11", a tag with
+       two roots that matches nothing. A path whose first segment starts with
+       "!" is a root, so it can only ever have meant a branch of its own.
+
+    2. A SOURCE SAVED AS A COURSE BRANCH. "!!Fleg::KGs::CS::HW_Aug_26" is not
+       a branch of a tag tree the user keeps — it is under the add-on's own
+       base, which means it is provenance: a homework set. It moves to the
+       source axis as "CS::HW_Aug_26", where a leading KG/KGs/Sources segment
+       is dropped because the axis already says that.
+
+    Idempotent, and it never invents an override for a group that has none.
+    """
+    kg = cfg.get("tools", {}).get("knowledge_gaps")
+    if not isinstance(kg, dict):
+        return
+    overrides = kg.get("group_tag_overrides")
+    if not isinstance(overrides, dict) or not overrides:
+        return
+    base = (kg.get("auto_tag_base") or "").strip().strip(":")
+    content = str(kg.get("content_segment") or DEFAULT_CONTENT_SEGMENT).strip(":")
+    out = {}
+    for name, raw in overrides.items():
+        if isinstance(raw, str):
+            raw = {"path": raw, "absolute": False, "levels": "full"}
+        if not isinstance(raw, dict):
+            out[name] = raw
+            continue
+        ent = dict(raw)
+        path = str(ent.get("path") or ent.get("segment") or "").strip().strip(":")
+
+        # 1 ── a rooted path is a branch of its own, whatever the dial said
+        if path and path.split("::")[0].startswith("!") and not ent.get("absolute"):
+            ent["absolute"] = True
+
+        # 2 ── a path under OUR base is provenance, not a course branch
+        if base and path and path.lower().startswith(f"{base.lower()}::"):
+            tail = path[len(base) + 2:].strip(":")
+            head = tail.split("::")[0] if tail else ""
+            if head.lower() in {content.lower(), SOURCES_SEGMENT.lower(),
+                                f"{content.lower()}s"}:
+                tail = tail[len(head) + 2:].strip(":") if "::" in tail else ""
+            if tail:
+                ent["source"] = ent.get("source") or tail
+                ent["path"] = ""
+                ent["absolute"] = False
+        out[name] = ent
+    kg["group_tag_overrides"] = out
 
 
 def _migrate_auto_tag_scheme(cfg: dict) -> None:
@@ -1130,6 +1244,13 @@ def source_tag(path: str) -> str:
 
     "" when there is no base or no path — a source tag with nothing after
     "Sources::" is worse than none.
+
+    A path that ALREADY carries the prefix has it stripped rather than doubled.
+    Every source box in the add-on has a tag completer on it, and a tag
+    completer offers whole tags — so "!!Fleg::Sources::Placements::GP" is not a
+    user error, it is what the box hands you. Rendering that as
+    "!!Fleg::Sources::!!Fleg::Sources::Placements::GP" was a real tag on a real
+    card, and no amount of placeholder text was going to stop it.
     """
     base = auto_tag_base()
     import re as _re
@@ -1137,6 +1258,19 @@ def source_tag(path: str) -> str:
     path = _re.sub(r"_*::_*", "::", path)
     path = _re.sub(r"(::)+", "::", path).strip(":")
     if not base or not path:
+        return ""
+    head = f"{base}::{SOURCES_SEGMENT}::"
+    low = path.lower()
+    if low.startswith(head.lower()):
+        path = path[len(head):].strip(":")
+    elif low.startswith(f"{SOURCES_SEGMENT}::".lower()):
+        path = path[len(SOURCES_SEGMENT) + 2:].strip(":")
+    elif low.startswith(f"{base}::".lower()):
+        # Under the base but not under Sources: still not a source path. The
+        # only thing after the base that isn't provenance is the content
+        # segment, and that is never what someone means to type here.
+        path = path[len(base) + 2:].strip(":")
+    if not path:
         return ""
     return f"{base}::{SOURCES_SEGMENT}::{path}"
 

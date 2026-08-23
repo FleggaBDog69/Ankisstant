@@ -21,7 +21,8 @@
 from __future__ import annotations
 
 from aqt.qt import (
-    QFrame, QHBoxLayout, QLabel, QSizePolicy, Qt, QWidget,
+    QColor, QFont, QFontMetrics, QFrame, QHBoxLayout, QLabel, QPainter,
+    QPalette, QPen, QPoint, QRect, QSize, QSizePolicy, Qt, QWidget,
 )
 
 from . import pipeline
@@ -64,12 +65,146 @@ _STAGE_TIP = {
 _CIRCLED = "①②③④⑤⑥⑦⑧"
 
 
+# ── the strip, painted ───────────────────────────────────────────────────────
+#
+# It was eight bordered labels in a row: legible, but it read as a toolbar of
+# buttons rather than as one run moving through eight stages. A pipeline has a
+# direction and this now shows it — nodes on a track, the track between two
+# finished stages filled in, the one you are on ringed.
+#
+# The rules it keeps from the label version, because both were load-bearing:
+#
+#   * EVERY stage is drawn, including the ones this run skipped. Seeing that a
+#     solo AI Create skipped Read, Approve and Find is how the shape of the
+#     pipeline stays legible across doors that use very different amounts of it.
+#   * NEVER state by colour alone. Each node carries a glyph (✓ ▪ – !) AND a
+#     word underneath. Grey reads as "rejected" when it means "not run yet",
+#     and this add-on has been bitten by exactly that before.
+#   * Palette-relative colours, so it reads on both Anki themes.
+
+class _StageNode(QWidget):
+    """One stage: a node on the track, its label, and its state in words."""
+
+    _R = 9                     # node radius
+    _TRACK_Y = 13              # centre line, from the top
+
+    def __init__(self, st, state: str, tail: str, is_current: bool,
+                 first: bool, last: bool, left_done: bool, right_done: bool,
+                 parent=None):
+        super().__init__(parent)
+        self._st, self._state, self._tail = st, state, tail
+        self._current = is_current
+        self._first, self._last = first, last
+        self._left_done, self._right_done = left_done, right_done
+        self.setSizePolicy(QSizePolicy.Policy.Preferred,
+                           QSizePolicy.Policy.Fixed)
+        self.setMinimumHeight(46)
+        f = self.font()
+        f.setPointSizeF(max(8.0, f.pointSizeF() - 2))
+        self._font = f
+        fm = QFontMetrics(f)
+        self._w = max(fm.horizontalAdvance(st.label),
+                      fm.horizontalAdvance(tail), 2 * self._R) + 14
+        self.setMinimumWidth(self._w)
+
+    def sizeHint(self):
+        return QSize(self._w, 46)
+
+    # -- what the node itself says --------------------------------------------
+    def _glyph(self) -> str:
+        return {pipeline.DONE: "✓", pipeline.RUNNING: "▪",
+                pipeline.SKIPPED: "–", pipeline.FAILED: "!"}.get(
+                    self._state, str(self._st.ordinal))
+
+    def _ink(self):
+        pal = self.palette()
+        if self._state == pipeline.FAILED:
+            return QColor("#b45309")
+        if self._state in (pipeline.PENDING, pipeline.SKIPPED):
+            c = QColor(pal.color(QPalette.ColorRole.WindowText))
+            c.setAlpha(110)
+            return c
+        return pal.color(QPalette.ColorRole.WindowText)
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pal = self.palette()
+        mid = QColor(pal.color(QPalette.ColorRole.WindowText))
+        mid.setAlpha(45)
+        ink = self._ink()
+        cx, cy, r = self.width() // 2, self._TRACK_Y, self._R
+
+        # -- the track, half a segment either side ----------------------------
+        # A segment is FILLED only when the stages at both of its ends are
+        # behind you. A run that skipped a stage still shows a continuous line
+        # through it: the run did pass through, it just had nothing to do there.
+        def seg(x1, x2, solid):
+            c = QColor(ink) if solid else mid
+            if solid:
+                c.setAlpha(120)
+            pen = QPen(c, 2)
+            if not solid:
+                pen.setStyle(Qt.PenStyle.DotLine)
+            p.setPen(pen)
+            p.drawLine(x1, cy, x2, cy)
+
+        behind = self._state in (pipeline.DONE, pipeline.SKIPPED)
+        if not self._first:
+            seg(0, cx - r - 3, behind and self._left_done)
+        if not self._last:
+            seg(cx + r + 3, self.width(), behind and self._right_done)
+
+        # -- the node ----------------------------------------------------------
+        p.setPen(QPen(ink, 1.5))
+        if self._state == pipeline.DONE:
+            fill = QColor(ink)
+            fill.setAlpha(38)
+            p.setBrush(fill)
+        elif self._current or self._state == pipeline.RUNNING:
+            # The ring is the "you are here" marker; the word underneath says
+            # "running", so the ring is never the only thing carrying it.
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(ink, 2.5))
+        else:
+            p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawEllipse(QPoint(cx, cy), r, r)
+
+        gf = QFont(self._font)
+        gf.setBold(self._current or self._state == pipeline.RUNNING)
+        gf.setPointSizeF(max(7.0, self._font.pointSizeF() - 0.5))
+        p.setFont(gf)
+        p.setPen(ink)
+        p.drawText(QRect(cx - r, cy - r, 2 * r, 2 * r),
+                   int(Qt.AlignmentFlag.AlignCenter), self._glyph())
+
+        # -- the label and the state, in words ---------------------------------
+        lf = QFont(self._font)
+        lf.setBold(self._current or self._state == pipeline.RUNNING)
+        p.setFont(lf)
+        p.setPen(ink)
+        p.drawText(QRect(0, cy + r + 1, self.width(), 13),
+                   int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop),
+                   QFontMetrics(lf).elidedText(self._st.label,
+                                               Qt.TextElideMode.ElideRight,
+                                               self.width()))
+        sub = QColor(ink)
+        sub.setAlpha(150)
+        p.setPen(sub)
+        p.setFont(self._font)
+        p.drawText(QRect(0, cy + r + 14, self.width(), 13),
+                   int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop),
+                   QFontMetrics(self._font).elidedText(
+                       self._tail, Qt.TextElideMode.ElideRight, self.width()))
+        p.end()
+
+
 class StageStrip(QWidget):
     """The eight stages, along the top of the run view.
 
     Reads a pipeline.RunRecord and nothing else, so it works identically for a
     one-card AI Create run and a sixty-point lecture. Deliberately cheap to
-    rebuild: set_record() throws the boxes away and remakes them, because a run
+    rebuild: set_record() throws the nodes away and remakes them, because a run
     changes state a handful of times, not per frame.
     """
 
@@ -77,8 +212,8 @@ class StageStrip(QWidget):
         super().__init__(parent)
         self._record = None
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 4)
-        lay.setSpacing(4)
+        lay.setContentsMargins(6, 2, 6, 2)
+        lay.setSpacing(0)
         self._lay = lay
         self.setSizePolicy(QSizePolicy.Policy.Preferred,
                            QSizePolicy.Policy.Fixed)
@@ -95,38 +230,30 @@ class StageStrip(QWidget):
             self._lay.addStretch(1)
             return
         current = record.current
-        for st in pipeline.STAGES:
-            state = record.state_of(st.key)
-            self._lay.addWidget(self._box(st, state, record,
-                                          current is not None
-                                          and current.key == st.key))
-        self._lay.addStretch(1)
+        stages = list(pipeline.STAGES)
+        states = [record.state_of(st.key) for st in stages]
+        behind = [s in (pipeline.DONE, pipeline.SKIPPED) for s in states]
+        for i, st in enumerate(stages):
+            node = _StageNode(
+                st, states[i], self._tail(st, states[i], record),
+                current is not None and current.key == st.key,
+                first=(i == 0), last=(i == len(stages) - 1),
+                left_done=behind[i - 1] if i else False,
+                right_done=behind[i + 1] if i + 1 < len(stages) else False,
+                parent=self)
+            err = (record.errors or {}).get(st.key, "")
+            node.setToolTip("\n\n".join(x for x in (
+                f"{st.ordinal}. {st.label}",
+                _STAGE_TIP.get(st.key, ""), _TIP.get(states[i], ""), err) if x))
+            self._lay.addWidget(node, 1)
 
-    def _box(self, st, state: str, record, is_current: bool) -> QWidget:
-        count = (record.counts or {}).get(st.key, "")
-        word = _WORD.get(state, state)
-        num = _CIRCLED[st.ordinal - 1] if st.ordinal <= len(_CIRCLED) else str(st.ordinal)
-        # The count replaces the state word once there IS one: "14 points" says
-        # both that the stage ran and what came out of it, and the box is too
-        # small to carry both without truncating the useful half.
-        tail = count or word
-        lbl = QLabel(f"{num} {st.label} · {tail}")
-        lbl.setTextFormat(Qt.TextFormat.PlainText)
-        err = (record.errors or {}).get(st.key, "")
-        lbl.setToolTip("\n\n".join(x for x in (
-            _STAGE_TIP.get(st.key, ""), _TIP.get(state, ""), err) if x))
-        muted = state in (pipeline.PENDING, pipeline.SKIPPED)
-        weight = "bold" if is_current or state == pipeline.RUNNING else "normal"
-        # Palette-relative so it reads on both Anki themes; the words carry the
-        # meaning either way.
-        colour = ("palette(mid)" if muted else
-                  "palette(bright-text)" if state == pipeline.FAILED
-                  else "palette(text)")
-        lbl.setStyleSheet(
-            f"QLabel {{ color: {colour}; font-size: 11px; font-weight: {weight};"
-            "  padding: 2px 6px; border: 1px solid palette(mid);"
-            "  border-radius: 3px; }")
-        return lbl
+    @staticmethod
+    def _tail(st, state: str, record) -> str:
+        """What sits under the label: the count once there is one, else the
+        state word. "14 points" says both that the stage ran and what came out
+        of it, and the line is too short to carry both without truncating the
+        useful half."""
+        return (record.counts or {}).get(st.key, "") or _WORD.get(state, state)
 
 
 def separator() -> QFrame:

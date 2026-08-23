@@ -197,6 +197,7 @@ class BulkSearchDialog(QDialog):
     ROLE_CARD = Qt.ItemDataRole.UserRole + 2      # the written card dict itself
     ROLE_CONCEPT = Qt.ItemDataRole.UserRole + 3   # a point row's concept text
     ROLE_KG = Qt.ItemDataRole.UserRole + 4        # owning gap, carried by leaves
+    ROLE_TITLE = Qt.ItemDataRole.UserRole + 5     # a gap row's own heading text
 
     def __init__(self, kgs: list[dict], parent=None, *, unified: bool = False,
                  plans=None, matches=None, coverage=None, door: str = "",
@@ -642,14 +643,16 @@ class BulkSearchDialog(QDialog):
         self._source_input.setPlaceholderText("e.g. Placements::GP — optional")
         self._source_input.setToolTip(
             "Where this run's cards came from, tagged under "
-            "{base}::Sources::. Prefilled from the gap type or the file when "
-            "that says it; otherwise type it once and it sticks for next time.\n\n"
+            "{base}::Sources::. Prefilled from the GROUP's own source when it "
+            "has one, then the gap type or the file; otherwise type it once "
+            "and it sticks for next time.\n\n"
             "It carries NO body system — the content tag holds that, once.")
         self._source_input.setText(
-            self._seed_source or autotag.sticky_source("knowledge_gaps"))
+            self._seed_source or self._group_source()
+            or autotag.sticky_source("knowledge_gaps"))
         try:
-            from ...core.qt_utils import attach_tag_completer
-            attach_tag_completer(self._source_input, multi=False)
+            from ...core.qt_utils import attach_source_completer
+            attach_source_completer(self._source_input)
         except Exception:
             pass
         send_row.addWidget(self._source_input)
@@ -1458,6 +1461,11 @@ class BulkSearchDialog(QDialog):
             top = QTreeWidgetItem(self._tree)
             top.setData(0, self.ROLE_KIND, "gap")
             top.setData(0, self.ROLE_KEY, plan.kg_id)
+            # _relabel_gaps rebuilds this row's heading from the title, so the
+            # heading can say what is TICKED now rather than what the search
+            # found earlier. Without it the row is skipped and the count
+            # freezes at whatever the search reported.
+            top.setData(0, self.ROLE_TITLE, plan.title)
             top.setFlags(top.flags() | Qt.ItemFlag.ItemIsAutoTristate
                          | Qt.ItemFlag.ItemIsUserCheckable)
             # An auto-tristate parent needs a starting state or Qt draws no
@@ -1619,12 +1627,31 @@ class BulkSearchDialog(QDialog):
                 log.warn(f"run view: couldn't resolve the group branch: {e}")
         return ""
 
+    def _run_group(self) -> str:
+        """The group this run belongs to — the first one its plans name.
+
+        A run is a batch and a batch has one provenance; when a selection spans
+        groups the first is as good an answer as any, and both the course tag
+        and the source box show what it picked before anything commits."""
+        for plan in self._run_plans:
+            g = getattr(plan, "group", "")
+            if g:
+                return str(g)
+        return ""
+
+    def _group_source(self) -> str:
+        try:
+            return autotag.group_source(self._run_group())
+        except Exception as e:
+            log.warn(f"run view: couldn't read the group's source: {e}")
+            return ""
+
     def _source_tag(self) -> str:
         """The provenance tag for this run — {base}::Sources::….
 
         Derived where it can be (a missed question is Sources::MQ, a lecture is
-        Sources::Lecture::<file>) and typed where it can't (a placement, a
-        question bank). What you type STICKS for this door: a placement runs
+        Sources::Lecture::<file>, and a group carries its own source once the
+        group was told) and typed where it can't. What you type STICKS for this door: a placement runs
         for weeks, and re-typing the same source on every card is how a source
         axis stops being filled in.
         """
@@ -1636,12 +1663,13 @@ class BulkSearchDialog(QDialog):
             if kind:
                 break
         path = autotag.source_path_for(
-            tool="knowledge_gaps", kg_type_key=kind,
+            tool="knowledge_gaps", kg_type_key=kind, group=self._run_group(),
             override=typed if typed is not None else None)
         # Only remember a source the USER typed. A derived one (a lecture's
         # filename) is specific to that run and would otherwise become the
         # default for every gap batch afterwards.
         if (typed is not None and typed != self._seed_source
+                and typed != self._group_source()
                 and typed != autotag.sticky_source("knowledge_gaps")):
             autotag.set_sticky_source("knowledge_gaps", typed)
         from ...core.config import source_tag

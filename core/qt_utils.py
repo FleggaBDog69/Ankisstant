@@ -446,6 +446,31 @@ def attach_tag_completer(line_edit, multi: bool = False) -> None:
         log.warn(f"tag completer setup failed: {e}")
 
 
+def attach_source_completer(line_edit) -> None:
+    """Attach a completer that offers SOURCE PATHS — "Placements::GP" — not
+    whole tags.
+
+    The distinction is the whole point. A source box wants the path that goes
+    after "{base}::Sources::", but attach_tag_completer offers finished tags,
+    so accepting its suggestion put "!!Fleg::Sources::Placements::GP" in a box
+    that then prefixed it again. config.source_tag strips a doubled prefix now,
+    but a box that offers the right thing in the first place is the better half
+    of that fix.
+
+    No-op if mw.col isn't ready or nothing is tagged with a source yet."""
+    try:
+        from ..tools.autotag import known_source_paths
+        paths = known_source_paths()
+        if not paths:
+            return
+        completer = QCompleter(paths, line_edit)
+        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        line_edit.setCompleter(completer)
+    except Exception as e:
+        log.warn(f"source completer setup failed: {e}")
+
+
 def attach_deck_completer(line_edit, multi: bool = False) -> None:
     """Attach an Anki-deck-name autocomplete to a QLineEdit. No-op if mw.col
     isn't ready (e.g. called before profile load)."""
