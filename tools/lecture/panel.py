@@ -2695,6 +2695,8 @@ class LecturePanel(QWidget):
         open_run([record], plans=[plan], matches=list(self._matches),
                  coverage=cov, door="lecture",
                  title=f"AI Lecture — {item.title}",
+                 # The file is the source; nothing to type.
+                 source=autotag.source_for_lecture(self._path or ""),
                  parent=self, on_committed=self._on_run_committed)
 
     def _on_run_committed(self, created: dict, _found_nids: list) -> None:
@@ -2942,7 +2944,11 @@ class LecturePanel(QWidget):
             tag_ops=commit.tag_ops_for(
                 per_item=[(tag, list(nids))],
                 audit=(audit if audit != tag else ""),
-                month=(mtag if mtag != tag else "")),
+                month=(mtag if mtag != tag else ""),
+                # The file IS the source, so there is nothing to type: a
+                # lecture always knows where its cards came from.
+                source=autotag.source_tag_for(tool="lecture",
+                                              lecture_path=self._path or "")),
             unsuspend_nids=list(nids) if do_unsuspend else [],
         )
         res = commit.run(cplan)

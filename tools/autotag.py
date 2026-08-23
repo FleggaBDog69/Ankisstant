@@ -451,6 +451,18 @@ def tag_from_levels(levels: dict | None, kg_type_key: str | None = None,
     any_kept = any(str(v).strip() for v in kept.values())
 
     # ── absolute: the group's branch, standing on its own ────────────────────
+    #
+    # An absolute group used to REPLACE the content tag: a gap in "SRS 5" got
+    # !!Curtanki::Year_3::SRS::05::<topic> and nothing under !!Fleg::KG:: at
+    # all. That is what the group feature was for — one contiguous course
+    # branch — but it means the content axis has a hole in it exactly where the
+    # course work is, so "everything I have on the thyroid" misses every card
+    # made from a case.
+    #
+    # The two are no longer alternatives. This still returns the course path,
+    # because that is what the group asked for and what the tag box should
+    # show; the CONTENT tag comes back from content_tag_from_levels() and both
+    # are applied. See tags_for().
     if plan["absolute"] and plan["path"]:
         if not any_kept:
             return plan["path"]
@@ -458,19 +470,200 @@ def tag_from_levels(levels: dict | None, kg_type_key: str | None = None,
         # standing in for the base and no type segment — so a customised
         # template still shapes the levels the way the user set it up.
         tag = format_hierarchical_tag(plan["path"], kept, type_seg="",
-                                      group_seg="")
+                                      group_seg="", content_seg="")
         return tag or plan["path"]
 
     # ── relative: one segment inside the shared base ─────────────────────────
     base = auto_tag_base()
     if not base or not levels:
         return ""
-    if type_meta is not None:
-        type_seg = type_meta.get("name") or type_meta.get("key") or ""
-    else:
-        type_seg, _enabled = kg_type_info((kg_type_key or default_type_key()))
-    tag = format_hierarchical_tag(base, kept, type_seg=type_seg,
-                                  group_seg=plan["path"])
+    # The second segment is the CONTENT axis ("KG"), the same for every card.
+    # It used to be the gap's TYPE, which filed an LO gap under {base}::LO:: and
+    # a missed question under {base}::MQ:: — provenance sitting in the middle of
+    # the content hierarchy, so one fact lived in two branches depending on how
+    # it happened to be captured. The type is provenance and now rides the
+    # source axis (see source_tag_for).
+    tag = format_hierarchical_tag(base, kept, group_seg=plan["path"])
     if not tag or tag == base:
         return ""
     return tag
+
+
+# ── the source axis ──────────────────────────────────────────────────────────
+#
+# WHERE a card came from, kept strictly separate from what it is about. The
+# content tag holds the body system once; a source tag that repeated it would
+# put the same fact in two branches, which is the thing this scheme exists to
+# stop. So a source path is short and says only where: "MQ", "CS::HW_Aug_26",
+# "Lecture::cardiac_output", "Placements::Homeless_Healthcare".
+#
+# Derived where it can be, set by hand where it can't, and the hand-set value
+# STICKS per tool — a placement runs for weeks, and re-typing the same source on
+# every card is how a source axis stops being filled in.
+
+# KG type key -> its source segment. A type not listed here contributes no
+# source of its own: "kg" is the ordinary case (a gap you noticed), and
+# "Sources::KG" would say nothing the content tag doesn't already say.
+_TYPE_SOURCES = {"mq": "MQ", "cs": "CS", "lo": "LO"}
+
+
+def source_for_type(kg_type_key: str) -> str:
+    return _TYPE_SOURCES.get(str(kg_type_key or "").strip().lower(), "")
+
+
+def source_for_lecture(path: str) -> str:
+    """A lecture file's source path: Lecture::<the file's own name>."""
+    import os
+    name = os.path.basename(str(path or ""))
+    stem = os.path.splitext(name)[0]
+    # ".pdf" -> splitext returns (".pdf", ""): a dotfile has no stem, and
+    # "Lecture::.pdf" is not a source.
+    if stem.startswith("."):
+        stem = ""
+    stem = _clean_seg(stem)
+    return f"Lecture::{stem}" if stem else "Lecture"
+
+
+def sticky_source(tool: str) -> str:
+    """The source this tool last committed under. Sticks because a placement or
+    a question bank run spans weeks, not one card."""
+    try:
+        return str(tool_config(tool).get("source_path") or "").strip()
+    except Exception:
+        return ""
+
+
+def set_sticky_source(tool: str, path: str) -> None:
+    # Imported here, not at module level: autotag is deliberately importable
+    # with almost nothing stubbed, and three offline harnesses rely on that.
+    from ..core import log
+    from ..core.config import save_tool_config, tool_config as _tc
+    try:
+        cfg = dict(_tc(tool))
+        cfg["source_path"] = str(path or "").strip()
+        save_tool_config(tool, cfg)
+    except Exception as e:
+        log.warn(f"autotag: couldn't remember the source for {tool}: {e}")
+
+
+def source_path_for(*, tool: str = "", kg_type_key: str = "",
+                    lecture_path: str = "", override: str | None = None) -> str:
+    """The source path for a card, most specific first.
+
+    An explicit `override` (what the user typed for this run) always wins. Then
+    the file, then the gap type, then whatever this tool last used. "" means
+    no source tag — which is a legitimate answer, not a hole to fill with a
+    guess.
+    """
+    if override is not None and str(override).strip():
+        return str(override).strip()
+    if lecture_path:
+        return source_for_lecture(lecture_path)
+    from_type = source_for_type(kg_type_key)
+    if from_type:
+        return from_type
+    if override is not None:
+        # An explicit EMPTY override is the user saying "no source", and must
+        # not fall through to the sticky value they cleared.
+        return ""
+    return sticky_source(tool) if tool else ""
+
+
+def source_tag_for(**kw) -> str:
+    """source_path_for, rendered as a tag. "" when there is no source."""
+    from ..core.config import source_tag
+    return source_tag(source_path_for(**kw))
+
+
+def known_source_paths() -> list:
+    """Source paths already in the collection, for the completer — so the
+    second placement of the year files under the first one's branch instead of
+    inventing a near-miss spelling."""
+    from ..core.config import auto_tag_base, SOURCES_SEGMENT
+    base = auto_tag_base()
+    if not base:
+        return []
+    head = f"{base}::{SOURCES_SEGMENT}::"
+    out: set = set()
+    try:
+        from aqt import mw
+        for t in mw.col.tags.all():
+            if t.startswith(head):
+                tail = t[len(head):].strip(":")
+                if tail:
+                    out.add(tail)
+                    # The parents too: "CS::HW_Aug_26" implies "CS" is a source
+                    # you use, even if nothing is tagged with it bare.
+                    parts = tail.split("::")
+                    for i in range(1, len(parts)):
+                        out.add("::".join(parts[:i]))
+    except Exception:
+        return []
+    return sorted(out)
+
+
+def content_tag_from_levels(levels: dict | None, *, group: str = "",
+                            group_plan: dict | None = None,
+                            kg_type_key: str | None = None,
+                            type_meta: dict | None = None) -> str:
+    """The CONTENT tag — {base}::KG::{system}::{subsystem}::{topic} — always
+    relative to the base, whatever the group is doing.
+
+    Separate from tag_from_levels because an absolute group deliberately
+    returns its own branch there. Both are wanted; neither replaces the other.
+
+    `kg_type_key` / `type_meta` are ACCEPTED AND IGNORED. They used to pick the
+    second segment, which is exactly the mistake this function exists to undo —
+    the type is provenance and rides the source axis now (source_for_type).
+    They stay in the signature so the ~six call sites that pass one don't all
+    need editing to say the same thing, and so passing one is visibly a no-op
+    rather than a silent difference.
+    """
+    base = auto_tag_base()
+    if not base or not levels:
+        return ""
+    # The group's `levels` mode is DELIBERATELY not applied here. It decides how
+    # much of the hierarchy to repeat under the group's own branch — "topic"
+    # keeps that branch shallow instead of making it a deep duplicate of the
+    # content tree. The content tag is that tree, so it always carries the full
+    # levels; trimming it here filed a "topic"-mode gap as
+    # !!Fleg::KG::Graves_disease, with no field segment at all.
+    if not any(str(v).strip() for v in (levels or {}).values()):
+        return ""
+    tag = format_hierarchical_tag(base, levels)
+    return "" if (not tag or tag == base) else tag
+
+
+def tags_for(levels: dict | None, *, group: str = "", tool: str = "",
+             kg_type_key: str = "", lecture_path: str = "",
+             source_override: str | None = None,
+             group_plan: dict | None = None) -> list:
+    """EVERY tag one card earns from the scheme, on all three axes.
+
+    Order is the commit order and it is load-bearing (see
+    tools/commit.tag_ops_for): most specific first.
+
+      1. content   {base}::KG::{system}::{subsystem}::{topic}
+      2. course    the group's own branch, when it has an absolute one
+      3. source    {base}::Sources::{path}, when there is a source
+
+    Deduped case-insensitively, because Anki matches tags that way and two
+    spellings of one tag are one tag with twice the clutter.
+    """
+    out: list = []
+    seen: set = set()
+
+    def add(t):
+        t = str(t or "").strip()
+        if t and t.lower() not in seen:
+            seen.add(t.lower())
+            out.append(t)
+
+    add(content_tag_from_levels(levels, group=group, group_plan=group_plan))
+    course = tag_from_levels(levels, group=group, group_plan=group_plan)
+    plan = (group_plan if group_plan is not None else group_tag_plan(group))
+    if plan.get("absolute") and plan.get("path"):
+        add(course)
+    add(source_tag_for(tool=tool, kg_type_key=kg_type_key,
+                       lecture_path=lecture_path, override=source_override))
+    return out

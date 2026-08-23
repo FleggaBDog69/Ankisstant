@@ -329,8 +329,11 @@ def _apply_tag_levels(gap: dict, type_meta: dict, levels: dict) -> str:
     KG store. Whether to tag at all is the caller's call (the Auto-tag
     checkbox); this only needs the type's name segment. Returns '' if unusable
     (no base/levels)."""
-    tag = autotag.tag_from_levels(levels, type_meta=type_meta,
-                                  group=_gap_group(gap))
+    # The tag BOX is the content axis. It used to show the group's own absolute
+    # branch instead, which meant a gap in a course case never got a content tag
+    # at all — see autotag.content_tag_from_levels. The course branch is still
+    # applied, as a shared tag at commit time.
+    tag = autotag.content_tag_from_levels(levels, group=_gap_group(gap))
     if not tag:
         return ""
     gap["auto_tag"] = tag
@@ -359,7 +362,7 @@ def _topic_tag_from_levels(levels: dict, type_meta: dict | None,
 
     `group` is normally '' here — a no-gap generation has no KG and so no group.
     Mass AI Create passes one when a whole batch is being written into a group."""
-    return autotag.tag_from_levels(levels, type_meta=type_meta, group=group)
+    return autotag.content_tag_from_levels(levels, group=group)
 
 
 def _tag_material(gap: dict | None, topic_label: str | None,

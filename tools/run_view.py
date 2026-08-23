@@ -140,7 +140,8 @@ def separator() -> QFrame:
 
 def open_run(records: list, *, plans=None, matches=None, coverage=None,
              door: str = "", title: str = "", parent=None,
-             on_committed=None, unified: bool = True, adopt_batch: str = ""):
+             on_committed=None, unified: bool = True, adopt_batch: str = "",
+             source: str = ""):
     """Open the shared run view on whatever this door has already produced.
 
     Four ways in, and the door picks by how much it has done already:
@@ -175,7 +176,7 @@ def open_run(records: list, *, plans=None, matches=None, coverage=None,
     dlg = BulkSearchDialog(records, parent=parent, unified=unified,
                            plans=plans, matches=matches, coverage=coverage,
                            door=door, title=title, on_committed=on_committed,
-                           adopt_batch=adopt_batch)
+                           adopt_batch=adopt_batch, source=source)
     dlg.show()
     dlg.raise_()
     dlg.activateWindow()
@@ -219,9 +220,13 @@ def open_written(job: dict, *, parent=None, door: str = "create"):
         cards=int(job.get("n_cards") or 0) or len(concepts),
         points=[_bare_point(c) for c in concepts if c],
     )
+    from . import autotag
     return open_run([item.to_kg_record(concept=plan.concept)],
                     plans=[plan], door=door, adopt_batch=batch,
-                    title=f"AI Create — {item.title}", parent=parent)
+                    title=f"AI Create — {item.title}", parent=parent,
+                    source=autotag.source_path_for(
+                        tool="card_creator",
+                        kg_type_key=str(job.get("kg_type_for_image") or "")))
 
 
 def _bare_point(concept: str):

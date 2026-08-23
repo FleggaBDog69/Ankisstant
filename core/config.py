@@ -667,6 +667,9 @@ def ensure_config() -> None:
     merged = _deep_merge(DEFAULTS, raw)
     _migrate_auto_tag_scheme(merged)
     _migrate_lecture_audit_tag(merged)
+    # AFTER the lecture rename, which is what produces the '{base}::AI::Lecture'
+    # spelling this one then moves under Ankisstant.
+    _migrate_tag_axes(merged)
     _migrate_dead_gemini_models(merged)
     if merged != raw:
         mw.addonManager.writeConfig(ADDON, merged)
@@ -679,6 +682,7 @@ def load_config() -> dict:
     _migrate_creator_notetypes(cfg)
     _migrate_auto_tag_scheme(cfg)
     _migrate_lecture_audit_tag(cfg)
+    _migrate_tag_axes(cfg)
     _migrate_ai_matrix(cfg)
     _migrate_dead_gemini_models(cfg)
     return cfg
@@ -888,6 +892,64 @@ def _migrate_lecture_audit_tag(cfg: dict) -> None:
         lec["audit_tag"] = "!!Fleg::AI::Lecture"
 
 
+def _migrate_tag_axes(cfg: dict) -> None:
+    """Move the tag scheme onto the three axes: content, source, audit.
+
+    Two things drifted, and both are visible in the collection as duplicate
+    branches:
+
+    1. The AUDIT tags still point at the old '{base}::AI::…' location, while
+       every note tagged since the restructure sits under
+       '{base}::Ankisstant::AI::…'. Left alone, the next commit would keep
+       re-creating the old branch beside the new one. Update by Tag is worse:
+       'Ankisstant::AI::Updated', with no base at all, so its notes land
+       outside the personal namespace entirely.
+
+    2. The CONTENT template's second segment is {type}, so a gap files under
+       {base}::LO:: or {base}::MQ:: depending on how it was captured — putting
+       provenance inside the content hierarchy and splitting one fact across
+       two branches. It becomes {content}, and the type moves to the source
+       axis.
+
+    Idempotent, and only ever rewrites values it recognises: a segment the user
+    has customised to something else is left exactly as written.
+    """
+    tools = cfg.get("tools")
+    if not isinstance(tools, dict):
+        return
+    base = ""
+    kg = tools.get("knowledge_gaps")
+    if isinstance(kg, dict):
+        base = (kg.get("auto_tag_base") or "").strip().strip(":")
+
+    # -- audit tags --
+    for tool, leaf in (("browse", "Browse"), ("card_creator", "Creator"),
+                       ("lecture", "Lecture"), ("update_by_tag", "Updated")):
+        tc = tools.get(tool)
+        if not isinstance(tc, dict):
+            continue
+        cur = (tc.get("audit_tag") or "").strip()
+        if not cur:
+            continue
+        want_tail = f"Ankisstant::AI::{leaf}"
+        if cur.endswith(want_tail) and "::Ankisstant::AI::" in cur:
+            continue                                   # already migrated
+        # The legacy spellings, and ONLY those.
+        legacy = {f"{base}::AI::{leaf}" if base else None,
+                  f"!!Fleg::AI::{leaf}",
+                  f"Ankisstant::AI::{leaf}",
+                  f"AI::{leaf}"}
+        legacy.discard(None)
+        if cur in legacy:
+            tc["audit_tag"] = f"{base}::{want_tail}" if base else want_tail
+
+    # -- the content template --
+    if isinstance(kg, dict):
+        tmpl = (kg.get("tag_scheme_template") or "").strip()
+        if tmpl and "{content}" not in tmpl and "{type}" in tmpl:
+            kg["tag_scheme_template"] = tmpl.replace("{type}", "{content}", 1)
+
+
 def _migrate_auto_tag_scheme(cfg: dict) -> None:
     """Consolidate the old dual auto-tag system (per-type prefixes + a separate
     Browse prefix) onto the single {base}::{type}::… scheme. Idempotent: only
@@ -1022,7 +1084,61 @@ def tool_model_for(tool_key: str, family: str | None = None, *,
     return default_model_for(family, cfg)
 
 
-_DEFAULT_TAG_TEMPLATE = "{base}::{type}::{system}::{subsystem}::{topic}"
+# THREE AXES, not one. A card gets a tag on each, and they answer different
+# questions:
+#
+#   CONTENT   {base}::KG::{system}::{subsystem}::{topic}   what it's about
+#   SOURCE    {base}::Sources::{source}                    where it came from
+#   AUDIT     {base}::Ankisstant::AI::{tool}               who made it
+#             {base}::Ankisstant::Month::{YYYY-MM}         when
+#
+# The second segment used to be {type} — the knowledge-gap TYPE, so an LO gap
+# filed under {base}::LO:: and a missed question under {base}::MQ::. That put
+# provenance in the middle of the content hierarchy, which meant the same fact
+# lived in two branches depending on how it was captured, and the sidebar could
+# not answer "everything I have on the thyroid" at all.
+#
+# Content is now always {content} (literally "KG" unless configured otherwise)
+# and the type moves onto the SOURCE axis where it belongs. {type} is kept as a
+# live placeholder so a hand-written template that still names it renders, but
+# nothing feeds it any more.
+_DEFAULT_TAG_TEMPLATE = "{base}::{content}::{system}::{subsystem}::{topic}"
+
+# The literal second segment of every content tag.
+DEFAULT_CONTENT_SEGMENT = "KG"
+# The branch every source tag hangs off, under the base.
+SOURCES_SEGMENT = "Sources"
+
+
+def content_segment() -> str:
+    """The content axis's own segment ("KG"). Configurable, because it is the
+    one word in the scheme that is purely a naming choice."""
+    try:
+        v = (tool_config("knowledge_gaps").get("content_segment") or "").strip()
+    except Exception:
+        v = ""
+    return (v or DEFAULT_CONTENT_SEGMENT).strip(":")
+
+
+def source_tag(path: str) -> str:
+    """A provenance tag: "{base}::Sources::{path}".
+
+    `path` is a '::'-separated source path — "MQ", "CS::HW_Aug_26",
+    "Lecture::cardiac_output", "Placements::Homeless_Healthcare". It carries
+    NO body system: the content axis holds that, once, and repeating it here
+    is what made the same fact live in two branches.
+
+    "" when there is no base or no path — a source tag with nothing after
+    "Sources::" is worse than none.
+    """
+    base = auto_tag_base()
+    import re as _re
+    path = _re.sub(r"\s+", "_", str(path or "").strip()).strip(":_")
+    path = _re.sub(r"_*::_*", "::", path)
+    path = _re.sub(r"(::)+", "::", path).strip(":")
+    if not base or not path:
+        return ""
+    return f"{base}::{SOURCES_SEGMENT}::{path}"
 
 
 def _template_with_group(template: str) -> str:
@@ -1044,14 +1160,15 @@ def _template_with_group(template: str) -> str:
     """
     if "{group}" in template:
         return template
-    for anchor in ("{type}", "{base}", "{prefix}"):
+    for anchor in ("{content}", "{type}", "{base}", "{prefix}"):
         if anchor in template:
             return template.replace(anchor, anchor + "::{group}", 1)
     return template
 
 
 def format_hierarchical_tag(prefix: str, levels: dict, template: str | None = None,
-                            type_seg: str = "", group_seg: str = "") -> str:
+                            type_seg: str = "", group_seg: str = "",
+                            content_seg: str | None = None) -> str:
     """Render a hierarchical Anki tag from a base prefix, a type segment, an
     optional group segment, and {system, subsystem, topic} levels, using
     `template` (defaults to the shared knowledge_gaps tag_scheme_template).
@@ -1079,9 +1196,27 @@ def format_hierarchical_tag(prefix: str, levels: dict, template: str | None = No
     # cleaned the same way.
     group_safe = _re.sub(r"[\s/]+", "_", str(group_seg or "")).strip("_:")
     base = (prefix or "").strip().strip("_")
+    # The content axis's segment. None means "the configured one" — a caller
+    # passes "" only to render a tag with no content segment at all, which is
+    # what an absolute group path wants (it owns its own branch).
+    if content_seg is None:
+        try:
+            content_seg = content_segment()
+        except Exception:
+            content_seg = DEFAULT_CONTENT_SEGMENT
+    # A template that still names {type} and not {content} is an un-migrated
+    # one. Feeding {type} nothing there would drop the content segment
+    # ENTIRELY — "!!Fleg::Endocrine::Thyroid" with no KG at all — which is
+    # worse than either scheme. So {type} stands in for it, and such a template
+    # keeps rendering a well-formed tag whether or not the migration has run.
+    if "{content}" not in template and ("{type}" in template) and content_seg:
+        type_seg = content_seg
     safe = {
         "base":      base,
         "prefix":    base,  # back-compat alias for templates still using {prefix}
+        "content":   sanitise(content_seg),
+        # Kept live so a hand-written template naming {type} still renders.
+        # Nothing feeds it any more: provenance moved to the source axis.
         "type":      sanitise(type_seg),
         "group":     group_safe,
         "system":    sanitise(levels.get("system", "")),
@@ -1091,7 +1226,8 @@ def format_hierarchical_tag(prefix: str, levels: dict, template: str | None = No
     try:
         rendered = template.format(**safe)
     except (KeyError, IndexError):
-        rendered = "::".join(p for p in (safe["base"], safe["type"], safe["group"],
+        rendered = "::".join(p for p in (safe["base"], safe["content"],
+                                         safe["type"], safe["group"],
                                          safe["system"], safe["subsystem"],
                                          safe["topic"]) if p)
     return _re.sub(r":{3,}", "::", rendered).strip(":")

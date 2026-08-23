@@ -2272,7 +2272,7 @@ class _WriteOwnCardDialog(QDialog):
             if not any(levels.values()):
                 levels["topic"] = str(self._kg.get("title") or "")
             key = str(self._kg.get("type") or "kg")
-            return autotag.tag_from_levels(
+            return autotag.content_tag_from_levels(
                 levels, kg_type_key=key, type_meta=_type_meta(key),
                 group=str(self._kg.get("group") or ""))
         except Exception as e:
@@ -3391,7 +3391,7 @@ class KnowledgeGapsPanel(QWidget):
             if not any(str(v).strip() for v in levels.values()):
                 skipped += 1        # never classified — nothing to build a tag from
                 continue
-            new = autotag.tag_from_levels(
+            new = autotag.content_tag_from_levels(
                 levels, kg_type_key=(kg.get("type") or "kg"),
                 group=group_name, group_plan=plan)
             old = str(kg_store.field(kg, "auto_tag") or "").strip()

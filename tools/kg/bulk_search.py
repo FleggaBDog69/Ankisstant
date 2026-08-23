@@ -200,7 +200,8 @@ class BulkSearchDialog(QDialog):
 
     def __init__(self, kgs: list[dict], parent=None, *, unified: bool = False,
                  plans=None, matches=None, coverage=None, door: str = "",
-                 title: str = "", on_committed=None, adopt_batch: str = ""):
+                 title: str = "", on_committed=None, adopt_batch: str = "",
+                 source: str = ""):
         super().__init__(parent or mw)
         # ── the other doors ──────────────────────────────────────────────────
         # This dialog started as the work-through's own screen and is now THE
@@ -226,6 +227,10 @@ class BulkSearchDialog(QDialog):
         # own job and then hands the id here, so its cards land on the same
         # page as everything else instead of in a review dialog of their own.
         self._adopt_batch = str(adopt_batch or "")
+        # The source path this door already knows (a lecture's filename, a
+        # topic Browse was told about). Prefills the Source box; the user can
+        # still change it before Apply.
+        self._seed_source = str(source or "")
         self._record = pipeline.RunRecord(run_id=uuid.uuid4().hex[:12],
                                           door=self._door)
         # UNIFIED MODE is the same dialog with the hand-off automated: instead of
@@ -629,6 +634,25 @@ class BulkSearchDialog(QDialog):
             "in AI Create's queue \u2014 nothing is generated yet.")
         self._send_create_btn.clicked.connect(self._on_send_to_create)
         send_row.addWidget(self._send_create_btn)
+        src_lbl = QLabel("Source:")
+        src_lbl.setStyleSheet("font-size: 11px; opacity: .8;")
+        send_row.addWidget(src_lbl)
+        self._source_input = QLineEdit()
+        self._source_input.setMaximumWidth(230)
+        self._source_input.setPlaceholderText("e.g. Placements::GP — optional")
+        self._source_input.setToolTip(
+            "Where this run's cards came from, tagged under "
+            "{base}::Sources::. Prefilled from the gap type or the file when "
+            "that says it; otherwise type it once and it sticks for next time.\n\n"
+            "It carries NO body system — the content tag holds that, once.")
+        self._source_input.setText(
+            self._seed_source or autotag.sticky_source("knowledge_gaps"))
+        try:
+            from ...core.qt_utils import attach_tag_completer
+            attach_tag_completer(self._source_input, multi=False)
+        except Exception:
+            pass
+        send_row.addWidget(self._source_input)
         self._summary_btn = QPushButton("\U0001F4C4  Read as a summary")
         self._summary_btn.setAutoDefault(False)
         self._summary_btn.setCheckable(True)
@@ -1574,6 +1598,55 @@ class BulkSearchDialog(QDialog):
                 and self._write_cb.isChecked() and not self._gen_batch_id):
             QTimer.singleShot(0, self._start_generation)
 
+    def _course_tag(self) -> str:
+        """The group's own branch, when it has an absolute one.
+
+        An absolute group ("SRS 5" -> !!Curtanki::Year_3::SRS::05) is a COURSE
+        tag, not a content tag. It used to be returned in place of the content
+        tag, so a gap worked inside a case ended up with no !!Fleg::KG:: tag at
+        all and the content tree had a hole exactly where the course work was.
+        Both are applied now: the content tag per gap, this once for the run.
+        """
+        for plan in self._run_plans:
+            group = getattr(plan, "group", "")
+            if not group:
+                continue
+            try:
+                gp = autotag.group_tag_plan(group)
+                if gp.get("absolute") and gp.get("path"):
+                    return str(gp["path"])
+            except Exception as e:
+                log.warn(f"run view: couldn't resolve the group branch: {e}")
+        return ""
+
+    def _source_tag(self) -> str:
+        """The provenance tag for this run — {base}::Sources::….
+
+        Derived where it can be (a missed question is Sources::MQ, a lecture is
+        Sources::Lecture::<file>) and typed where it can't (a placement, a
+        question bank). What you type STICKS for this door: a placement runs
+        for weeks, and re-typing the same source on every card is how a source
+        axis stops being filled in.
+        """
+        box = getattr(self, "_source_input", None)
+        typed = box.text().strip() if box is not None else None
+        kind = ""
+        for p in self._run_plans:
+            kind = getattr(p, "kg_type", "") or kind
+            if kind:
+                break
+        path = autotag.source_path_for(
+            tool="knowledge_gaps", kg_type_key=kind,
+            override=typed if typed is not None else None)
+        # Only remember a source the USER typed. A derived one (a lecture's
+        # filename) is specific to that run and would otherwise become the
+        # default for every gap batch afterwards.
+        if (typed is not None and typed != self._seed_source
+                and typed != autotag.sticky_source("knowledge_gaps")):
+            autotag.set_sticky_source("knowledge_gaps", typed)
+        from ...core.config import source_tag
+        return source_tag(path)
+
     def _found_flaw(self, nid: int) -> str:
         """One line of quality opinion on a card the deck already has, or "".
 
@@ -1608,11 +1681,14 @@ class BulkSearchDialog(QDialog):
         ordered = [m for m in group if m.final] + [m for m in group if not m.final]
         for m in ordered:
             try:
-                tag = autotag.tag_from_levels(m.point.tag_levels,
-                                              kg_type_key=plan.kg_type,
-                                              group=plan.group)
+                # The CONTENT tag. The course branch (an absolute group) and
+                # the source both ride separately as shared tags at commit
+                # time — putting either in this box would leave the card with
+                # no content tag at all.
+                tag = autotag.content_tag_from_levels(m.point.tag_levels,
+                                                      group=plan.group)
             except Exception as e:
-                log.warn(f"bulk search: tag_from_levels failed: {e}")
+                log.warn(f"bulk search: content tag failed: {e}")
                 tag = ""
             if tag:
                 return tag
@@ -2088,6 +2164,8 @@ class BulkSearchDialog(QDialog):
                 per_item=per_item,
                 audit=(cfg.get("audit_tag") or "").strip(),
                 month=month_tag(),
+                course=self._course_tag(),
+                source=self._source_tag(),
                 # EVERY ticked note, not just the tagged ones: a gap with an
                 # empty tag box still took part in this run and still gets the
                 # audit trail, exactly as it did before.

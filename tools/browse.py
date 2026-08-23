@@ -695,6 +695,21 @@ class BrowsePanel(QWidget):
 
         confirm_row = QHBoxLayout()
         confirm_row.addStretch(1)
+        src_lbl = QLabel("Source:")
+        src_lbl.setStyleSheet("font-size: 11px; opacity: .8;")
+        confirm_row.insertWidget(0, src_lbl)
+        self.source_input = QLineEdit()
+        self.source_input.setMaximumWidth(230)
+        self.source_input.setPlaceholderText("e.g. Placements::GP — optional")
+        self.source_input.setToolTip(
+            "Where these cards came from, tagged under {base}::Sources::. A "
+            "loaded missed-question gap fills this in on its own; otherwise "
+            "type it once and it sticks.\n\nIt carries no body system — the "
+            "tag above holds that.")
+        self.source_input.setText(autotag.sticky_source("browse"))
+        attach_tag_completer(self.source_input, multi=False)
+        confirm_row.insertWidget(1, self.source_input)
+
         # The write door. Hidden until a matched find has run — before that
         # there is no measurement to write against, and a live button that
         # can't do anything reads as a broken one.
@@ -909,7 +924,7 @@ class BrowsePanel(QWidget):
         routed = engine.route(reply, plan)
         terms = routed.terms if routed.terms else (reply if isinstance(reply, list) else None)
         if merge_tag and isinstance(routed.tag_levels, dict):
-            tag = autotag.tag_from_levels(
+            tag = autotag.content_tag_from_levels(
                 routed.tag_levels, kg_type_key=kg_type_key,
                 group=(getattr(self, "_linked_kg_group", "")
                        if getattr(self, "_linked_kg_id", None) else ""))
@@ -1084,6 +1099,20 @@ class BrowsePanel(QWidget):
 
     # ── stage 5: WRITE, on the shared run view ───────────────────────────────
 
+    def _source_tag(self) -> str:
+        """Provenance for this search. A loaded missed-question gap derives
+        Sources::MQ on its own; anything else is what's in the Source box, and
+        that sticks so a placement isn't retyped per card."""
+        typed = self.source_input.text().strip()
+        if typed != autotag.sticky_source("browse"):
+            autotag.set_sticky_source("browse", typed)
+        from ..core.config import source_tag
+        return source_tag(autotag.source_path_for(
+            tool="browse",
+            kg_type_key=(getattr(self, "_linked_kg_type", "")
+                         if getattr(self, "_linked_kg_id", None) else ""),
+            override=typed))
+
     def _refresh_write_btn(self) -> None:
         btn = getattr(self, "write_btn", None)
         if btn is None:
@@ -1138,7 +1167,12 @@ class BrowsePanel(QWidget):
         from .run_view import open_run
         open_run([record], plans=[plan], matches=[self._last_match],
                  coverage=self._last_coverage, door="browse",
-                 title=f"AI Browse — {self._last_topic}", parent=self)
+                 title=f"AI Browse — {self._last_topic}", parent=self,
+                 source=autotag.source_path_for(
+                     tool="browse",
+                     kg_type_key=((getattr(self, "_linked_kg_type", "") or "")
+                                  if getattr(self, "_linked_kg_id", None) else ""),
+                     override=self.source_input.text().strip()))
 
     def _refresh_rescope_enabled(self):
         # Broader / Narrower are notes-mode-only — tag-mode prompts are different.
@@ -1706,7 +1740,8 @@ class BrowsePanel(QWidget):
             tag_ops=commit.tag_ops_for(
                 per_item=[(tag, list(nids))],
                 audit=(audit_tag if (apply_audit and audit_tag != tag) else ""),
-                month=(mtag if mtag != tag else "")),
+                month=(mtag if mtag != tag else ""),
+                source=self._source_tag()),
             unsuspend_nids=list(nids) if do_unsuspend else [],
         )
         res = commit.run(cplan)

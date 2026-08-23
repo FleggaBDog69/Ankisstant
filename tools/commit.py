@@ -182,13 +182,25 @@ def refresh() -> None:
 
 # ── the shared policy ────────────────────────────────────────────────────────
 
-def tag_ops_for(*, per_item: list, audit: str = "", month: str = "",
+def tag_ops_for(*, per_item: list, course: str = "", source: str = "",
+                audit: str = "", month: str = "",
                 everything: list | None = None) -> list:
     """The tag order every door agreed on, made explicit.
 
     `per_item` is [(tag, nids), ...] — the specific tag for each item's own
     notes. The audit tag and the month tag then go on, after it and in that
     order.
+
+    `course` is the group's own branch, when the group has an absolute path of
+    its own (a Curtanki case). It used to REPLACE the per-item content tag,
+    which left course work with no content tag at all; the two are applied
+    together now.
+
+    `source` is the provenance tag ({base}::Sources::…) for this run. It sits
+    with the shared tags rather than per item because a run has ONE source: the
+    placement you were on, the file you fed in, the question bank you got it
+    wrong in. Applied before the audit tags, since it says something about the
+    card and they say something about the tool.
 
     `everything` is which notes the SHARED tags cover, and it is a separate
     argument rather than derived from per_item for one reason: a gap whose tag
@@ -211,7 +223,7 @@ def tag_ops_for(*, per_item: list, audit: str = "", month: str = "",
             seen.add(n)
             shared_nids.append(n)
     if shared_nids:
-        for shared in (audit, month):
+        for shared in (course, source, audit, month):
             shared = str(shared or "").strip()
             if shared:
                 ops.append((shared, list(shared_nids)))
