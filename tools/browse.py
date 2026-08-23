@@ -218,6 +218,10 @@ class BrowsePanel(QWidget):
         self._results: list = []
         self._last_topic = ""
         self._last_terms: list[str] = []
+        # The last matched find, kept so the write door can hand the SAME
+        # measurement to the run view rather than re-deriving it.
+        self._last_match = None
+        self._last_coverage = None
         # Auto-tag respects an existing tag: don't overwrite one carried from a
         # loaded KG, nor one the user typed by hand. Both flags reset when the
         # user edits the topic (a fresh topic deserves a fresh suggestion).
@@ -691,6 +695,14 @@ class BrowsePanel(QWidget):
 
         confirm_row = QHBoxLayout()
         confirm_row.addStretch(1)
+        # The write door. Hidden until a matched find has run — before that
+        # there is no measurement to write against, and a live button that
+        # can't do anything reads as a broken one.
+        self.write_btn = QPushButton("⚡ Write a card for this")
+        self.write_btn.setAutoDefault(False)
+        self.write_btn.setVisible(False)
+        self.write_btn.clicked.connect(self._on_write)
+        confirm_row.addWidget(self.write_btn)
         self.confirm_btn = QPushButton("Tag + Unsuspend")
         self.confirm_btn.setAutoDefault(False)
         self.confirm_btn.setEnabled(False)
@@ -768,6 +780,10 @@ class BrowsePanel(QWidget):
         # Different result kinds → clear what's there so the UI is consistent.
         self.results_list.clear()
         self._results = []
+        self._last_match = None
+        self._last_coverage = None
+        if getattr(self, "write_btn", None) is not None:
+            self.write_btn.setVisible(False)
         self._last_terms = []
         self.broader_btn.setEnabled(False)
         self.narrower_btn.setEnabled(False)
@@ -1044,6 +1060,9 @@ class BrowsePanel(QWidget):
         judged = bool(getattr(m, "scored", False)) if m else False
         scores = dict(getattr(m, "scores", {}) or {}) if m else {}
 
+        self._last_match = m
+        self._last_coverage = coverage
+        self._refresh_write_btn()
         self._populate_results(nids, terms, total > max_results, per_term,
                                notes=notes, ticks=ticks, scores=scores)
 
@@ -1062,6 +1081,64 @@ class BrowsePanel(QWidget):
         if deg:
             head += f"  ({deg})"
         self.status.setText(head)
+
+    # ── stage 5: WRITE, on the shared run view ───────────────────────────────
+
+    def _refresh_write_btn(self) -> None:
+        btn = getattr(self, "write_btn", None)
+        if btn is None:
+            return
+        cov = self._last_coverage
+        is_gap = bool(cov and getattr(cov, "gaps", None))
+        btn.setVisible(True)
+        btn.setEnabled(bool(self._last_match) and bool(self._last_topic))
+        btn.setText("⚡ Write a card for this" if is_gap
+                    else "⚡ Write a card anyway")
+        btn.setToolTip(
+            "Your deck has no card that tests this — write one, on the same "
+            "screen the rest of the add-on uses."
+            if is_gap else
+            "Your deck already covers this. Write a card for it anyway if you "
+            "want a different angle on it.")
+
+    def _on_write(self) -> None:
+        """Hand this topic to the write stage.
+
+        Browse could always tell you your deck had nothing; it could never do
+        anything about it except send you to another tab. This is the same
+        hand-off AI Lecture makes — the found cards you're looking at travel
+        WITH it, so the one screen shows what you had above and what was
+        written below, and one Apply commits both.
+        """
+        if not self._last_match or not self._last_topic:
+            return
+        item = pipeline.WorkItem.from_topic(self._last_topic)
+        item.type_key = ((getattr(self, "_linked_kg_type", "") or "")
+                         if getattr(self, "_linked_kg_id", None)
+                         else autotag.default_type_key())
+        item.group = (getattr(self, "_linked_kg_group", "")
+                      if getattr(self, "_linked_kg_id", None) else "")
+        tag = self.tag_input.text().strip()
+        if tag:
+            item.tags = [tag]
+        # The results view groups points by point.kg_id.
+        pt = self._last_match.point
+        if not getattr(pt, "kg_id", ""):
+            pt.kg_id = item.id
+
+        plan = pipeline.Plan(item=item, concept=self._last_topic,
+                             points=[pt], cards=1, scope="focused",
+                             breadth="pinpoint")
+        record = item.to_kg_record(
+            concept=self._last_topic,
+            points=[{"concept": pt.concept, "terms": list(pt.terms),
+                     "system": pt.system, "subsystem": pt.subsystem,
+                     "topic": pt.topic}],
+            target_cards=1)
+        from .run_view import open_run
+        open_run([record], plans=[plan], matches=[self._last_match],
+                 coverage=self._last_coverage, door="browse",
+                 title=f"AI Browse — {self._last_topic}", parent=self)
 
     def _refresh_rescope_enabled(self):
         # Broader / Narrower are notes-mode-only — tag-mode prompts are different.

@@ -1397,12 +1397,27 @@ def commit_ctx_for(job: dict, profile: dict, tags: list):
     this dialog's review blocks, and the unified pass, which renders the written
     cards straight into its results tree and so has no block to ask."""
     from .. import card_creator as cc
+    import os as _os
+    # The job's OWN mode and source label, not a hardcoded "topic". They were
+    # hardcoded because every job this saw came from mass create, where both are
+    # always topic/None — but AI Create's jobs now commit through here too, and
+    # a source-mode job committed as topic loses its citation (enrich_extra
+    # keys off exactly these two).
+    try:
+        media_dir = mw.col.media.dir()
+    except Exception:
+        media_dir = ""
+    panel_paths = [_os.path.join(media_dir, fn) if media_dir else fn
+                   for fn in (job.get("panel_image_filenames") or []) if fn]
     return cc.CommitCtx(
         profile=profile,
         tags=list(tags),
-        mode="topic",
-        source_label=None,
-        panel_image_paths=[],
+        mode=str(job.get("mode") or "topic"),
+        source_label=job.get("source_label"),
+        # Images the user attached in the Create panel. Empty for every mass
+        # create job (it has no panel), which is why this used to be a literal
+        # [] — an AI Create job carries them and must not lose them.
+        panel_image_paths=panel_paths,
         kg_image_filenames=list(job.get("kg_image_filenames") or []),
         kg_type_for_image=(job.get("kg_type_for_image") or "").lower(),
         kg_stem_html=str(job.get("kg_stem_html") or ""),

@@ -3585,6 +3585,15 @@ class CreatorPanel(QWidget):
         is_mq = bool(gap and (gap.get("kg_type") or "").lower() == "mq")
         return {
             "id": job_id,
+            # A batch of one. Additive keys: create_jobs._normalise starts from
+            # dict(item) so it carries them through untouched, and nothing that
+            # reads these records today looks at either. They exist so the
+            # shared run view (tools/run_view.py) can adopt this job the same
+            # way it adopts a mass-create batch — one output page, whatever
+            # door you came through.
+            "batch_id": job_id,
+            "kg_id": (str((gap or {}).get("kg_id") or (gap or {}).get("id") or "")
+                      or f"create:{job_id}"),
             "title": (topic_label or source_label or "Generation"),
             "mode": mode, "source_label": source_label, "topic_label": topic_label,
             "focus": focus, "deck_name": deck_name, "notetype_name": notetype_name,
@@ -3643,6 +3652,28 @@ class CreatorPanel(QWidget):
         if rec.get("status") != create_jobs.READY:
             tooltip("That generation isn't ready to review yet.")
             return
+
+        # THE ONE OUTPUT PAGE. A finished generation lands on the same screen a
+        # lecture and a batch of gaps land on — same tree, same tick boxes,
+        # same Apply, same single Ctrl+Z.
+        #
+        # Two modes stay on ReviewDialog, and that is a feature decision rather
+        # than an unfinished port: slide mode and lecture-match give every card
+        # a PER-CARD SLIDE PREVIEW, and the shared page has no equivalent yet.
+        # Routing them anyway would delete something that gets used, which is
+        # the one thing this consolidation isn't allowed to do.
+        if not (rec.get("slide_mode") or rec.get("lecture_match")
+                or rec.get("slide_pages")):
+            try:
+                from .run_view import open_written
+                if open_written(rec, parent=self) is not None:
+                    self.refresh_ready_lists()
+                    return
+            except Exception as e:
+                # Falls back to the review dialog rather than stranding the
+                # cards: the generation has already been paid for.
+                log.error(f"create: couldn't open the run view, falling back "
+                          f"to the review dialog: {e}")
 
         cfg = tool_config("card_creator")
         profile = _resolved_profile(cfg, rec.get("profile_name", ""))

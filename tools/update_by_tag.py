@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import re
 import threading
+import uuid
 
 from aqt import mw
 from aqt.qt import (
@@ -27,9 +28,10 @@ from aqt.qt import (
 from aqt.utils import askUser, showWarning, tooltip
 
 from ..core import anki_utils, api as core_api, log
-from ..core.config import tool_config, tool_model_for
+from ..core.config import tool_config
 from ..grounding import guidelines as grounding
 from . import autotag
+from . import commit
 from . import pipeline
 from . import card_creator as cc
 from . import quality_pass as qp
@@ -194,6 +196,21 @@ class UpdateByTagPanel(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(18, 16, 18, 16)
         root.setSpacing(10)
+
+        # The stage strip. Update by Tag is the tool with the FEWEST stages —
+        # notes in, rewritten notes out, nothing read and nothing searched —
+        # which is exactly why it carries the strip: seeing Read, Approve and
+        # Find sitting there labelled "skipped" is what makes the shape of the
+        # pipeline legible, and it is the case that proves a stage can be
+        # skipped rather than merely fast.
+        from .run_view import StageStrip
+        self._record = pipeline.RunRecord(run_id=uuid.uuid4().hex[:12],
+                                          door="update-by-tag")
+        for _k in (pipeline.READ, pipeline.APPROVE, pipeline.FIND):
+            self._record.mark(_k, pipeline.SKIPPED)
+        self._strip = StageStrip()
+        self._strip.set_record(self._record)
+        root.addWidget(self._strip)
 
         intro = QLabel(
             "<b>Update by Tag</b> — re-process existing notes to the current "
@@ -465,6 +482,7 @@ class UpdateByTagPanel(QWidget):
             showWarning("Pick a destination deck.")
             return
         n = len(self._note_ids)
+        self._stage(pipeline.TAKE_IN, pipeline.DONE, f"{n} note(s)")
         if not askUser(
             f"Create {n} updated cop{'ies' if n != 1 else 'y'} as "
             f"'{profile.get('name')}' in deck '{dest}'?\n\n"
@@ -499,6 +517,8 @@ class UpdateByTagPanel(QWidget):
         self._process_next()
 
     def _process_next(self):
+        if self._record.state_of(pipeline.WRITE) == pipeline.PENDING:
+            self._stage(pipeline.WRITE, pipeline.RUNNING)
         if self._cancelled or not self._queue:
             self._finish()
             return
@@ -552,6 +572,10 @@ class UpdateByTagPanel(QWidget):
         else:
             self._finish()
 
+    def _stage(self, key: str, state: str, count: str = "") -> None:
+        self._record.mark(key, state, count)
+        self._strip.set_record(self._record)
+
     def _row(self, nid: int, ok: bool, detail: str):
         lbl = QLabel(f"{'✓' if ok else '✗'}  note {nid} — {detail}")
         lbl.setWordWrap(True)
@@ -563,6 +587,12 @@ class UpdateByTagPanel(QWidget):
 
     def _finish(self):
         self._running = False
+        self._stage(pipeline.WRITE, pipeline.DONE, f"{self._ok} rewritten")
+        # No quality pass on this path, so CHECK says skipped rather than
+        # quietly reading as if everything passed.
+        self._stage(pipeline.CHECK, pipeline.SKIPPED)
+        self._stage(pipeline.REVIEW, pipeline.SKIPPED, "committed as it ran")
+        self._stage(pipeline.COMMIT, pipeline.DONE, f"{self._ok} added")
         self._cancel_btn.setVisible(False)
         self._find_btn.setEnabled(True)
         self._run_btn.setEnabled(bool(self._note_ids and self._profiles()))
@@ -570,11 +600,7 @@ class UpdateByTagPanel(QWidget):
         self._status_lbl.setText(
             f"Done — {self._ok} cop{'ies' if self._ok != 1 else 'y'} created."
         )
-        try:
-            mw.col.reset()
-            mw.reset()
-        except Exception:
-            pass
+        commit.refresh()
 
     def _cancel(self):
         self._cancelled = True

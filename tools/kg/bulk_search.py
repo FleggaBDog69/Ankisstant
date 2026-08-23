@@ -44,7 +44,8 @@ from aqt.qt import (
     QPushButton, QSpinBox, QStackedWidget, Qt, QTableWidget, QTableWidgetItem,
     QTimer, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
-from aqt.utils import askUser, showWarning, tooltip
+from aqt.utils import askUser, showInfo, showWarning, tooltip
+from aqt.webview import AnkiWebView
 
 from ...core import anki_utils, api as core_api, log
 from ...core.config import month_tag, tool_config
@@ -134,6 +135,30 @@ def create_record_for(kg: dict, concept: str, points: list[dict]) -> dict:
     }
 
 
+def _record_points(rec: dict) -> list:
+    """The point concepts on a record, whichever shape it is in.
+
+    TWO shapes reach the copy/export path and they are not the same:
+
+      create_record_for()      -> "points",      list[dict] with a "concept"
+      gen_prompt.build_job_record -> "mass_points", list[str]
+
+    Everything here used to read `mass_points` only. _create_payload builds the
+    first shape, so the checklist came out with a heading and notes for every
+    gap and NOT ONE POINT under any of them — the whole thing the export
+    exists to produce. Reading both is the fix, and it is also the honest
+    description of the data: two producers, one consumer.
+    """
+    out: list = []
+    for p in (rec.get("mass_points") or rec.get("points") or []):
+        if isinstance(p, dict):
+            p = p.get("concept")
+        p = str(p or "").strip()
+        if p:
+            out.append(p)
+    return out
+
+
 def _parse_terms(text: str) -> list[str]:
     """A typed 'a, b; c' into search terms, deduped, order preserved.
 
@@ -175,7 +200,7 @@ class BulkSearchDialog(QDialog):
 
     def __init__(self, kgs: list[dict], parent=None, *, unified: bool = False,
                  plans=None, matches=None, coverage=None, door: str = "",
-                 title: str = "", on_committed=None):
+                 title: str = "", on_committed=None, adopt_batch: str = ""):
         super().__init__(parent or mw)
         # ── the other doors ──────────────────────────────────────────────────
         # This dialog started as the work-through's own screen and is now THE
@@ -197,6 +222,10 @@ class BulkSearchDialog(QDialog):
         self._seed_matches = list(matches or [])
         self._seed_coverage = coverage
         self._seed_title = str(title or "")
+        # A create_jobs batch this window did not start. AI Create enqueues its
+        # own job and then hands the id here, so its cards land on the same
+        # page as everything else instead of in a review dialog of their own.
+        self._adopt_batch = str(adopt_batch or "")
         self._record = pipeline.RunRecord(run_id=uuid.uuid4().hex[:12],
                                           door=self._door)
         # UNIFIED MODE is the same dialog with the hand-off automated: instead of
@@ -277,7 +306,16 @@ class BulkSearchDialog(QDialog):
         self._fill_plan_table()
         if self._seed_plans:
             self._render_plan_table()
-        if self._seed_coverage is not None:
+        if self._adopt_batch:
+            # Nothing was searched — this door only WROTE. The results tree is
+            # still the surface; it is just built from the plan rather than
+            # from matches, with each point marked unmeasured because nothing
+            # looked.
+            self._run_plans = list(self._seed_plans)
+            self._wants = {p.kg_id: (False, True) for p in self._run_plans}
+            QTimer.singleShot(0, lambda: self._skip_to_writing(
+                self._run_plans, generate=False))
+        elif self._seed_coverage is not None:
             # The door already searched the deck. Render its results directly —
             # this is the same page a work-through search lands on, built from
             # someone else's matches.
@@ -570,7 +608,16 @@ class BulkSearchDialog(QDialog):
         col = QVBoxLayout(w)
         col.setContentsMargins(0, 0, 0, 0)
 
-        col.addWidget(self._build_found_pane(), 1)
+        # QT TO ACT, HTML TO READ — both on this one page, swapped in place.
+        # The tree is where you tick, edit, rewrite and split; that needs real
+        # widgets and always has. The summary is where you read what the run
+        # concluded, and prose in a document beats prose crammed into tree row
+        # labels. Neither is a second window.
+        self._results_stack = QStackedWidget()
+        self._results_stack.addWidget(self._build_found_pane())   # 0 — act
+        self._summary_view = AnkiWebView()
+        self._results_stack.addWidget(self._summary_view)         # 1 — read
+        col.addWidget(self._results_stack, 1)
 
         send_row = QHBoxLayout()
         self._send_create_btn = QPushButton("\u2192  Send gaps to AI Create\u2026")
@@ -582,9 +629,46 @@ class BulkSearchDialog(QDialog):
             "in AI Create's queue \u2014 nothing is generated yet.")
         self._send_create_btn.clicked.connect(self._on_send_to_create)
         send_row.addWidget(self._send_create_btn)
+        self._summary_btn = QPushButton("\U0001F4C4  Read as a summary")
+        self._summary_btn.setAutoDefault(False)
+        self._summary_btn.setCheckable(True)
+        self._summary_btn.setToolTip(
+            "The same run, written out as a document — what your deck "
+            "covered, what it didn't, and what was written for the difference. "
+            "Ticking is done in the tree; this is for reading.")
+        self._summary_btn.toggled.connect(self._on_summary_toggled)
+        send_row.addWidget(self._summary_btn)
         send_row.addStretch(1)
         col.addLayout(send_row)
         return w
+
+    def _on_summary_toggled(self, on: bool) -> None:
+        if on:
+            try:
+                self._summary_view.stdHtml(self._summary_html())
+            except Exception as e:
+                log.error(f"run view: couldn't render the summary: {e}")
+                self._summary_btn.setChecked(False)
+                return
+            self._summary_btn.setText("◀  Back to the cards")
+        else:
+            self._summary_btn.setText("\U0001F4C4  Read as a summary")
+        self._results_stack.setCurrentIndex(1 if on else 0)
+        # The tick boxes live in the tree, so acting on the run means going
+        # back to it. Say so rather than leaving a dead Apply button.
+        self._commit_btn.setEnabled(not on and not self._applied)
+
+    def _summary_html(self) -> str:
+        """This run as a document. Reads the tree, so it always says what is
+        ticked NOW rather than what the search originally concluded."""
+        from ..run_view import summary_html
+        return summary_html(self._record, self._run_plans, self._coverage,
+                            ticked=self._ticked(),
+                            written=[c for _leaf, c in self._written_items()],
+                            approved=[c for c in self._approved_cards_flat()])
+
+    def _approved_cards_flat(self) -> list:
+        return [c for _k, cards in self._approved_written() for c in cards]
 
     def _build_found_pane(self) -> QWidget:
         w = QWidget()
@@ -1233,7 +1317,7 @@ class BulkSearchDialog(QDialog):
 
     # ── stage 3: results, grouped by gap ─────────────────────────────────────
 
-    def _skip_to_writing(self, plans: list) -> None:
+    def _skip_to_writing(self, plans: list, *, generate: bool = True) -> None:
         """Every gap is Write-only, so there is no search to render.
 
         The results tree is still the surface — the written cards belong under
@@ -1290,7 +1374,43 @@ class BulkSearchDialog(QDialog):
             "Nothing is claimed to be covered — cards are being written for "
             "every point.")
         self._update_selection_count()
-        QTimer.singleShot(0, self._start_generation)
+        QTimer.singleShot(0, self._start_generation if generate
+                          else self._adopt_generation)
+
+    def _adopt_generation(self) -> None:
+        """Show a batch this window didn't start.
+
+        AI Create runs its generation in the background and used to open a
+        review dialog of its own when the cards landed. It now enqueues exactly
+        as before and hands the batch id here, so the cards appear in the same
+        tree, under the same tick boxes, and commit through the same Apply as a
+        sixty-point lecture's. Nothing about the generation changed — only
+        where you read the result.
+        """
+        if self._closed or not self._adopt_batch:
+            return
+        from .. import create_jobs
+        self._gen_batch_id = self._adopt_batch
+        jobs = create_jobs.by_batch(self._gen_batch_id)
+        if not jobs:
+            self._show_written_ui()
+            self._gen_note.setText("That generation is no longer in the job "
+                                   "list.")
+            return
+        self._stage(pipeline.WRITE, pipeline.RUNNING, f"{len(jobs)} item(s)")
+        self._show_written_ui()
+        self._gen_active = any(
+            j.get("status") in (create_jobs.QUEUED, create_jobs.RUNNING)
+            for j in jobs)
+        if self._gen_active:
+            self._progress.setRange(0, 100)
+            self._progress.setValue(0)
+            self._progress.setVisible(True)
+            self._stop_btn.setVisible(True)
+            self._stop_btn.setEnabled(True)
+            self._render_written_placeholders(jobs)
+        self._poll.start()
+        self._on_gen_poll()
 
     def _render_results(self) -> None:
         from ..lecture import matcher
@@ -2040,7 +2160,7 @@ class BulkSearchDialog(QDialog):
                     period=4000)
             return
         n_gaps = len(payload)
-        n_pts = sum(len(r.get("mass_points") or []) for r in payload)
+        n_pts = sum(len(_record_points(r)) for r in payload)
         menu = QMenu(self)
         a1 = menu.addAction(f"Copy {n_pts} point(s) as a list")
         a1.setToolTip("Plain text, grouped by gap, with each gap's notes. For "
@@ -2057,6 +2177,15 @@ class BulkSearchDialog(QDialog):
             "into. Re-importing turns each POINT into its own gap, so the "
             "parent gap's notes don't survive that round trip.")
         a3.triggered.connect(lambda: self._copy_uncovered("markdown"))
+        menu.addSeparator()
+        # Saving to a FILE used to be AI Lecture's alone (panel._export_gaps),
+        # and copying to the clipboard used to be this screen's alone. Both are
+        # the same job — get the list out to whatever you actually write cards
+        # in — so both surfaces now offer both.
+        a4 = menu.addAction("Save the checklist to a file…")
+        a4.setToolTip("The same markdown, written to a file you can hand to "
+                      "another card generator.")
+        a4.triggered.connect(self._save_uncovered)
         menu.exec(self._copy_btn.mapToGlobal(self._copy_btn.rect().bottomLeft()))
 
     def _copy_uncovered(self, kind: str) -> None:
@@ -2079,9 +2208,36 @@ class BulkSearchDialog(QDialog):
             log.error(f"work through: clipboard write failed: {e}")
             showWarning(f"Couldn't copy that: {e}")
             return
-        n_pts = sum(len(r.get("mass_points") or []) for r in payload)
+        n_pts = sum(len(_record_points(r)) for r in payload)
         tooltip(f"Copied {n_pts} uncovered point(s) from {len(payload)} gap(s).",
                 period=4000)
+
+    def _save_uncovered(self) -> None:
+        payload = self._create_payload()
+        if not payload:
+            return
+        text = self._uncovered_as_text(payload, markdown=True)
+        stem = "uncovered_points"
+        if len(self._run_plans) == 1:
+            safe = "".join(ch if (ch.isalnum() or ch in " -_") else "_"
+                           for ch in str(self._run_plans[0].title))
+            stem = (safe.strip() or stem)[:60].replace(" ", "_")
+        from aqt.qt import QFileDialog
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save the uncovered points", f"{stem}_missing_points.md",
+            "Markdown (*.md);;Text (*.txt);;All files (*)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(text)
+        except Exception as e:
+            log.error(f"work through: export failed: {e}")
+            showWarning(f"Couldn't write that file:\n\n{e}")
+            return
+        n_pts = sum(len(_record_points(r)) for r in payload)
+        showInfo(f"Wrote {n_pts} uncovered point(s) from {len(payload)} "
+                 f"item(s) to:\n\n{path}")
 
     def _uncovered_as_text(self, payload: list, *, markdown: bool) -> str:
         """The residue as text. The gap's own notes ride along, because a point
@@ -2110,7 +2266,7 @@ class BulkSearchDialog(QDialog):
                     out.append(("> " if markdown else "  notes: ")
                                + notes.replace("\n",
                                                "\n> " if markdown else "\n  "))
-            for pt in (rec.get("mass_points") or []):
+            for pt in _record_points(rec):
                 out.append(f"- [ ] {pt}" if markdown else f"  - {pt}")
             out.append("")
         return "\n".join(out).strip() + "\n"
