@@ -51,6 +51,9 @@ UPDATE_INSTRUCTION = (
     "• Preserve the clinical meaning; correct anything that conflicts with current "
     "Australian guidelines.\n"
     "• Do NOT copy the original verbatim — rewrite it cleanly.\n"
+    "• For a cloze card, the front obeys the word limit above. If the original "
+    "carries more facts than one short card can test, test the highest-yield one "
+    "— the original is kept, nothing is lost.\n"
     "• Return a JSON ARRAY with a SINGLE card object in the standard output format.\n"
 )
 

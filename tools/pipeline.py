@@ -585,7 +585,12 @@ def check_found(front_html: str, max_clozes: int = 1):
     """
     from .quality_pass import prefilter_card
     try:
-        return prefilter_card({"front": front_html or ""}, max_clozes)
+        # max_words=0: the length limit is a rule for cards the add-on WRITES.
+        # A long card already in the deck is still his card, and flagging
+        # every AnKing card over 25 words would bury the flags that matter
+        # (an answer echoed in its own prompt).
+        return prefilter_card({"front": front_html or ""}, max_clozes,
+                              max_words=0)
     except Exception:
         # Fails OPEN, like every other optional pass: an opinion that can't be
         # formed must never stop a card being shown.

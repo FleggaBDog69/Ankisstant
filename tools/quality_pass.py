@@ -19,9 +19,19 @@ from dataclasses import dataclass, field
 try:
     from ..core.anki_utils import strip_html
 except Exception:  # pragma: no cover - allows standalone import in tests
+    import html as _html
+
     def strip_html(s: str) -> str:
         s = re.sub(r"<[^>]+>", " ", s or "")
+        s = _html.unescape(s)
         return re.sub(r"\s+", " ", s).strip()
+
+
+# The ceiling on a cloze front, in visible words. Mirrors
+# card_creator.MAX_FRONT_WORDS — duplicated rather than imported because this
+# module must stay importable without card_creator (Qt) for the tests and the
+# background worker. test_concision.py pins the two together.
+MAX_FRONT_WORDS = 25
 
 
 # ── verdict model ───────────────────────────────────────────────────────────
@@ -90,6 +100,19 @@ def visible_front(front: str) -> str:
     return strip_html(blanked)
 
 
+def front_word_count(front: str) -> int:
+    """Visible words on a cloze front as the learner reads it once revealed:
+    cloze ANSWERS count, hints and the {{c1:: }} markup don't, HTML and entities
+    are stripped. A token with no letter or digit in it ("—", "→", "/") is
+    punctuation, not a word. Never raises."""
+    try:
+        txt = _CLOZE_RE.sub(lambda m: " " + (m.group(2) or "") + " ", front or "")
+        txt = strip_html(txt)
+        return sum(1 for t in txt.split() if re.search(r"[A-Za-z0-9]", t))
+    except Exception:  # pragma: no cover - defensive
+        return 0
+
+
 _WORD_RE = re.compile(r"[a-z0-9]+")
 
 
@@ -112,19 +135,25 @@ def _is_subsequence(needle: list[str], haystack: list[str]) -> bool:
 
 # ── deterministic pre-filters (no LLM, run on every provider) ───────────────
 
-def prefilter_card(card: dict, max_clozes: int = 1) -> Verdict | None:
+def prefilter_card(card: dict, max_clozes: int = 1,
+                   max_words: int = MAX_FRONT_WORDS) -> Verdict | None:
     """Cheap deterministic checks. Returns a Verdict when a rule trips, or None
     ('no opinion — let the LLM decide'). Never raises.
 
     - answer-in-prompt  → FAIL / D1: a cloze answer is echoed verbatim in the
       visible surrounding text, so the prompt gives the answer away.
+    - length             → FAIL / D4: the front is over `max_words` visible
+      words. Deterministic because a grader asked "is this concise?" is lenient
+      about exactly the cards that drifted long — the length is a number, so it
+      is checked as one.
     - cloze count        → FLAG / D2: MORE than `max_clozes` DISTINCT cloze
       groups on one note (repeated same-group clozes are one fact, not flagged).
       `max_clozes` is the user-configured atomicity sensitivity
       (quality_pass.atomicity_max_clozes) — e.g. 2 means a clean 2-cloze note
       passes and only 3+ independent clozes flag.
 
-    answer-in-prompt (FAIL) takes precedence over cloze-count (FLAG).
+    answer-in-prompt (FAIL) takes precedence over length (FAIL), which takes
+    precedence over cloze-count (FLAG).
     """
     try:
         front = card.get("front", "") if isinstance(card, dict) else ""
@@ -141,11 +170,24 @@ def prefilter_card(card: dict, max_clozes: int = 1) -> Verdict | None:
             if _is_subsequence(ans_tokens, vis_tokens):
                 return Verdict(
                     FAIL, "D1",
-                    "the cloze answer is echoed in the visible prompt — replace the "
-                    "restated fact with a clinical cue (presentation or mechanism) so "
-                    "the answer must be recalled, not read off the card.",
+                    "the cloze answer is echoed in the visible prompt — reword the "
+                    "cue so the answer isn't in it (keep it short and direct).",
                     source="prefilter",
                 )
+
+        try:
+            cap = int(max_words)
+        except (TypeError, ValueError):
+            cap = MAX_FRONT_WORDS
+        n_words = front_word_count(front)
+        if cap > 0 and n_words > cap:
+            return Verdict(
+                FAIL, "D4",
+                f"the front is {n_words} words (limit {cap}) — cut it to the one "
+                "fact being tested; move any teaching to Extra or split it into "
+                "two cards.",
+                source="prefilter",
+            )
 
         # TODO follow-up: cross-cloze leakage — when {{c1}} and {{c2}} sit on one
         # note, each visible half can telegraph the other's hidden answer. Not
@@ -175,22 +217,27 @@ def prefilter_card(card: dict, max_clozes: int = 1) -> Verdict | None:
 
 # ── rubric prompt (bundled inline so grading works on every provider) ───────
 
-# Condensed from ~/.claude/skills/anki-card-scorer/SKILL.md. Kept verbatim on the
-# load-bearing parts (hard gates, the inherent-label-association test) so the
-# inline grade matches what the skill would produce on Anthropic.
+# THE SOURCE OF TRUTH for grading. The anki-card-scorer skill mirrors it for
+# use outside the add-on — edit here first, then mirror. Since 2026-10-10 this is
+# sent on EVERY provider: on the CLI the skill never loaded (generation runs with
+# --tools ""), so a skill-only grader prompt was grading with no rubric at all.
 RUBRIC_TEXT = """\
-You grade Anki CLOZE cards for a Year-3 Australian medical student. Score each card on \
-four dimensions, 0/1/2. The goal is RETRIEVAL FORCE: a good card makes the learner \
-recall the answer; a bad one lets them read it off the prompt or recognise a label.
+You grade Anki CLOZE cards for a Year-3 Australian medical student. The target style \
+is the AnKing deck: short, direct, one fact per card. Score each card on five \
+dimensions, 0/1/2.
 
-D1 — Retrieval force / cue type (HARD GATE, weight x3)
-  0 = the answer is derivable from the visible prompt: its label/category is restated \
-("the first-line treatment for anaphylaxis is {{c1::adrenaline}}"), a bare definition \
-("{{c1::Apoptosis}} is programmed cell death"), a textbook sentence with one word removed, \
-or the answer appears as a literal substring of the visible text.
-  1 = partial cue leakage; some processing but a hint shortcuts it.
-  2 = the cue forces processing — a genuine mechanism, presentation, contrast, cause, or \
-consequence drives the retrieval.
+D1 — Give-away check (HARD GATE, weight x3)
+  0 = the answer can be READ OFF the card: it (or a shared word-stem) appears in the \
+visible text; the cue is the answer's definition ("{{c1::Apoptosis}} is programmed cell \
+death", "inflammation of the joint is called {{c1::arthritis}}"); a synonym or a second \
+cloze names it; or grammar gives it away ("an {{c1::…}}").
+  1 = partial leakage — a hint or phrase shortcuts the recall.
+  2 = the cue pins exactly one answer without giving it away. A DIRECT, plain statement \
+of the fact ("Kawasaki disease can cause coronary artery {{c1::aneurysms}}") is a 2. Do \
+NOT mark a card down for being direct or for lacking a mechanism or vignette. \
+  HINTS: in {{c1::answer::hint}} the hint is what the student sees in the blank. A hint \
+that gives the answer's SHAPE ("increased/decreased", "which test?", "limb") is GOOD \
+practice, not a leak; only a hint that contains the answer itself scores 0.
 
 D2 — Atomicity (weight x2)
   0 = several independent facts on one note (an enumerated list), which desync under \
@@ -204,27 +251,32 @@ D3 — Answer precision / unambiguity (weight x2)
   1 = one best answer but a synonym would also be defensible.
   2 = exactly one precise answer of an unambiguous shape.
 
+D4 — Concision (weight x2)
+  0 = over """ + str(MAX_FRONT_WORDS) + """ words, OR the front teaches a second fact: two clauses joined by \
+"so", "yet", "which", "because", a semicolon or an em-dash where the second clause is a \
+fact of its own; a mechanism chain (X → so Y → so Z); a vignette the fact doesn't need. \
+Length under the limit does NOT rescue a two-fact front.
+  1 = 18-""" + str(MAX_FRONT_WORDS) + """ words, or one clause that could be deleted without changing the answer.
+  2 = about 17 words or fewer and nothing removable.
+
 D5 — Factual accuracy & clinical realism (HARD GATE, weight x3, binary)
   0 = inaccurate, hallucinated, implausible, or contradicts guidelines → fail regardless.
   2 = accurate and realistic. (If genuinely unsure, FLAG with reason "accuracy not \
 verified" rather than guessing.)
 
 VERDICT
-  Weighted max = 20 (D1x3x2 + D2x2x2 + D3x2x2 + D5x3x2). Percent = weighted/20.
+  Weighted max = 24 (D1x3x2 + D2x2x2 + D3x2x2 + D4x2x2 + D5x3x2). Percent = weighted/24.
   - D5 = 0  → fail (accuracy non-negotiable).
-  - D1 = 0  → fail, UNLESS the inherent-label-association test applies → flag.
-  - >= 85% and no hard-gate zero → pass.
+  - D1 = 0  → fail, UNLESS the answer is unavoidably in the cue because the name IS \
+the learning target (a mnemonic, a fixed eponym, an etymologically self-revealing term) \
+→ flag.
+  - D4 = 0  → fail (rewrite shorter).
+  - >= 85% and no zero above → pass.
   - 60-84% → flag.
-  - < 60% and no hard-gate zero → fail.
+  - < 60% → fail.
 
-INHERENT-LABEL-ASSOCIATION TEST (apply only when D1 = 0): could the card be rewritten \
-with a processing cue while preserving the SAME retrieval target? If YES the failure is \
-fixable → fail (rewrite). If NO (a mnemonic, a fixed eponym, an etymologically self-\
-revealing term where the name IS the learning target) → flag, do not over-reject. \
-When in doubt, fail. Do NOT reject a card merely because a knowledgeable solver could \
-derive the answer — every good card's answer is derivable to someone who knows the topic; \
-the fault is only when the cue's SURFACE FORM hands the answer over with no processing.
-
+Do NOT reject a card merely because a knowledgeable student could derive the answer — \
+that is what knowing it means. The fault is only when the card's SURFACE hands it over.
 Ignore the Extra field — it is not part of the score."""
 
 _BATCH_OUTPUT = """\
@@ -232,8 +284,8 @@ Return ONLY a JSON array — no prose, no markdown fences — with exactly one o
 input card, in the same order:
 [{"index": 0, "verdict": "pass|flag|fail", "worst_dim": "D1", "reason": "one short line", \
 "percent": 85}, ...]
-Use "fail" for cards that need regeneration and "flag" for inherent-label cards. Keep \
-each reason to one actionable line naming the failure mode."""
+Use "fail" for cards that need regeneration and "flag" for unavoidable give-aways. \
+Keep each reason to one actionable line naming the failure mode."""
 
 def atomicity_directive(max_clozes: int = 1) -> str:
     """A one-line D2 sensitivity override appended to every grader prompt so the
@@ -261,14 +313,12 @@ def rubric_batch_system(max_clozes: int = 1) -> str:
 
 
 def skill_batch_system(max_clozes: int = 1) -> str:
-    """Grader system prompt when the anki-card-scorer skill is invoked
-    (Anthropic only): the skill carries the rubric server-side / on-demand, so we
-    only pin the output shape and the atomicity override and save the inline
-    rubric tokens."""
-    return (
-        "Score these Anki cloze cards using the anki-card-scorer rubric."
-        + atomicity_directive(max_clozes) + "\n\n" + _BATCH_OUTPUT
-    )
+    """Grader system prompt when a scorer skill is attached (Anthropic API
+    skill_id). Carries the FULL inline rubric anyway: the skill is a bonus, never
+    the only copy of the rules. It used to send just "score using the
+    anki-card-scorer rubric", and on the CLI — where the skill can't load with
+    tools disabled — the grader was left scoring with no rubric at all."""
+    return rubric_batch_system(max_clozes)
 
 
 def merged_grade_instructions(max_clozes: int = 1) -> str:

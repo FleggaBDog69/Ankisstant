@@ -80,24 +80,31 @@ NAME = "AI Create"
 
 # ── prompts ───────────────────────────────────────────────────────────────────
 
+# The hard ceiling on a cloze front, in visible words (cloze answers count;
+# HTML, hints and the {{c1:: }} markup don't). Fletcher's number, 2026-10-10:
+# the AnKing deck's median front is 13 words and its 95th percentile ~25, while
+# the cards this add-on wrote had drifted to a median of 19 and climbing. One
+# constant, read by the writing prompt, the deterministic prefilter, the grader
+# rubric and the tighten pass, so all four agree on what "too long" means.
+MAX_FRONT_WORDS = 25
+
+
 # The front-emphasis + allowed-HTML rules, hoisted out of CARD_GEN_SYSTEM so the
-# prompts that REWRITE a card (split, one-by-one) carry the identical text. A
-# rewritten card is still a card he has to read at 6am, and a rewrite prompt that
-# says nothing about markup gets back plain prose — measured, see the emphasis
-# repair in ensure_front_emphasis(). One definition, three prompts.
+# prompts that REWRITE a card (split, one-by-one, tighten) carry the identical
+# text. A rewritten card is still a card he has to read at 6am, and a rewrite
+# prompt that says nothing about markup gets back plain prose — measured, see
+# the emphasis repair in ensure_front_emphasis(). One definition, four prompts.
 FRONT_EMPHASIS_RULES = """- FRONT EMPHASIS — do this on EVERY card, for fast visual recognition. Mark up key words
   INLINE with HTML so the eye lands on the anchor and the target instantly:
     • <b>Bold</b> the topic/disease anchor and any augmenting qualifier ('first-line',
       'most common', 'initial', 'acute', 'irreversible').
     • <u>Underline</u> the words in the cue that are ALREADY doing the retrieval
-      work — the mechanism, the finding, the contrast the student must think
-      through. Mark up what is there. NEVER add a phrase to the front just so
-      there is something to underline.
+      work — the finding, the contrast, the qualifier that pins the answer. Mark up
+      what is there. NEVER add a phrase to the front just so there is something to
+      underline.
       A SHAPE WORD (the <u>investigation</u>, the <u>vessel</u>, the <u>protozoa</u>)
       earns its place ONLY when the cue would otherwise admit more than one
-      answer — it is a disambiguator, not decoration. If the cue already pins
-      exactly one answer, adding the answer's category back in is the LABEL CUE
-      banned above: it makes the card longer AND easier at the same time.
+      answer — it is a disambiguator, not decoration.
       NECESSITY TEST — before writing a shape word, delete it and re-read the
       cue. Does more than one answer now fit? If no, leave it out.
         BAD:  "…carry a markedly elevated rate of <u>self-inflicted death</u>,
@@ -113,119 +120,119 @@ FRONT_EMPHASIS_RULES = """- FRONT EMPHASIS — do this on EVERY card, for fast v
 """
 
 
+# THE SOURCE OF TRUTH for how a cloze card is written. The anki-cards skill
+# (skills/anki-cards/SKILL.md, mirrored to ~/.claude/skills) restates these rules
+# for use outside the add-on — edit here first, then mirror.
+#
+# Rewritten 2026-10-10. The previous version BANNED direct cues ("X causes
+# {{c1::Y}}") and required every card to be cued from a mechanism or a
+# presentation. That is a rule that can only be obeyed by adding words, and it
+# was: fronts ran ~50% longer than the AnKing cards beside them, a third carried
+# an em-dash or "because" clause, and most read as a short story. The default is
+# now the AnKing card — one fact, the shortest cue that pins it — and the story
+# card is a rationed exception.
 CARD_GEN_SYSTEM = """You generate high-yield Anki cloze cards for a Year 3 Australian medical student.
+The target style is the AnKing deck: short, direct, one fact per card.
 
 
 OUTPUT FORMAT
 Return ONLY a JSON array. Each element:
   {"front": "<cloze text with {{c1::...}} / {{c2::...}} etc>",
-   "extra": "<the clinical 'so what' or mechanism — do NOT repeat the front>"}
+   "extra": "<optional short note, or empty string>",
+   "style": "fact" | "story"}
 No prose outside the JSON array. No markdown fences.
 
-THE ONE THING THAT MATTERS: RETRIEVAL FORCE
-Every card has a CLOZE (what gets retrieved) and a CUE (the visible text around it). A
-card is only worth making if the cue forces the student to RECALL the answer from memory
-— not read it off the prompt or recognise a label.
+THE DEFAULT CARD: ONE FACT, THE SHORTEST CUE THAT PINS IT
+- Each card tests ONE fact. The visible text is the shortest cue that makes exactly
+  one answer correct — nothing more.
+- HARD LIMIT: the front is at most """ + str(MAX_FRONT_WORDS) + """ words (cloze answers count; HTML and
+  hints don't). Aim for about 15. A front that needs more than """ + str(MAX_FRONT_WORDS) + """ words is
+  carrying two facts — split it.
+- Direct cues are GOOD. State the fact plainly and cloze the answer:
+    GOOD: "<b>Clomiphene</b> {{c1::increases::increases/decreases}} pituitary release of FSH and LH."  (hint needed: "increases" alone could be read as any verb)
+    GOOD: "Unopposed <b>oestrogen</b> is the usual cause of {{c1::endometrial hyperplasia}}."
+    GOOD: "<b>Kawasaki disease</b> can cause coronary artery {{c1::aneurysms}}."
+    GOOD: "<b>Second impact syndrome</b> kills through {{c1::diffuse cerebral swelling}}."
+- HINTS ({{c1::answer::hint}}) SPARINGLY — only where the student couldn't otherwise
+  tell what the blank wants: {{c1::increased::increased/decreased}},
+  {{c1::echocardiogram::which test?}}. If the cue already makes the kind of answer
+  obvious, no hint. Most cards have none.
 
-Two kinds of cue. Only one is allowed:
-- LABEL CUE (BANNED): names the answer's own category and asks you to fill it in. The
-  retrieval path is keyword → answer; it doesn't exist on the ward.
-    BAD: "The first-line treatment for anaphylaxis is {{c1::adrenaline}}."  ← the cue IS the answer's restated label.
-- PROCESSING CUE (REQUIRED): gives a mechanism, presentation, contrast, cause, or
-  consequence the student must work THROUGH to reach the answer.
-    GOOD: "{{c1::Adrenaline}} reverses the bronchospasm, vasodilation, and capillary leak of anaphylaxis."  ← same fact, same atomicity, mechanism cue.
+STORY CARDS ARE RATIONED
+A "story" card is one cued by a clinical vignette ("A 24-year-old … presents with …")
+or a mechanism chain ("X blocks Y, so Z rises, which …"). Mark it "style": "story";
+every other card is "style": "fact".
+- AT MOST ONE IN FIVE cards may be a story card (fewer than five cards → none, unless
+  the topic itself is a clinical scenario). Most facts do not need one.
+- Use one only where the fact cannot be tested without the setting — e.g. the
+  diagnosis that only a combination of findings points to.
+- A story card still obeys the """ + str(MAX_FRONT_WORDS) + """-word limit.
 
-THE TEST (apply to every card before writing it): if I delete the answer, can the reader
-reconstruct it from the TYPE OF THINKING the cue demands — or only from recognising a
-label? If only the label, redesign the cue.
-
-CUE TOOLKIT — build the visible part from one of:
-  Mechanism ("the drug that reverses the bronchospasm of…") · Presentation ("a patient
-  with stridor and hypotension after a sting…") · Contrast ("what distinguishes X from
-  Y…") · Cause ("why does…") · Consequence ("what happens if…").
-Function over anatomy: cue what a structure DOES, not its origin/insertion.
-
-PRECISION vs LEAKAGE: give enough context that exactly ONE answer fits, WITHOUT restating
-the answer's label. Specify the SHAPE of the answer (a drug? a vessel? a phase?), not
-which specific one. "The immediate drug…" says it's a drug without saying which.
-
-SUBSTRING CHECK (run on every card before finalising): does the cloze answer appear as a
-literal substring or shared word-stem of any word in the visible cue? If yes it's a
-morphological give-away — redesign.
-    BAD: "Vasospastic angina is caused by coronary {{c1::spasm}}."  ("spasm" sits inside "Vasospastic")
-
-ATOMICITY: one retrievable unit per card. Multi-fact cards spawn sibling clozes that
-DESYNC under spaced repetition — the easy sub-fact keeps the card off the queue while the
-hard one never matures.
-- Split a multi-component fact into separate clozes rather than clozing the whole phrase:
-    CORRECT: prevents {{c1::anterior shear}} of {{c2::L5}} on {{c3::S1}}
-    WRONG:   prevents {{c1::anterior shear of L5 on S1}}
-- Coupled-but-separable facts (a disease name AND its vessel) are TWO cards, each cued
-  from a different angle — not one card with two clozes.
-
-ONE FACT IN THE FRONT. Atomicity is about the WHOLE front, not just how many
-clozes you used. A one-cloze card is still non-atomic if the visible text
-smuggles a second fact in — an em-dash tail, a parenthetical aside, an "and it
-also…" clause. Every word in the front must be there to make the ONE hidden
-fact retrievable. A clause that TEACHES rather than CUES belongs in the EXTRA
-field, which exists for precisely that.
+ONE FACT IN THE FRONT
+Atomicity is about the WHOLE front, not just how many clozes you used. A one-cloze card
+is still non-atomic if the visible text smuggles a second fact in — an em-dash tail, a
+parenthetical aside, a "because…" or "and it also…" clause. Every word in the front must
+be there to make the ONE hidden fact retrievable. A clause that TEACHES rather than CUES
+is cut, or goes in EXTRA.
   BAD:  "In newly diagnosed <b>heart failure</b>, {{c1::transthoracic echocardiography}}
          is the <u>initial</u> test — it quantifies ventricular function and detects
          stenotic or regurgitant lesions that may be a surgically correctable cause."
-         (everything after the em-dash is teaching, and it is a second fact)
-  GOOD: "In newly diagnosed <b>heart failure</b>, the test that shows whether a valve
-         lesion is driving it is {{c1::transthoracic echocardiography}}."
-         …with the ventricular-function detail moved to EXTRA.
-DELETION TEST (run on every card, clause by clause — position doesn't matter, a
-cue may sit before or after its cloze): take out one clause and re-read. If the
-cue still forces the SAME answer without it, that clause was teaching, not
-cueing — move it to EXTRA. Keep only what the recall depends on. Do not lengthen
-the front to be thorough; the back is where thorough goes.
+  GOOD: "The <u>initial</u> test in newly diagnosed <b>heart failure</b> is
+         {{c1::transthoracic echocardiography}}."
+  BAD:  "<b>Clomiphene</b> blocks hypothalamic oestrogen negative feedback, so GnRH pulses
+         rise and the pituitary releases more {{c1::FSH}} — recruiting {{c2::multiple}}
+         follicles at once."   (a mechanism chain carrying three facts)
+  GOOD: two cards — "<b>Clomiphene</b> blocks oestrogen negative feedback at the
+         {{c1::hypothalamus}}." and "<b>Clomiphene</b> raises the risk of
+         {{c1::multiple}} pregnancy."
+DELETION TEST (run on every card, clause by clause): take out one clause and re-read. If
+the cue still forces the SAME answer without it, delete that clause.
+
+GIVE-AWAYS (banned — these let the answer be read off the card)
+- SUBSTRING: the cloze answer, or a shared word-stem, appears in the visible text.
+    BAD: "Vasospastic angina is caused by coronary {{c1::spasm}}."  ("spasm" sits inside "Vasospastic")
+- DEFINITION ↔ TERM: "{{c1::Apoptosis}} is programmed cell death." / "Inflammation of the
+  joint is called {{c1::arthritis}}." A dictionary, not a fact. Test something the term
+  DOES or CAUSES instead.
+- SYNONYM SET-UP: the cue restates the answer in other words, or a second cloze names
+  the first.
+- GRAMMAR: "an {{c1::…}}" cues a vowel; write "a(n)" or restructure.
 
 LIST-SHAPED CONTENT ("the N X are A, B, C…", or enumeration words three/four/several):
 STOP and pick a format deliberately —
-  A) SPLIT into N cards, each cued from that item's own mechanism/presentation. Default
-     for long lists (≥5) or items with independent meaning.
-  B) ONE card with HINT SYNTAX {{c1::answer::hint}} — for short lists (≤4), conceptually
-     paired, where the gestalt "what are the X" recall matters. Hints anchor each cloze
-     to its retrieval angle without giving the answer away.
-  C) ONE card without hints, ACCEPTING desync — only for fixed sequences / mnemonics /
-     ordered cascades that lose meaning if split.
+  A) SPLIT into N cards, one per item. DEFAULT for lists of ≥5 or items with
+     independent meaning.
+  B) ONE card with HINT SYNTAX {{c1::answer::hint}} — for short lists (≤4) where the
+     gestalt "what are the X" recall matters.
+  C) ONE card without hints, accepting desync — only for fixed sequences / mnemonics.
 Never default to a multi-cloze enumeration without choosing A/B/C.
 
 CLOZE NUMBERING (commonly done wrong):
-- Separate facts each meant to be hidden on their OWN sibling card → number sequentially
-  {{c1::…}}, {{c2::…}}, {{c3::…}}.
-- Deletions meant to be revealed TOGETHER as a single card → give them the SAME number.
-- Reusing {{c1::…}} for every separate fact collapses them into one card — WRONG. When in
-  doubt, number c1, c2, c3.
-
-INHERENT LABEL-ASSOCIATION (rare, allowed): some content is genuinely a name↔feature
-mapping with no processing-cue equivalent — mnemonics, eponym→lesion (Marfan →
-{{c1::cystic medial degeneration}}), etymologically self-revealing terms. Write these
-honestly. But FIRST apply the test: could a processing cue preserve the same fact? If
-YES, write the better version — a flag here is laziness. Definitional clozes and
-"first-line treatment of X" are FIXABLE, never inherent.
+- Separate facts each meant to be hidden on their OWN sibling card → c1, c2, c3.
+- Deletions meant to be revealed TOGETHER as one card → the SAME number.
+- When in doubt, number c1, c2, c3.
+- Split a multi-component fact into separate clozes rather than clozing a whole phrase:
+    CORRECT: prevents {{c1::anterior shear}} of {{c2::L5}} on {{c3::S1}}
+    WRONG:   prevents {{c1::anterior shear of L5 on S1}}
 
 CLOZE FORMAT & STYLE
-- Cloze only (no Q&A). 1–3 clozes per card, each a discrete fact. Short answers (1–4 words).
+- Cloze only (no Q&A). Usually ONE cloze; at most 2–3 when they are parts of one fact.
+  Short answers (1–4 words).
 - LEVEL: Year 3 Australian med student; Australian drugs/guidelines (eTG, RACGP, PBS,
-  ANZCOR) where relevant.
-- Ruthless concision — cut filler ("important to know that…", "remember that…").
-""" + FRONT_EMPHASIS_RULES + """- Cloze the YIELD (the high-value fact), not background framing. If a fact only makes
-  sense with framing, put the framing UNCLOZED in the front and cloze the testable part.
+  ANZCOR) and spelling.
+- Ruthless concision — no filler ("important to know that…", "remember that…"), no
+  framing the answer doesn't need.
+""" + FRONT_EMPHASIS_RULES + """- Cloze the YIELD (the high-value fact), not background framing.
 
-EXTRA FIELD (the back): concise and SCANNABLE — never a wall of text. The clinical "so
-what", mechanism, or exam pearl; never a repeat of the front. Skip it entirely if you have
-nothing high-yield to add.
-- Keep it to ≤ ~40 words. Prefer 2–4 short points over prose.
-- Lead each point with a BOLDED key term, separated by <br>:
-  "<b>Mechanism:</b> reverses bronchospasm + vasodilation<br><b>Pearl:</b> IV only in arrest".
-- Use <ul><li>…</li></ul> for a genuine list. Allowed HTML: <b>, <u>, <i>, <br>, <ul>,
-  <li> — nothing else (<i> for genus/species only). Cut filler ("important to know
-  that…", "remember that…").
+EXTRA FIELD (the back): OPTIONAL and SHORT. An empty string is the right answer for
+most cards.
+- At most ~20 words: one or two bolded points, e.g. "<b>Pearl:</b> IM thigh, repeat
+  every 5 min". Never a paragraph, never a second lesson, never a repeat of the front.
+- Allowed HTML: <b>, <u>, <i>, <br>. Include it only for a high-yield mnemonic,
+  distinction or pearl the card genuinely benefits from.
 
 DO NOT include any prose outside the JSON array. No markdown fences. Just the JSON array."""
+
 
 
 QA_GEN_SYSTEM = """You generate high-yield question/answer Anki cards for a Year 3 Australian medical student, in the Malleus Clinical Medicine submission style.
@@ -260,10 +267,151 @@ DO NOT include any prose outside the JSON array. No markdown fences. Just the JS
 SPLIT_SYSTEM = (
     "Split the supplied Anki card into multiple ATOMIC single-cloze cards. Each output card "
     "must test ONE fact, contain exactly ONE cloze deletion ({{c1::...}}), and stand on its own. "
-    "Keep cloze answers short (1–4 words). Preserve the clinical meaning of the original. "
+    "Keep cloze answers short (1–4 words) and each front at most "
+    + str(MAX_FRONT_WORDS) + " words — a short, direct statement of its one fact. "
+    "Preserve the clinical meaning of the original. Extra is optional and short "
+    "(≤ ~20 words, or an empty string). "
     "Return ONLY a JSON array of {front, extra} objects — no prose, no markdown fences.\n\n"
     + FRONT_EMPHASIS_RULES
 )
+
+
+# The deterministic length net — the generation-side twin of the quality pass's
+# D4 prefilter. The prompt asks for <= MAX_FRONT_WORDS and mostly gets it; this
+# fixes the rest in ONE batched call per job instead of leaving him red chips to
+# regenerate by hand. Same idea as ensure_front_emphasis: prompting gets most of
+# the way, a cheap check closes the last stretch.
+TIGHTEN_SYSTEM = (
+    "You shorten Anki cloze cards that came back too long or too story-like. "
+    "The target is the AnKing style: one fact per card, the shortest direct cue "
+    "that pins exactly one answer.\n"
+    "For each card you are given, return replacement card(s):\n"
+    "- Each front at most " + str(MAX_FRONT_WORDS) + " words (cloze answers count; "
+    "HTML and hints don't). Aim for about 15.\n"
+    "- Keep the SAME fact and the same cloze answer(s). Do not add facts.\n"
+    "- Cut vignettes, mechanism chains, em-dash tails and 'because…' clauses. "
+    "If the card genuinely holds TWO facts, return TWO cards, one each.\n"
+    "- A card marked REWRITE AS FACT must come back as a direct statement, not a "
+    "clinical vignette.\n"
+    "- Never put the cloze answer, or a word sharing its stem, in the visible text.\n"
+    "- Extra is optional: at most ~20 words, or an empty string.\n"
+    "- Every returned card carries \"style\": \"fact\".\n\n"
+    + FRONT_EMPHASIS_RULES
+    + "\nOUTPUT: ONLY a JSON array, one object per input card, in order:\n"
+    '[{"index": 0, "cards": [{"front": "...", "extra": "", "style": "fact"}]}]\n'
+    "No prose, no markdown fences."
+)
+
+
+def story_allowance(n_cards: int) -> int:
+    """How many "story" cards a batch of n may keep: one in five, rounded down.
+    Fletcher's rule (2026-10-10) — vignette/mechanism-chain cards have their
+    place, "but definitely not every card, probably not even every 5th card"."""
+    try:
+        return max(0, int(n_cards) // 5)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_story(card: dict) -> bool:
+    return str((card or {}).get("style") or "").strip().lower() == "story"
+
+
+def cards_needing_tighten(cards: list, max_words: int = MAX_FRONT_WORDS) -> dict:
+    """{index: reason} for every card the tighten pass should rewrite: fronts
+    over the word limit, plus the story cards past this batch's allowance (the
+    LONGEST stories go first — the short ones are the least harmful to keep).
+    Pure; no AI. Exposed for the tests and for callers that only want to know."""
+    out: dict[int, str] = {}
+    if not isinstance(cards, list):
+        return out
+    for i, c in enumerate(cards):
+        if not isinstance(c, dict):
+            continue
+        n = qp.front_word_count(c.get("front", ""))
+        if n > max_words:
+            out[i] = f"TOO LONG ({n} words, limit {max_words})"
+    stories = [i for i, c in enumerate(cards) if isinstance(c, dict) and _is_story(c)]
+    allowance = story_allowance(len(cards))
+    if len(stories) > allowance:
+        by_len = sorted(stories, key=lambda i: -qp.front_word_count(cards[i].get("front", "")))
+        for i in by_len[:len(stories) - allowance]:
+            out[i] = (out[i] + "; " if i in out else "") + "REWRITE AS FACT (too many story cards)"
+    return out
+
+
+# Keys that describe the card's CONTENT and are rewritten by the tighten pass.
+# Everything else on a card (point attribution, slide links, images, the
+# image_query, a source citation) belongs to where the card came from, and a
+# shortened card came from the same place.
+_TIGHTEN_CONTENT_KEYS = ("front", "extra", "style", "_verdict")
+
+
+def tighten_cards(cards: list, profile: dict | None, model: str | None, *,
+                  max_words: int = MAX_FRONT_WORDS) -> tuple[list, bool]:
+    """Shorten over-long cards, and demote the story cards past the 1-in-5
+    allowance, in ONE AI call. Returns (cards, changed).
+
+    Cloze only — a Q&A (Malleus) profile is returned untouched, its answers are
+    meant to be complete. Qt-free and safe off the main thread (create_jobs runs
+    it in the worker). Fail-open: any error, an unparseable reply, or a card the
+    model drops leaves the original in place, and the D4 prefilter then shows a
+    still-long card in red rather than silently passing it.
+    """
+    try:
+        if not isinstance(cards, list) or not cards:
+            return cards, False
+        if str((profile or {}).get("card_format") or "").lower() == "qa":
+            return cards, False
+        todo = cards_needing_tighten(cards, max_words)
+        if not todo:
+            return cards, False
+        blocks = []
+        for i in sorted(todo):
+            c = cards[i]
+            blocks.append(
+                f"Card {i} — {todo[i]}\nFront:\n{c.get('front', '')}\n"
+                f"Extra:\n{c.get('extra', '')}")
+        prompt = ("Rewrite these cards. Reply with the JSON array described.\n\n"
+                  + "\n\n".join(blocks))
+        raw = core_api.ask_claude_json(
+            prompt=prompt, system=_augment_system(TIGHTEN_SYSTEM, profile),
+            max_tokens=max(1024, 400 * len(todo) + 512), model=model,
+            show_errors=False)
+        if isinstance(raw, dict):
+            raw = next((v for v in raw.values() if isinstance(v, list)), None)
+        if not isinstance(raw, list):
+            return cards, False
+        repl: dict[int, list] = {}
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            try:
+                idx = int(item.get("index"))
+            except (TypeError, ValueError):
+                continue
+            new = [n for n in (item.get("cards") or [])
+                   if isinstance(n, dict) and str(n.get("front") or "").strip()]
+            if idx in todo and new:
+                repl[idx] = new
+        if not repl:
+            return cards, False
+        out: list = []
+        for i, c in enumerate(cards):
+            if i not in repl:
+                out.append(c)
+                continue
+            carry = {k: v for k, v in c.items() if k not in _TIGHTEN_CONTENT_KEYS}
+            for n in repl[i]:
+                card = dict(carry)
+                card["front"] = str(n.get("front") or "")
+                card["extra"] = str(n.get("extra") or "")
+                card["style"] = "fact"
+                out.append(card)
+        return out, True
+    except Exception as e:
+        print(f"[ankisstant] tighten pass skipped: {e}")
+        return cards, False
 
 def _augment_system(base: str, profile: dict | None) -> str:
     """Append a NOTETYPE block to a system prompt so Claude knows which
@@ -833,9 +981,10 @@ def _breadth_directive(n: int, mode: str, *, band: str | None = None) -> str:
         )
     elif band == "mechanism":
         scope = (
-            f"a medium set — cover the main concepts across {where} with moderate "
-            "depth: key mechanisms, presentations, and management, not just "
-            "headline facts."
+            f"a medium set — cover the main concepts across {where}: key "
+            "mechanisms, presentations and management, not just headline facts. "
+            "Depth means MORE single-fact cards (a mechanism is its own short "
+            "card), never longer cards."
         )
     else:
         if source_bound:
@@ -850,7 +999,7 @@ def _breadth_directive(n: int, mode: str, *, band: str | None = None) -> str:
                 "subtopics (epidemiology, pathophysiology, diagnosis, the relevant "
                 "organ systems, management, complications, monitoring) AND go "
                 "deeper into mechanisms, distinctions, and less-common but testable "
-                "detail."
+                "detail — as more single-fact cards, never longer ones."
             )
     cards_word = "card" if n == 1 else "cards"
     return (
@@ -1101,13 +1250,16 @@ def _grader_skill(cfg: dict, profile: dict | None) -> tuple[str, str]:
     provider = (load_config().get("provider") or "auto").lower()
     if provider not in ("auto", "cli", "anthropic"):
         return ("", "")
-    inv = (qpc.get("grader_skill_invocation") or "").strip()
     sid = (qpc.get("grader_skill_id") or "").strip()
+    # The CLI runs every call with --tools "", so a skill named in the prompt
+    # can never be loaded there — the invocation was dead text the model
+    # answered with "I couldn't access that skill". The inline rubric (always
+    # sent, see quality_pass.skill_batch_system) is the grader on the CLI; only
+    # an uploaded API skill_id still rides along. (grader_skill_invocation is
+    # left in config, unread, so his saved settings aren't disturbed.)
     if provider == "cli":
-        return (inv, "")
-    if provider == "anthropic":
-        return ("", sid)
-    return ("", sid) if sid else (inv, "")  # auto: prefer the API id
+        return ("", "")
+    return ("", sid)
 
 
 def _regenerate_one(old_card: dict, hint: str, profile: dict | None,
@@ -1131,8 +1283,9 @@ def _regenerate_one(old_card: dict, hint: str, profile: dict | None,
         )
     else:
         instruction = (
-            "Rewrite this card as a single, better card on the same fact — a "
-            "stronger cue or wording while keeping the same retrieval target."
+            "Rewrite this card as a single, better card on the same fact — "
+            "shorter and more direct (at most " + str(MAX_FRONT_WORDS) + " words "
+            "in the front), keeping the same retrieval target."
         )
     # A rewrite prompt hands the model a finished card and one thing to fix, and
     # the reply comes back tuned to that one thing — in practice, as plain text.
@@ -1170,8 +1323,9 @@ def _regenerate_one(old_card: dict, hint: str, profile: dict | None,
     if old_card.get("_image_paths"):
         new["_image_paths"] = list(old_card["_image_paths"])
     # Carry the slide attachment across a regeneration — the rewritten card is
-    # the same fact from the same slide.
-    for k in ("slide", "_slide_indices", "_slide_paths"):
+    # the same fact from the same slide. Likewise the learning point it was
+    # written for, so a regenerated card stays filed under its point.
+    for k in ("slide", "_slide_indices", "_slide_paths", "point"):
         if old_card.get(k) is not None:
             new[k] = list(old_card[k]) if isinstance(old_card[k], list) else old_card[k]
     return new
@@ -3702,6 +3856,9 @@ class CreatorPanel(QWidget):
             profile=profile, gap=gap, type_meta=type_meta,
             cached_tag=cached_tag, want_tag=False, model=None,
             same_call_grades=same_call_grades,
+            # Cards he brought himself are his to edit — no silent AI rewrite.
+            # The D4 prefilter still marks any over-long one.
+            allow_tighten=False,
         )
 
     def _grader_system(self, use_skill: bool) -> str:
@@ -3808,7 +3965,7 @@ class CreatorPanel(QWidget):
                          topic_label, focus, deck_name, notetype_name, tags_raw,
                          profile, gap, type_meta, cached_tag, want_tag, model,
                          same_call_grades=None, topic_autotag=False, tag_material="",
-                         slide_pages=None):
+                         slide_pages=None, allow_tighten=True):
         """Validate the card list, resolve the auto-tag, and open the review
         dialog. Shared by Generate (AI round-trip) and Paste cards (user brings
         their own JSON). Returns False on malformed input (a warning is shown)."""
@@ -3890,6 +4047,18 @@ class CreatorPanel(QWidget):
                     tags_raw.append(tag)
             except Exception as e:
                 print(f"[ankisstant] no-gap tag build skipped: {e}")
+
+        # Length net (see tighten_cards) — the same pass the background worker
+        # runs, so foreground and background generations come out alike. Not
+        # for the paste provider: it can't make the call without popping
+        # another paste dialog at him.
+        if (allow_tighten and not is_manual_provider()
+                and resolve_card_validity(cards)):
+            with loading(self.go_btn, "Tightening long cards…"):
+                cards, tightened = tighten_cards(cards, profile, model)
+            if tightened:
+                same_call_grades = None
+                ensure_front_emphasis(cards, topic_label or "", source_label or "")
 
         # Quality pass: score cards (and optionally auto-regenerate failures)
         # before the review screen. Fail-open — never blocks card creation.

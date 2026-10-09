@@ -119,6 +119,23 @@ def _points_block(points: list, n_cards: int = 0) -> str:
     return head + lines + tail
 
 
+def _style_block(examples: list) -> str:
+    """Real cards from the student's deck on this gap's topic, as a register to
+    match. Work-through only — it is the one door where a search has already
+    found them (bulk_search._style_examples_for). Shown as STYLE, explicitly not
+    as content: the facts they test are ones the deck already has."""
+    lines = [str(e or "").strip() for e in (examples or [])]
+    lines = [e for e in lines if e]
+    if not lines:
+        return ""
+    return (
+        "\nSTYLE REFERENCE — cards already in the student's deck on this topic. "
+        "Match their length and directness. Do NOT repeat the facts they test; "
+        "they are already covered:\n"
+        + "\n".join(f"- {e}" for e in lines) + "\n"
+    )
+
+
 def build_generation_request(*, kg: dict, plan, profile: dict, cfg: dict,
                              focus: str = "", n_cards: int | None = None):
     """Assemble one gap's generation request.
@@ -145,6 +162,7 @@ def build_generation_request(*, kg: dict, plan, profile: dict, cfg: dict,
         # The band is the dial's depth half — see _breadth_directive(band=).
         + cc._breadth_directive(n, "topic", band=getattr(plan, "depth_band", None)) + "\n"
         + (cc._focus_directive(focus) + "\n" if focus else "")
+        + ("" if is_qa else _style_block(kg.get("style_examples")))
     )
 
     # ── system prompt ───────────────────────────────────────────────────────

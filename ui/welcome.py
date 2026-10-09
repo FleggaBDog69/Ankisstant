@@ -180,8 +180,9 @@ _TEST_CARD_PROMPT = (
     '{"front":"...{{c1::...}}...","extra":"..."}\n\n'
     "Rules:\n"
     "- front must contain at least one {{c1::text}} cloze\n"
-    "- keep front to one sentence (the key fact as a fill-in-the-blank)\n"
-    "- extra: 1-2 sentences of clinical context\n"
+    "- keep front to one short sentence, at most 25 words (the key fact "
+    "as a fill-in-the-blank)\n"
+    "- extra: optional, at most ~20 words\n"
     "- medically accurate\n"
 )
 

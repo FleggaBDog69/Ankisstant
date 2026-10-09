@@ -72,21 +72,18 @@ MQ_EXPLANATION (only when the gap is a question you got wrong)
   isn't a missed question.
 
 CARD RULES (Wozniak's 20 Rules / Med School Insiders best practice)
-- MINIMUM INFORMATION: one atomic fact per card. If a card tests two things,
-  split it into two cards.
-- CONCISION: cut every word that doesn't change meaning. No "important to know
-  that…", no "remember that…".
-- CLOZE: standard Anki syntax {{c1::answer}}, {{c2::answer}}. Keep cloze answers
-  SHORT (1–4 words). Multiple clozes on one card only when the facts are tightly
-  coupled (e.g. drug + class + mechanism); otherwise split.
-- NO ENUMERATIONS: never "list the 5 causes of X" on one card. Pick the 1–2
-  highest-yield items, or use sequential/overlapping clozes across cards.
-- UNDERSTAND BEFORE MEMORISE: don't cloze a number/classification with no
-  framing. Put the framing in the front (unclozed); cloze the testable part.
-- FORMATTING: only <b> (high-yield terms) and <u> (underline) in fields. No
-  other HTML.
-- EXTRA: clinical context, mnemonic, or a one-line "why it matters". Don't
-  repeat the front. Use "" if you have nothing worth adding.
+- ONE FACT PER CARD, AnKing-style: the shortest direct cue that pins exactly one
+  answer. Direct statements ("Kawasaki disease can cause coronary artery
+  {{c1::aneurysms}}") are good.
+- FRONT AT MOST 25 WORDS (aim for ~15). Longer means two facts — split it.
+- STORY CARDS (clinical vignettes, mechanism chains) at most one in five cards.
+- CLOZE: standard `{{c1::answer}}` syntax, answers 1–4 words. Multiple clozes only
+  when they are parts of one fact; otherwise split into sibling cards.
+- NO GIVE-AWAYS: the cloze answer (or a shared word-stem) must not appear in the
+  visible text; no definition → term cards; no "an {{c1::…}}".
+- NO ENUMERATIONS on one card; split, or use hint syntax for a short list.
+- FORMATTING: only `<b>` and `<u>` in fields. No other HTML.
+- EXTRA: optional, at most ~20 words; "" for most cards. Never repeat the front.
 - LEVEL: Year 3 Australian medical student. Prefer Australian drug names and
   guidelines (eTG, RACGP) when relevant.
 - How many cards: as many as the gap genuinely needs (usually 1–5). Don't pad.

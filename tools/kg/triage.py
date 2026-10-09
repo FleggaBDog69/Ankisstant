@@ -68,9 +68,9 @@ from . import read_cache
 SCOPES: dict[str, dict] = {
     "narrow":  {"points": (1, 1), "cards": 1,
                 "label": "Narrow",  "hint": "one assertion — one card"},
-    "focused": {"points": (1, 3), "cards": 4,
+    "focused": {"points": (2, 5), "cards": 5,
                 "label": "Focused", "hint": "one entity, one aspect"},
-    "broad":   {"points": (3, 7), "cards": 10,
+    "broad":   {"points": (6, 12), "cards": 12,
                 "label": "Broad",   "hint": "a whole entity, or entity + management"},
 }
 DEFAULT_SCOPE = "focused"
@@ -103,11 +103,11 @@ MIN_CARDS, MAX_CARDS = 1, 40
 CREATE_BREADTHS: dict[str, dict] = {
     "pinpoint": {"points": (1, 1), "cards": 1,  "band": "single",
                  "label": "Pinpoint", "hint": "one fact — one card"},
-    "core":     {"points": (2, 4), "cards": 5,  "band": "essentials",
+    "core":     {"points": (3, 6), "cards": 6,  "band": "essentials",
                  "label": "Core",     "hint": "one aspect, the must-knows"},
-    "wide":     {"points": (5, 8), "cards": 12, "band": "essentials",
+    "wide":     {"points": (8, 14), "cards": 14, "band": "essentials",
                  "label": "Wide",     "hint": "the whole entity, headline level"},
-    "deep":     {"points": (5, 8), "cards": 22, "band": "mechanism",
+    "deep":     {"points": (12, 20), "cards": 22, "band": "mechanism",
                  "label": "Deep",     "hint": "the whole entity, down to mechanism"},
 }
 DEFAULT_BREADTH = "core"
@@ -267,16 +267,33 @@ _S_SCOPE = (
 )
 
 
+# A POINT IS ONE FACT. Shared by both decompositions, because a point is what
+# a card gets written FROM: work-through writes one card per uncovered SEARCH
+# point (bulk_search.create_record_for), Mass AI Create from the create points.
+# Compound points ("X does A, and additionally B") were turning straight into
+# compound cards — the long, two-fact fronts this rule exists to stop. Splitting
+# them means more points per gap, so the point ranges in SCOPES and
+# CREATE_BREADTHS were raised alongside (2026-10-10).
+_ONE_FACT_POINT = (
+    "A POINT IS ONE FACT — the single thing one cloze would hide. If your "
+    "sentence contains 'and', 'additionally', 'while', 'whereas', a list, or a "
+    "second clause that could be its own card, it is TWO points: split it. "
+    "Keep each point short — a plain sentence of about 15 words or fewer. "
+    "Many small points are right; a few big ones are the failure.\n"
+)
+
+
 _S_DECOMPOSE = (
     "STEP 2 — DECOMPOSE TO MATCH THE SCOPE. Split the gap into learning points, "
-    "each ONE idea a single card could test:\n"
+    "each ONE fact a single card could test:\n"
     "  narrow  → exactly 1 point. Do not expand it. The student wrote one fact; "
     "finding cards on the surrounding topic is noise they did not ask for.\n"
-    "  focused → 1 to 3 points.\n"
-    "  broad   → 3 to 7 points that between them cover the entity properly: for "
+    "  focused → 2 to 5 points.\n"
+    "  broad   → 6 to 12 points that between them cover the entity properly: for "
     "a disease, its mechanism, features, diagnosis and management; for a drug, "
     "its mechanism, indications, key adverse effects and monitoring. Only mint a "
-    "point a well-taught student would actually be examined on.\n\n"
+    "point a well-taught student would actually be examined on.\n"
+    + _ONE_FACT_POINT + "\n"
 
 )
 
@@ -287,8 +304,8 @@ _S_CARDS = (
     "the student needs is one they have to read and reject:\n"
     "  narrow  → 1. One assertion is one card. Use 2 ONLY if the fact has two "
     "genuinely separate halves that no single card could test together.\n"
-    "  focused → 3-5.\n"
-    "  broad   → 8-14, and only at the top of that range for a large disease "
+    "  focused → 4-6.\n"
+    "  broad   → 10-16, and only at the top of that range for a large disease "
     "with a real management arm.\n"
     "Scale it to how much there genuinely is to know, not to a formula.\n\n"
 
@@ -413,19 +430,20 @@ _C_CONSTRAINTS = (
 
 _C_DECOMPOSE = (
     "STEP 2 — DECOMPOSE INTO WRITEABLE POINTS. Split the gap into learning "
-    "points, each ONE idea that ONE card could test:\n"
+    "points, each ONE fact that ONE short card could test:\n"
     "  pinpoint → exactly 1 point. Do not expand it. The student wrote one fact; "
     "cards on the surrounding topic are noise they did not ask for.\n"
-    "  core     → 2 to 4 points.\n"
-    "  wide     → 5 to 8 points that between them cover the entity properly: for "
+    "  core     → 3 to 6 points.\n"
+    "  wide     → 8 to 14 points that between them cover the entity properly: for "
     "a disease, its mechanism, features, diagnosis and management; for a drug, "
     "its mechanism, indications, key adverse effects and monitoring.\n"
-    "  deep     → 5 to 8 points, chosen so the set reaches mechanism and "
+    "  deep     → 12 to 20 points, chosen so the set reaches mechanism and "
     "distinction, not just more headlines.\n"
-    "A POINT IS A TESTABLE CLAIM, NOT A SEARCH QUERY OR A HEADING. "
+    "A POINT IS A TESTABLE FACT, NOT A SEARCH QUERY OR A HEADING. "
     "'Graves: management' is a heading; 'Thionamides are first-line medical "
-    "therapy in Graves, with carbimazole preferred outside the first trimester' "
-    "is a point.\n"
+    "therapy in Graves' is a point, and 'carbimazole is preferred over PTU "
+    "outside the first trimester' is a SECOND point.\n"
+    + _ONE_FACT_POINT +
     "POINTS MUST NOT OVERLAP. Two points covering the same claim produce two "
     "near-identical cards, and — unlike a search, where the same card simply "
     "matches twice and dedupes — nothing culls a duplicate that was newly "
@@ -451,11 +469,11 @@ _C_DECOMPOSE = (
 
 _C_CARDS = (
     "STEP 3 — SET A CARD BUDGET. \"cards\" is how many NEW cards to write for "
-    "the WHOLE gap. Roughly one to three per point:\n"
+    "the WHOLE gap. Roughly ONE per point — each point is a single fact:\n"
     "  pinpoint → 1. One assertion is one card.\n"
-    "  core     → 4-6.\n"
-    "  wide     → 10-14.\n"
-    "  deep     → 18-26.\n"
+    "  core     → 4-7.\n"
+    "  wide     → 10-16.\n"
+    "  deep     → 16-26.\n"
     "The student reviews every card before any of it is added, so an extra card "
     "is cheap and a point left uncovered is a gap that stays open. But the "
     "number is A CEILING TO AIM AT, NOT A QUOTA TO FILL: a point that a single "
@@ -545,7 +563,7 @@ _TRIAGE_SYSTEM = (
     "gaps, never drop one, never invent one.\n"
     "- concept (per gap): one plain sentence naming what the student wants to "
     "know, instruction verbs and list markers stripped.\n"
-    "- concept (per point): one plain sentence stating the testable fact.\n"
+    "- concept (per point): one short plain sentence stating ONE testable fact.\n"
     "- terms: 2-4 strings per point, mostly two words.\n\n"
     "Return ONLY the JSON array. No prose, no code fences."
     )
@@ -591,11 +609,14 @@ _CREATE_SYSTEM = (
     '{"concept": "Graves disease is caused by IgG autoantibodies that stimulate '
     'the TSH receptor", "system": "Endocrine", "subsystem": "Thyroid", '
     '"topic": "graves_disease", "terms": ["Graves TSI", "Graves autoantibody"]}, '
-    '{"concept": "Thionamides inhibit thyroid peroxidase, and propylthiouracil '
-    'additionally blocks peripheral T4 to T3 conversion", '
+    '{"concept": "Thionamides inhibit thyroid peroxidase", '
     '"system": "Endocrine", "subsystem": "Thyroid", '
     '"topic": "graves_disease", "terms": ["carbimazole peroxidase", '
-    '"propylthiouracil conversion"]}]}]\n\n'
+    '"thionamide peroxidase"]}, '
+    '{"concept": "Propylthiouracil also blocks peripheral T4 to T3 conversion", '
+    '"system": "Endocrine", "subsystem": "Thyroid", '
+    '"topic": "graves_disease", "terms": ["propylthiouracil conversion", '
+    '"PTU peripheral"]}]}]\n\n'
 
     )
     + (
@@ -604,7 +625,7 @@ _CREATE_SYSTEM = (
     "gaps, never drop one, never invent one.\n"
     "- concept (per gap): one plain sentence naming what the student wants to "
     "know, instruction verbs and list markers stripped.\n"
-    "- concept (per point): one plain sentence stating the testable claim, "
+    "- concept (per point): one short plain sentence stating ONE testable fact, "
     "specific enough that a card could be written from it alone.\n"
     "- terms: 2-4 strings per point, mostly two words.\n\n"
     "Return ONLY the JSON array. No prose, no code fences."
@@ -710,7 +731,7 @@ _DECOMP_SEARCH_SYSTEM = (
     "RULES:\n"
     "- Emit one object for EVERY gap you were given, in order. Never merge two "
     "gaps, never drop one, never invent one.\n"
-    "- concept (per point): one plain sentence stating the testable fact.\n"
+    "- concept (per point): one short plain sentence stating ONE testable fact.\n"
     "- terms: 2-4 strings per point, mostly two words.\n\n"
     "Return ONLY the JSON array. No prose, no code fences."
     )
@@ -760,16 +781,19 @@ _DECOMP_CREATE_SYSTEM = (
     '{"concept": "Graves disease is caused by IgG autoantibodies that stimulate '
     'the TSH receptor", "system": "Endocrine", "subsystem": "Thyroid", '
     '"topic": "graves_disease", "terms": ["Graves TSI", "Graves autoantibody"]}, '
-    '{"concept": "Thionamides inhibit thyroid peroxidase, and propylthiouracil '
-    'additionally blocks peripheral T4 to T3 conversion", '
+    '{"concept": "Thionamides inhibit thyroid peroxidase", '
     '"system": "Endocrine", "subsystem": "Thyroid", '
     '"topic": "graves_disease", "terms": ["carbimazole peroxidase", '
-    '"propylthiouracil conversion"]}]}]\n\n'
+    '"thionamide peroxidase"]}, '
+    '{"concept": "Propylthiouracil also blocks peripheral T4 to T3 conversion", '
+    '"system": "Endocrine", "subsystem": "Thyroid", '
+    '"topic": "graves_disease", "terms": ["propylthiouracil conversion", '
+    '"PTU peripheral"]}]}]\n\n'
 
     "RULES:\n"
     "- Emit one object for EVERY gap you were given, in order. Never merge two "
     "gaps, never drop one, never invent one.\n"
-    "- concept (per point): one plain sentence stating the testable claim, "
+    "- concept (per point): one short plain sentence stating ONE testable fact, "
     "specific enough that a card could be written from it alone.\n"
     "- terms: 2-4 strings per point, mostly two words.\n\n"
     "Return ONLY the JSON array. No prose, no code fences."
@@ -893,6 +917,12 @@ def _plan_from_obj(obj: dict, kg: dict, *,
             terms=terms,
             kg_id=kg_id,
         ))
+    # ONE CARD PER POINT is the floor when writing. Points are single facts
+    # now, and gen_prompt._points_block CUTS the list to the budget — so a model
+    # that minted 12 points but guessed "cards": 10 would silently lose two
+    # facts. A budget the USER set (a lock) is theirs and is left alone.
+    if creating and plan.points and not lock.get("cards"):
+        plan.cards = clamp_cards(max(plan.cards, len(plan.points)))
     if not plan.points:
         plan.confidence = "low"
         plan.note = plan.note or (
@@ -1162,7 +1192,7 @@ def _decomp_prompt_line(kg: dict, obj: dict, n: int, *, creating: bool) -> str:
     word.
 
     The range is stated because it is the operative instruction — "broad" only
-    means "3 to 7 points" via a table the decompose prompt also carries, and
+    means "6 to 12 points" via a table the decompose prompt also carries, and
     saying both costs a dozen tokens and removes the chance of disagreement.
 
     Constraints ride along verbatim. They were read off the gap by the sort
@@ -1287,7 +1317,7 @@ def _pack_chunks(triples: list, *, creating: bool, size: int) -> list[list]:
     first measured run 29% idle: a chunk of three broad gaps took 118s while
     another took 25s, and the pool sat on its hands waiting for the long one.
     Sizing already told us what each gap will cost — a narrow gap mints one
-    point, a broad one up to seven — so the cost is known before any of these
+    point, a broad one up to twelve — so the cost is known before any of these
     calls is made, and there is no excuse for an unbalanced deal.
 
     Longest-processing-time-first, with a hard cap of `size` per bin: fill the
@@ -1653,7 +1683,7 @@ def plan_from_queued_gap(gap: dict) -> KGPlan | None:
     # the deck didn't cover.
     n_points = len(points)
     breadth = ("pinpoint" if n_points <= 1
-               else "core" if n_points <= 4
+               else "core" if n_points <= 6
                else "wide")
     try:
         cards = clamp_cards(int(gap.get("target_cards") or 0) or

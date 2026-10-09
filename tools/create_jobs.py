@@ -535,9 +535,21 @@ def _worker(rec: dict, cancel_ev) -> dict:
         # a card the model left unbolded gets its anchor back from the point it
         # was written for. Deterministic and local; see card_creator's
         # ensure_front_emphasis for why prompting alone doesn't finish the job.
-        cc.ensure_front_emphasis_for_job(cards, rec)
         cfg = tool_config("card_creator")
         profile = cc._resolved_profile(cfg, rec.get("profile_name", ""))
+        # LENGTH NET, before emphasis and grading: over-long fronts and the
+        # story cards past the 1-in-5 allowance are rewritten in one call, so
+        # what reaches the review screen is already AnKing-length. Cloze only
+        # (tighten_cards no-ops on a Q&A profile); fail-open.
+        if str(rec.get("card_word") or "cloze").lower() != "q&a":
+            cards, tightened = cc.tighten_cards(cards, profile, rec.get("model"))
+            if cancel_ev.is_set():
+                raise _Cancelled()
+            if tightened:
+                # Folded grades were written against the cards as they were;
+                # positions have moved (a split adds a card), so grade afresh.
+                same_call_grades = None
+        cc.ensure_front_emphasis_for_job(cards, rec)
         verdicts = cc.grade_cards_sync(
             cards, profile, cfg, same_call_grades=same_call_grades)
         return {

@@ -102,7 +102,8 @@ class _AllPoints:
         self.point = point
 
 
-def create_record_for(kg: dict, concept: str, points: list[dict]) -> dict:
+def create_record_for(kg: dict, concept: str, points: list[dict],
+                      style_examples: list[str] | None = None) -> dict:
     """One gap, flattened into the record shape the generation side reads.
 
     FLATTENED, not dict(kg): gen_prompt.build_generation_request and
@@ -147,6 +148,9 @@ def create_record_for(kg: dict, concept: str, points: list[dict]) -> dict:
         # One card per uncovered point is the honest default: the point IS the
         # thing the deck is missing.
         "target_cards": max(1, len(points)),
+        # Fronts of cards the search found for this gap, so the writer can see
+        # what the cards beside its own look like (gen_prompt's STYLE REFERENCE).
+        "style_examples": [str(x) for x in (style_examples or []) if str(x).strip()],
     }
 
 
@@ -2797,7 +2801,50 @@ class BulkSearchDialog(QDialog):
                 [{"concept": m.point.concept, "terms": list(m.point.terms),
                   "system": m.point.system, "subsystem": m.point.subsystem,
                   "topic": m.point.topic}
-                 for m in missing]))
+                 for m in missing],
+                style_examples=self._style_examples_for(kg_id)))
+        return out
+
+    # How many found-card fronts ride along as style examples, and the longest
+    # one allowed in. Six is enough to set a register without crowding the
+    # prompt; the length cap keeps the examples inside the limit the writer is
+    # held to — a 40-word AnKing card would teach the opposite lesson.
+    STYLE_EXAMPLES_MAX = 6
+
+    def _style_examples_for(self, kg_id: str) -> list[str]:
+        """Fronts of real cards from his deck on this gap's topic — the ones the
+        search found, ticked or not, chosen ones first — to show the writer the
+        length and directness to match. Cloze fronts only, images stripped,
+        within the word limit. Main thread (reads mw.col). Fail-open: no
+        examples is the old behaviour, never an error."""
+        out: list[str] = []
+        try:
+            if self._coverage is None or not kg_id:
+                return out
+            from .. import quality_pass as qp
+            nids: list[int] = []
+            for m in list(self._coverage.covered) + list(self._coverage.gaps):
+                if getattr(m.point, "kg_id", "") != kg_id:
+                    continue
+                for n in list(m.final) + list(m.candidates):
+                    if n not in nids:
+                        nids.append(n)
+            for nid in nids:
+                if len(out) >= self.STYLE_EXAMPLES_MAX:
+                    break
+                try:
+                    note = mw.col.get_note(int(nid))
+                except Exception:
+                    continue
+                front = note.fields[0] if note.fields else ""
+                if "{{c" not in front:
+                    continue
+                front = re.sub(r"<img[^>]*>", "", front).strip()
+                n_words = qp.front_word_count(front)
+                if 0 < n_words <= qp.MAX_FRONT_WORDS and front not in out:
+                    out.append(front)
+        except Exception as e:
+            log.warn(f"work through: style examples skipped: {e}")
         return out
 
     # ── taking the uncovered points elsewhere ───────────────────────────────
@@ -3131,7 +3178,8 @@ class BulkSearchDialog(QDialog):
         rec = create_record_for(kg, plan.concept, [{
             "concept": point.concept, "terms": list(point.terms),
             "system": point.system, "subsystem": point.subsystem,
-            "topic": point.topic}])
+            "topic": point.topic}],
+            style_examples=self._style_examples_for(kg_id))
         one = kg_triage.plan_from_queued_gap(rec)
         if one is None:
             showWarning("Couldn't turn that point into a generation plan — "
