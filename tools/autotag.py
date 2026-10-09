@@ -241,7 +241,18 @@ GROUP_LEVEL_LABELS = {
 # batch actually has to be told, since content classifies itself and the audit
 # tags write themselves. They are independent: a group can have either, both or
 # neither, and "neither" is the ordinary case.
-_PLAN_DEFAULTS = {"path": "", "absolute": False, "levels": "full", "source": ""}
+# `tag_as_group` is whether the batch tags as ONE branch at all. Ticked by
+# default, because a group is usually a subject — a lecture, a case — and every
+# card off it belongs under one node with the gap's own topic hanging beneath.
+# Unticked is for the group that is only a container: a placement, a week of
+# ward work, where the gaps have nothing in common but the day you had them and
+# a shared branch would say something untrue. Such a group still tags — by
+# content, and by its source — it just doesn't claim its members are one topic.
+# `levels` defaults to "topic", not "full": under a group's own head node, all
+# three levels make a deep duplicate of the content tree, and the content tag
+# already carries them. One level below the group is what tells its cards apart.
+_PLAN_DEFAULTS = {"path": "", "absolute": False, "levels": "topic", "source": "",
+                  "tag_as_group": True}
 
 
 def normalise_levels(value) -> str:
@@ -283,12 +294,17 @@ def normalise_override(raw) -> dict | None:
         # "segment" is the key the first version of this used for a plain path.
         path = clean_segment_path(raw.get("path") or raw.get("segment") or "")
         source = clean_source_path(raw.get("source") or "")
-        if not path and not source:
+        # An entry that says ONLY "don't tag these as a group" is a real
+        # override with nothing else in it. Bailing out on it read the group
+        # back as unconfigured and put the branch straight back on.
+        told = "tag_as_group" in raw
+        if not path and not source and not told:
             return None
         return {"path": path,
                 "absolute": bool(raw.get("absolute")),
                 "levels": normalise_levels(raw.get("levels", "full")),
-                "source": source}
+                "source": source,
+                "tag_as_group": bool(raw.get("tag_as_group", True))}
     return None
 
 
@@ -305,8 +321,10 @@ def group_override(name: str) -> dict | None:
 def group_tag_plan(name: str, *, path: str | None = None,
                    absolute: bool | None = None,
                    levels: bool | None = None,
-                   source: str | None = None) -> dict:
-    """How this group tags, resolved: {"path", "absolute", "levels"}.
+                   source: str | None = None,
+                   tag_as_group: bool | None = None) -> dict:
+    """How this group tags, resolved:
+    {"path", "absolute", "levels", "source", "tag_as_group"}.
 
     THE single answer every tag-building caller goes through. The keyword
     arguments override the saved values one field at a time, which is what lets
@@ -314,6 +332,12 @@ def group_tag_plan(name: str, *, path: str | None = None,
     config to do it."""
     plan = group_override(name) or dict(
         _PLAN_DEFAULTS, path=derive_group_segment(name))
+    # A saved override with no path of its own still gets the DERIVED segment,
+    # so a group that was only ever told its source still tags as one group.
+    # Left empty, such an override read as "this group has no branch" and the
+    # batch lost its shared tag the moment anyone set a source on it.
+    if not plan.get("path") and not plan.get("absolute"):
+        plan = dict(plan, path=derive_group_segment(name))
     if path is not None:
         cleaned = clean_segment_path(path)
         plan = dict(plan, path=cleaned or derive_group_segment(name))
@@ -323,6 +347,8 @@ def group_tag_plan(name: str, *, path: str | None = None,
         plan = dict(plan, levels=normalise_levels(levels))
     if source is not None:
         plan = dict(plan, source=clean_source_path(source))
+    if tag_as_group is not None:
+        plan = dict(plan, tag_as_group=bool(tag_as_group))
     return plan
 
 
@@ -408,14 +434,17 @@ def derive_group_segment(name: str) -> str:
 def group_tag_prefix(group: str) -> str:
     """The tag branch a group's cards live under, as an Anki search pattern.
 
-    For a RELATIVE group, a batch spans types — an SRS batch holds MQ, KG and LO
-    gaps alike — and the type segment sits above the group in the tag, so there
-    is no single literal prefix covering all of them. The '*' is doing real work:
+    A RELATIVE group's branch sits inside the content tree, under the fixed
+    content segment, so its prefix is literal:
 
-        !!Fleg::*::SRS::04
+        !!Fleg::KG::SRS::04
 
-    An ABSOLUTE group has no type segment above it, so its prefix is the branch
-    itself and needs no wildcard at all:
+    It used to be wildcarded (!!Fleg::*::SRS::04) because the second segment was
+    the gap's TYPE and a batch spans types. The type moved to the source axis;
+    the segment is the same for every card now and there is nothing to match.
+
+    An ABSOLUTE group has no content segment above it, so its prefix is the
+    branch itself:
 
         !!Curtanki::Year_3::SRS::02
 
@@ -427,24 +456,51 @@ def group_tag_prefix(group: str) -> str:
     Feed it to matcher.scope_query("tag", ...) to get a scope query. Returns ''
     when there's nothing to scope to, which every caller treats as no scope."""
     plan = group_tag_plan(group)
-    if plan["absolute"] and plan["path"]:
+    # Asked first, because a group told not to tag as one has no branch to
+    # scope to however its path is stored — scoping to a branch nothing carries
+    # reads as "you have nothing on this" rather than "this doesn't tag".
+    if plan.get("tag_as_group", True) and plan["absolute"] and plan["path"]:
         return plan["path"]
     if plan.get("source"):
         from ..core.config import source_tag
         tag = source_tag(plan["source"])
         if tag:
             return tag
-    if not plan["path"] or not group_override(group):
-        # A group with no saved override has a DERIVED segment, and nothing is
-        # ever tagged with it: tags_for() applies the group's branch only when
-        # the group owns one. Scoping to it returned a query that could only
-        # ever match zero cards, which reads as "you have nothing on this"
-        # rather than "this group has no branch".
+    if not plan["path"] or not plan.get("tag_as_group", True):
+        # Nothing is tagged with this group's segment — either it has none, or
+        # it was told not to tag as a group — so scoping to it would return a
+        # query that can only match zero cards, which reads as "you have
+        # nothing on this" rather than "this group has no branch".
+        #
+        # A DERIVED segment is no longer excluded here. It used to be, because
+        # nothing applied it; tags_for() applies it now, so the cards really
+        # are under it and the scope really does find them.
         return ""
     base = auto_tag_base()
     if not base:
         return ""
-    return f"{base.rstrip(':')}::*::{plan['path']}"
+    try:
+        from ..core.config import content_segment
+        seg = content_segment()
+    except Exception:
+        seg = "KG"
+    return f"{base.rstrip(':')}::{seg}::{plan['path']}" if seg else \
+           f"{base.rstrip(':')}::{plan['path']}"
+
+
+def group_branch(name: str, plan: dict | None = None) -> str:
+    """The head node every card in this group shares, or '' when it shares none.
+
+    The one question four different screens were each answering their own way,
+    all of them by asking `absolute` — which was right only while a relative
+    group tagged with nothing. Now that it does, they were all showing "no
+    branch" for the ordinary case."""
+    plan = plan if plan is not None else group_tag_plan(name)
+    if not plan.get("tag_as_group", True) or not plan.get("path"):
+        return ""
+    if plan.get("absolute"):
+        return str(plan["path"])
+    return tag_from_levels(None, group=name, group_plan=dict(plan, levels="none"))
 
 
 def tag_from_levels(levels: dict | None, kg_type_key: str | None = None,
@@ -499,10 +555,10 @@ def tag_from_levels(levels: dict | None, kg_type_key: str | None = None,
     # course work is, so "everything I have on the thyroid" misses every card
     # made from a case.
     #
-    # The two are no longer alternatives. This still returns the course path,
-    # because that is what the group asked for and what the tag box should
-    # show; the CONTENT tag comes back from content_tag_from_levels() and both
-    # are applied. See tags_for().
+    # This returns the course path, because that is what the group asked for
+    # and what the tag box should show. For an absolute group it is ALSO what
+    # content_tag_from_levels() returns, so the card carries one classification
+    # rather than two parallel ones. See tags_for().
     if plan["absolute"] and plan["path"]:
         if not any_kept:
             return plan["path"]
@@ -514,8 +570,26 @@ def tag_from_levels(levels: dict | None, kg_type_key: str | None = None,
         return tag or plan["path"]
 
     # ── relative: one segment inside the shared base ─────────────────────────
+    #
+    # This is the ordinary group's branch: a lecture, a topic block, anything
+    # that is one subject rather than one afternoon. It sits INSIDE the content
+    # tree deliberately — a group is not a fourth axis and nothing needs to
+    # record that these cards arrived together, only that they are all about
+    # the same thing:
+    #
+    #     !!Fleg::KG::Antiepileptics::Atypical
+    #     !!Fleg::KG::Antiepileptics::Typical
+    #
+    # One head node, the gap's own classification hanging under it to whatever
+    # depth `levels` asks for.
     base = auto_tag_base()
-    if not base or not levels:
+    if not base:
+        return ""
+    # An unclassified gap in a group still belongs to the group. It used to
+    # return nothing here, which is how a batch ended up half-tagged: the gaps
+    # that had been through Browse got the branch and the ones that hadn't got
+    # silence. The head node alone is a true statement about every one of them.
+    if not levels and not plan["path"]:
         return ""
     # The second segment is the CONTENT axis ("KG"), the same for every card.
     # It used to be the gap's TYPE, which filed an LO gap under {base}::LO:: and
@@ -610,9 +684,9 @@ def source_path_for(*, tool: str = "", kg_type_key: str = "",
     """The source path for a card, most specific first.
 
     An explicit `override` (what the user typed for this run) always wins. Then
-    the file, then the GROUP's own source, then the gap type, then whatever this
-    tool last used. "" means no source tag — which is a legitimate answer, not a
-    hole to fill with a guess.
+    the file, then the GROUP's own source, then the gap type. Only an UNGROUPED
+    run falls back to whatever this tool last used. "" means no source tag —
+    which is a legitimate answer, not a hole to fill with a guess.
 
     The group sits above the type deliberately: "GP Day 1" is something you
     said about this batch, and a type segment is a default that applies to
@@ -635,6 +709,17 @@ def source_path_for(*, tool: str = "", kg_type_key: str = "",
     from_type = source_for_type(kg_type_key)
     if from_type:
         return from_type
+    # THE STICKY VALUE NEVER CROSSES A GROUP. A group is the unit of provenance:
+    # if the group says nothing, this batch HAS no source, and the group dialog
+    # promises exactly that ("Leave it blank for course work — the course branch
+    # already says where it came from"). Falling through to the sticky made that
+    # promise a lie — one path typed once for one ad-hoc batch became the
+    # default for every group afterwards, so every gap in a Curtanki case came
+    # out tagged Sources::Murtaghs::other. Sticky is for ungrouped work only,
+    # which is the case it was written for: gaps you are capturing loose over a
+    # placement, with nothing else to carry the provenance.
+    if group:
+        return ""
     return sticky_source(tool) if tool else ""
 
 
@@ -675,11 +760,26 @@ def content_tag_from_levels(levels: dict | None, *, group: str = "",
                             group_plan: dict | None = None,
                             kg_type_key: str | None = None,
                             type_meta: dict | None = None) -> str:
-    """The CONTENT tag — {base}::KG::{system}::{subsystem}::{topic} — always
-    relative to the base, whatever the group is doing.
+    """The ONE tag that classifies this gap's cards — the tag the box shows, the
+    tag `auto_tag` caches, and the tag the retag pass searches by.
 
-    Separate from tag_from_levels because an absolute group deliberately
-    returns its own branch there. Both are wanted; neither replaces the other.
+    Ordinarily that is the content tag under the shared base:
+
+        {base}::KG::{system}::{subsystem}::{topic}
+
+    A COURSE BRANCH REPLACES IT. When the group owns an absolute branch of the
+    user's own tree and tags as one, that branch is where the work files:
+
+        !!Curtanki::Year_3::CIW::Concussion::mTBI
+
+    and nothing goes under {base}::KG at all. Both used to be applied, on the
+    argument that the content axis would otherwise have a hole exactly where
+    the course work was. In practice the hole is the lesser problem: a gap
+    filed in a case came out carrying two parallel classifications, so every
+    card the tool made from course work landed in two places at once — which is
+    the thing the three-axis scheme exists to stop. The course branch carries
+    the gap's own classification under it (to the group's `levels` depth), so
+    naming it is not a loss of detail, only of duplication.
 
     `kg_type_key` / `type_meta` are ACCEPTED AND IGNORED. They used to pick the
     second segment, which is exactly the mistake this function exists to undo —
@@ -688,6 +788,14 @@ def content_tag_from_levels(levels: dict | None, *, group: str = "",
     need editing to say the same thing, and so passing one is visibly a no-op
     rather than a silent difference.
     """
+    plan = (group_plan if group_plan is not None
+            else (group_tag_plan(group) if group else dict(_PLAN_DEFAULTS)))
+    # `tag_as_group` is asked as well as `absolute`: a group told not to tag as
+    # one applies no branch, and dropping the content tag for it would leave
+    # its cards with no classification whatsoever.
+    if (plan.get("absolute") and plan.get("path")
+            and plan.get("tag_as_group", True)):
+        return tag_from_levels(levels, group=group, group_plan=plan)
     base = auto_tag_base()
     if not base or not levels:
         return ""
@@ -712,10 +820,19 @@ def tags_for(levels: dict | None, *, group: str = "", tool: str = "",
     Order is the commit order and it is load-bearing (see
     tools/commit.tag_ops_for): most specific first.
 
-      1. content   {base}::KG::{system}::{subsystem}::{topic}
-      2. course    the group's own branch, when it has an absolute one
+      1. content   {base}::KG::{system}::{subsystem}::{topic} — UNLESS the
+                   group owns an absolute course branch, in which case that
+                   branch replaces it and this and (2) are the same tag. See
+                   content_tag_from_levels.
+      2. group     the branch every card in the batch shares, when the group
+                   tags as one (see _PLAN_DEFAULTS["tag_as_group"]). Either the
+                   group's own absolute branch (!!Curtanki::Year_3::SRS::02::KGs)
+                   or, far more often, a head node inside the content tree with
+                   the gap's classification under it
+                   (!!Fleg::KG::Antiepileptics::Atypical).
       3. source    {base}::Sources::{path}, when there is a source —
-                   the group's own source unless this run overrode it
+                   the group's own source, and nothing at all when the group
+                   has none (see source_path_for)
 
     Deduped case-insensitively, because Anki matches tags that way and two
     spellings of one tag are one tag with twice the clutter.
@@ -729,11 +846,15 @@ def tags_for(levels: dict | None, *, group: str = "", tool: str = "",
             seen.add(t.lower())
             out.append(t)
 
-    add(content_tag_from_levels(levels, group=group, group_plan=group_plan))
-    course = tag_from_levels(levels, group=group, group_plan=group_plan)
     plan = (group_plan if group_plan is not None else group_tag_plan(group))
-    if plan.get("absolute") and plan.get("path"):
-        add(course)
+    add(content_tag_from_levels(levels, group=group, group_plan=plan))
+    # The group's branch used to be applied ONLY when the group had an absolute
+    # path of its own, which meant every ordinary group — a lecture, a block,
+    # anything without a Curtanki case behind it — produced cards with no shared
+    # tag at all. "Everything from that antiepileptics lecture" was unanswerable
+    # for all but a handful of groups.
+    if plan.get("path") and plan.get("tag_as_group", True):
+        add(tag_from_levels(levels, group=group, group_plan=plan))
     add(source_tag_for(tool=tool, kg_type_key=kg_type_key,
                        lecture_path=lecture_path, group=group,
                        override=source_override))

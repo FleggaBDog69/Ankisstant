@@ -37,7 +37,7 @@ from ...core import anki_utils, api as core_api, log
 from ...core.config import tool_config, save_tool_config, tool_model_for
 from ...core.qt_utils import (
     attach_tag_completer, is_manual_provider, make_help_button,
-    provider_configured, theme_dialog,
+    provider_configured, resurface_at_home, theme_dialog,
 )
 from .. import autotag
 from .. import create_jobs
@@ -149,6 +149,13 @@ class MassCreateDialog(QDialog):
         self._after_read = None
         self._after_coverage = None
         self._auto_read_done = False
+        # Has the coverage check run against the points currently on the table?
+        # A plain flag rather than a signature of the plans, because the check
+        # ITSELF rewrites them (a fully-covered gap is unticked, a partly
+        # covered one loses points and card budget) — so any signature would
+        # stop matching the moment it succeeded and the chain would loop.
+        # Invalidated wherever the points or the scope change instead.
+        self._coverage_done = False
 
         self._kgs = [k for k in (kgs or []) if isinstance(k, dict)]
         self._by_id = {str(k.get("id") or ""): k for k in self._kgs}
@@ -322,6 +329,7 @@ class MassCreateDialog(QDialog):
             "strictly need and can untick it in review.")
         self._cov_cb.setChecked(bool(scope_cfg.get("enabled", False)))
         self._cov_cb.toggled.connect(self._sync_scope_enabled)
+        self._cov_cb.toggled.connect(self._invalidate_coverage)
         cov.addWidget(self._cov_cb)
 
         self._cov_kind = QButtonGroup(self)
@@ -331,11 +339,13 @@ class MassCreateDialog(QDialog):
         self._cov_kind.addButton(self._cov_tag_rb)
         (self._cov_deck_rb if scope_cfg.get("kind") == "deck" else self._cov_tag_rb).setChecked(True)
         self._cov_deck_rb.toggled.connect(self._sync_scope_completer)
+        self._cov_deck_rb.toggled.connect(self._invalidate_coverage)
         cov.addWidget(self._cov_deck_rb)
         cov.addWidget(self._cov_tag_rb)
 
         self._cov_value = QLineEdit(str(scope_cfg.get("value") or ""))
         self._cov_value.setPlaceholderText("deck or tag to check against")
+        self._cov_value.textChanged.connect(self._invalidate_coverage)
         cov.addWidget(self._cov_value, 1)
 
         # When the whole selection shares a group, that group's tag branch is
@@ -454,6 +464,11 @@ class MassCreateDialog(QDialog):
             if p.confidence == "low":
                 read.setText((p.concept or p.title) + "  ⚠")
             self._table.setItem(row, self._col_ix["What the AI read it as"], read)
+            # What the AI put in the cell, so an EDIT can be told from the
+            # untouched text. This column has been editable all along and its
+            # value was read back nowhere at all — typing in it did literally
+            # nothing. See _sync_reading.
+            p._read_shown = read.text()
 
             breadth = QComboBox()
             for key, meta in kg_triage.CREATE_BREADTHS.items():
@@ -578,6 +593,56 @@ class MassCreateDialog(QDialog):
         self._mark_user_set(row)
         self._refresh_title()
 
+    def _sync_reading(self) -> set:
+        """Persist a rewritten reading onto its gap. Returns the kg_ids changed.
+
+        The reading column has always been editable and _sync_plans never read
+        it back, so an edit here vanished the moment anything re-rendered the
+        table. Saved onto the gap as `read_as`, it becomes the subject the gap
+        is decomposed from (triage._kg_prompt_line) — which also invalidates
+        that gap's cached reading, so the correction takes on the next read
+        instead of being served the old answer forever.
+        """
+        rewritten: set = set()
+        col = self._col_ix["What the AI read it as"]
+        for row, p in enumerate(self._plans):
+            cell = self._table.item(row, col)
+            if cell is None:
+                continue
+            typed = cell.text().strip()
+            if typed == "— not read yet —":
+                typed = ""
+            if typed == str(getattr(p, "_read_shown", "") or "").strip():
+                continue                      # untouched
+            kg = self._by_id.get(p.kg_id)
+            if kg is None:
+                continue
+            if typed == str(kg_store.field(kg, "read_as") or "").strip():
+                continue                      # already saved
+            fields = dict(kg.get("fields") or {})
+            if typed:
+                fields["read_as"] = typed
+            else:
+                fields.pop("read_as", None)   # cleared: back to the title
+            kg["fields"] = fields
+            try:
+                updated = kg_store.update(str(kg.get("id") or ""), fields=fields)
+                if updated:
+                    self._by_id[p.kg_id] = updated
+            except Exception as e:
+                log.warn(f"mass create: couldn't save the reading for "
+                         f"{p.kg_id}: {e}")
+            p._read_shown = typed
+            rewritten.add(p.kg_id)
+        self._reworded = set(getattr(self, "_reworded", set())) | rewritten
+        if rewritten:
+            # New wording means new points, so the last coverage answer was
+            # about a different question. Invalidated HERE rather than at each
+            # call site: _on_read and _on_generate both sync the readings, and
+            # only one of them was remembering to.
+            self._invalidate_coverage()
+        return rewritten
+
     def _sync_plans(self) -> None:
         """Fold every live widget value back into the plans, immediately before
         a run — so what is on screen is what runs."""
@@ -645,6 +710,37 @@ class MassCreateDialog(QDialog):
         only = groups.pop()
         return only
 
+    def _invalidate_coverage(self, *_a) -> None:
+        """The last coverage answer no longer describes what is on the table.
+
+        Called wherever the points or the scope change: a fresh read, a
+        rewritten reading, and every scope widget. Cheap and deliberately
+        over-eager — re-running the check costs a search, running the batch
+        against a stale one costs cards."""
+        self._coverage_done = False
+
+    def _continue_after_read(self, then) -> bool:
+        """Reading and coverage-checking are one thought, not two buttons: the
+        answer to "what should I write?" is incomplete until you know what the
+        deck already has. So when a scope is set, the check follows the read.
+
+        Called from BOTH ends of _on_read — the one that actually calls the AI
+        and the one that finds every ticked gap already planned by Mass AI
+        Search. That second path used to run `then` directly, which skipped the
+        check entirely in exactly the sequence the scope prefill exists for:
+        search a group, tag what it found, then create the residue.
+
+        Returns False when there was nothing to do — the caller says so.
+        """
+        _kind, value = self._scope_settings()
+        if self._cov_cb.isChecked() and value and not self._coverage_done:
+            self._on_check_coverage(then=then)
+            return True
+        if then is not None:
+            then()
+            return True
+        return False
+
     def _scope_settings(self) -> tuple[str, str]:
         if not self._cov_cb.isChecked():
             return "", ""
@@ -689,17 +785,16 @@ class MassCreateDialog(QDialog):
         if not self._backgrounded:
             return
         self._backgrounded = False
-        try:
-            self.show()
-            self.raise_()
-            self.activateWindow()
-        except RuntimeError:
-            self._closed = True
+        resurface_at_home(self)
 
     # ── stage 1: read gaps with AI ───────────────────────────────────────────
 
-    def _on_read(self, then=None) -> None:
+    def _on_read(self, *_a, then=None) -> None:
         """Read the ticked gaps with AI.
+
+        `*_a` swallows the `checked` bool QPushButton.clicked hands a slot that
+        can take one — without it the button set `then` to False and the run
+        ended by trying to call it.
 
         `then` is what to run once the reading has landed — used to chain
         Read → coverage check → Generate, so pressing Generate on an unread
@@ -707,6 +802,7 @@ class MassCreateDialog(QDialog):
         button next to it first.
         """
         self._after_read = then
+        self._sync_reading()
         self._sync_plans()
         # A gap already planned by Mass AI Search is left alone: its points were
         # measured against the deck, and re-reading them would cost tokens to
@@ -718,15 +814,23 @@ class MassCreateDialog(QDialog):
             kg = self._by_id.get(p.kg_id)
             if kg is None:
                 continue
-            if p.ok and kg_triage.plan_from_queued_gap(kg) is not None:
+            if (p.ok and kg_triage.plan_from_queued_gap(kg) is not None
+                    and p.kg_id not in getattr(self, "_reworded", set())):
                 pre_planned += 1
                 continue
             todo.append(kg)
+        # These gaps are being read now, so the rewrites they were queued for
+        # are spent. Cleared here rather than after the call so a read that
+        # fails doesn't leave them queued to force another one.
+        self._reworded = set()
         if not todo:
             self._after_read = None
-            if pre_planned and then is not None:
-                then()          # already planned — the chain still continues
-                return
+            if pre_planned:
+                # Already planned by Mass AI Search. Nothing to read — but the
+                # coverage check still has to run, so this goes through the
+                # same continuation as a real read instead of calling `then`.
+                if self._continue_after_read(then):
+                    return
             tooltip("Nothing left to read — every ticked gap is already planned."
                     if pre_planned else "Tick at least one gap first.")
             return
@@ -745,8 +849,9 @@ class MassCreateDialog(QDialog):
 
         def _bg():
             from ..lecture.panel import _Heartbeat
-            with _Heartbeat(_report, f"Reading {len(todo)} gap(s) with AI…", 0):
-                return kg_triage.triage_create(todo, model=model, locks=locks)
+            with _Heartbeat(_report, f"Reading {len(todo)} gap(s) with AI…", 0) as hb:
+                return kg_triage.triage_create(todo, model=model, locks=locks,
+                                               report=hb.set_base)
 
         mw.taskman.run_in_background(
             _bg, lambda fut: self._on_read_done(fut, todo), uses_collection=False)
@@ -795,20 +900,23 @@ class MassCreateDialog(QDialog):
             msg += f" {low} came back unsure — check the ⚠ rows before generating."
         self._set_status(msg)
 
-        # Reading and coverage-checking are one thought, not two buttons: the
-        # answer to "what should I write?" is incomplete until you know what the
-        # deck already has. So when a scope is set, the check follows the read.
+        # These are new points, so whatever the last coverage check concluded
+        # was about the old ones.
+        self._invalidate_coverage()
         then, self._after_read = self._after_read, None
-        _kind, value = self._scope_settings()
-        if self._cov_cb.isChecked() and value:
-            self._on_check_coverage(then=then)
-        elif then is not None:
-            then()
+        self._continue_after_read(then)
 
     # ── stage 2: generate ────────────────────────────────────────────────────
 
     def _on_generate(self) -> None:
         if not anki_utils.require_col():
+            return
+        # A rewritten reading is a different subject, so the gap is read again
+        # from it before anything gets written. Generating first would write
+        # cards from the points the OLD wording produced, which is the edit
+        # being ignored in a slower and more expensive way.
+        if self._sync_reading():
+            self._on_read(then=self._on_generate)
             return
         self._sync_plans()
         plans = self._active_plans()
@@ -826,7 +934,28 @@ class MassCreateDialog(QDialog):
                 showWarning("Those gaps couldn't be read, so there's nothing to "
                             "generate from. Try Read gaps with AI again.")
                 return
+            # "Tick at least one gap" is the wrong thing to say when the
+            # coverage check is what unticked them all.
+            if self._coverage_done and any(
+                    getattr(p, "_covered_label", "") for p in self._plans):
+                showWarning(
+                    "Every gap here is already covered in that scope, so "
+                    "there's nothing left to write.\n\nUntick the coverage box "
+                    "to write them anyway, or re-tick individual gaps.")
+                return
             showWarning("Tick at least one gap first.")
+            return
+
+        # The coverage box governs the RUN, not just the button next to it.
+        # Ticked, with a scope, and not yet checked against these points: the
+        # check goes first. It used to be chained only off a read that actually
+        # called the AI, so pressing Generate on an already-read table — or on
+        # gaps Mass AI Search had already planned — wrote cards for everything
+        # while the box sat there claiming otherwise.
+        _kind, cov_value = self._scope_settings()
+        if self._cov_cb.isChecked() and cov_value and not self._coverage_done:
+            self._set_status("Checking what your deck already covers first…")
+            self._on_check_coverage(then=self._on_generate)
             return
 
         budget = kg_triage.total_cards(plans)
@@ -1226,8 +1355,11 @@ class MassCreateDialog(QDialog):
 
     # ── coverage check ───────────────────────────────────────────────────────
 
-    def _on_check_coverage(self, then=None) -> None:
+    def _on_check_coverage(self, *_a, then=None) -> None:
         """Search the named deck/tag for each point, and drop the ones it covers.
+
+        `*_a` for the same reason as _on_read: clicked() passes `checked`, which
+        landed in `then` and was called as a function when the check finished.
 
         Reuses the AI Lecture pipeline exactly as bulk search does — passing
         `points` short-circuits extraction, so everything from the deck search
@@ -1289,13 +1421,20 @@ class MassCreateDialog(QDialog):
         then, self._after_coverage = self._after_coverage, None
         try:
             _lecture, _matches, coverage = fut.result()
+        # Both exits leave _coverage_done False, so Generate will offer to run
+        # the check again rather than quietly writing the whole batch. Say so:
+        # the check now gates generation, and "untick the box" is the way past
+        # a scope that can't be searched.
         except core_api.ClaudeCancelled:
-            self._set_status("Stopped.")
+            self._set_status("Coverage check stopped — untick the coverage box "
+                             "to generate without it.")
             return
         except Exception as e:
             log.error(f"mass create: coverage check failed: {e}")
             self._set_status("Coverage check failed.")
-            showWarning(f"Couldn't check coverage:\n\n{e}")
+            showWarning(f"Couldn't check coverage:\n\n{e}\n\nGenerate will "
+                        "offer to try again. Untick the coverage box to write "
+                        "these gaps without checking.")
             return
 
         # matcher.Coverage already splits the points into covered/gaps — that's
@@ -1333,6 +1472,7 @@ class MassCreateDialog(QDialog):
                 p.points = keep
             else:
                 untouched += 1
+        self._coverage_done = True
         self._render_plan_table()
         self._set_status(
             f"Coverage check done — {dropped_total} point(s) already covered in that "
@@ -1424,6 +1564,12 @@ def commit_ctx_for(job: dict, profile: dict, tags: list):
         kg_notes=str(job.get("kg_notes") or ""),
         kg_concept=str(job.get("kg_concept") or ""),
         kg_explanation=str(job.get("kg_explanation") or ""),
+        # The gap's reading list. Off the job where the queue carried it, off
+        # the gap record otherwise — an older job predates the key.
+        kg_resources=list(
+            job.get("kg_resources")
+            or (job.get("gap") if isinstance(job.get("gap"), dict) else {})
+            .get("resources") or []),
         type_meta=job.get("type_meta") if isinstance(job.get("type_meta"), dict) else None,
         # From the GAP, not the job: the worker persists AI-written field values
         # back onto the gap record (create_jobs._apply_result_main_thread), so

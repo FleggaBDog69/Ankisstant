@@ -442,6 +442,26 @@ def _worker(rec: dict, cancel_ev) -> dict:
     from . import card_creator as cc
     from ..core.config import tool_config
     core_api.set_cancel_event(cancel_ev)
+    # Live guideline grounding, if the job asked for it. Done HERE and not where
+    # the prompt was assembled because it is blocking HTTP, once per source, and
+    # the assembly runs on the main thread with the user watching the window. A
+    # failure leaves the card ungrounded rather than unwritten.
+    gl = rec.get("grounding_live")
+    if isinstance(gl, dict):
+        try:
+            from ..grounding import guidelines as _grounding
+            block = _grounding.build_guidelines_block(
+                str(gl.get("topic") or ""),
+                [str(t) for t in (gl.get("tags") or [])],
+                fetch_content=True)
+            if block:
+                # A copy: `rec` is the caller's job record, and a worker that
+                # rewrote it would leave the fetched page text sitting in the
+                # job store for every later read of that job.
+                rec = dict(rec)
+                rec["system_prompt"] = (rec.get("system_prompt") or "") + "\n\n" + block
+        except Exception as e:
+            print(f"[ankisstant] live grounding skipped: {e}")
     try:
         if rec.get("slide_mode"):
             # Slide-by-slide: one AI call per rendered page (basename-sorted so
@@ -511,6 +531,11 @@ def _worker(rec: dict, cancel_ev) -> dict:
             from . import autotag
             merged_tag_levels = autotag.classify(
                 rec.get("tag_material", ""), model=rec.get("model"))
+        # FRONT EMPHASIS repair, before grading and before the review screen —
+        # a card the model left unbolded gets its anchor back from the point it
+        # was written for. Deterministic and local; see card_creator's
+        # ensure_front_emphasis for why prompting alone doesn't finish the job.
+        cc.ensure_front_emphasis_for_job(cards, rec)
         cfg = tool_config("card_creator")
         profile = cc._resolved_profile(cfg, rec.get("profile_name", ""))
         verdicts = cc.grade_cards_sync(
@@ -570,8 +595,46 @@ def _apply_result_main_thread(job_id: str, result: dict) -> None:
         # from the levels the model returned ("…::KGs::Smegma"). Both are the
         # same tag to Anki, so appending the second only puts two spellings of
         # one tag on every note.
+        #
+        # A near-match is the same problem and case-folding does not catch it.
+        # The box is filled from the levels the READ produced and the auto-tag
+        # from the levels the WRITE produced — two guesses at one classification,
+        # which is how a card ends up under both
+        # "…KG::OBGYN::AbortionCare" and "…KG::ObstetricsGynaecology::Termination".
+        # One card in two content branches is the exact thing this scheme exists
+        # to stop, so when the door has already put a content tag on, that one
+        # stands: it is the one on screen and the one the student could edit.
+        try:
+            from ..core.config import auto_tag_base, content_segment
+            _b, _s = (auto_tag_base() or "").rstrip(":"), content_segment()
+            head = f"{_b}::{_s}::".lower() if _b and _s else ""
+        except Exception:
+            head = ""
+        door_tag = next((str(t) for t in tags_raw
+                         if head and str(t).lower().startswith(head)), "")
+        if auto_tag and door_tag and door_tag.lower() != auto_tag.lower():
+            print(f"[ankisstant] job {job_id}: content tag already set to "
+                  f"{door_tag!r}; dropping the second opinion {auto_tag!r}")
+            auto_tag = door_tag
+            # …and the gap remembers the tag that actually went on, so a later
+            # "Retag group" can find these cards by it.
+            if gap is not None:
+                try:
+                    cc.cache_auto_tag(gap, door_tag)
+                except Exception as e:
+                    print(f"[ankisstant] job {job_id} tag cache skipped: {e}")
         if auto_tag and auto_tag.lower() not in {t.lower() for t in tags_raw}:
             tags_raw.append(auto_tag)
+        # …and the rest of the scheme: the group's shared branch, the batch's
+        # source, the month. Every door that WRITES cards funnels through here,
+        # so this is the one place that had to know — and the one place that
+        # didn't. Deduped case-insensitively against what the door already set.
+        if gap is not None:
+            have = {t.lower() for t in tags_raw}
+            for t in cc.scheme_tags_for_gap(gap, levels, content_tag=auto_tag):
+                if t.lower() not in have:
+                    have.add(t.lower())
+                    tags_raw.append(t)
     except Exception as e:
         print(f"[ankisstant] job {job_id} auto-tag skipped: {e}")
 

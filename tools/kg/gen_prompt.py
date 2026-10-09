@@ -13,14 +13,26 @@
 # is only the legs a KG can't have:
 #
 #   no URL fetch, no PDF/PPTX ingestion, no slide mode, no lecture-match,
-#   no auto-image query, no grounding block (topic grounding keys off a typed
-#   topic and a per-batch checkbox that doesn't exist here)
+#   no auto-image query
+#
+# Source grounding IS here, though it was once on that list. The reason it was
+# excluded — "topic grounding keys off a typed topic and a per-batch checkbox
+# that doesn't exist here" — turned out to be a description of the panel's
+# plumbing rather than of the feature. The gap's concept is a typed topic by
+# any other name, and the per-batch checkbox only ever reflected the global
+# toggle plus the notetype override, both of which are readable from here. So
+# a card written for a gap now cites the same guideline allow-list a card
+# written in AI Create does, and the two stop disagreeing about what a real
+# source is.
 #
 # That's what keeps this file short enough to read, and keeps the refactor of
 # card_creator down to one optional kwarg.
 #
-# PURE: no Qt, no mw.col, no AI calls. Everything it touches is config or plain
-# data, so it is safe to call from the dialog's main thread before enqueueing.
+# PURE: no Qt, no mw.col, no AI calls, NO NETWORK. Everything it touches is
+# config or plain data, so it is safe to call from the dialog's main thread
+# before enqueueing. That is why live guideline fetching isn't done here but
+# handed to the worker as `grounding_live` — twelve gaps is twelve blocking
+# HTTP round trips, and this runs while the user is looking at the window.
 
 from __future__ import annotations
 
@@ -141,6 +153,31 @@ def build_generation_request(*, kg: dict, plan, profile: dict, cfg: dict,
     if not is_qa:
         system_prompt += cc._gen_atomicity_note(cc._atomicity_max(cfg))
 
+    # ── source grounding ────────────────────────────────────────────────────
+    # The same gate AI Create uses: the global toggle, overridden per notetype.
+    # Mode is always "topic" here — a gap is a subject, never a pasted document
+    # — which is exactly the case grounding is for.
+    #
+    # Fail-open throughout. A guideline block that won't build is worth an
+    # ungrounded card, not a gap that doesn't get written at all.
+    grounding_live = None
+    try:
+        if cc._grounding_active(cfg, profile, "topic") and topic_label:
+            # The gap's own tags are the specialty signal — the same list the
+            # panel passes from its tag box.
+            match_tags = [str(t) for t in (kg.get("tags") or []) if str(t).strip()]
+            if cc._grounding_fetch_live(cfg):
+                # Deferred, not skipped: the worker builds this one off-thread.
+                grounding_live = {"topic": topic_label, "tags": match_tags}
+            else:
+                from ...grounding import guidelines as grounding
+                block = grounding.build_guidelines_block(
+                    topic_label, match_tags, fetch_content=False)
+                if block:
+                    system_prompt += "\n\n" + block
+    except Exception as e:
+        log.error(f"mass create: grounding injection skipped: {e}")
+
     skill_invocation, skill_id = cc._resolve_skill(profile)
     no_skill = not skill_id and not skill_invocation
 
@@ -213,6 +250,8 @@ def build_generation_request(*, kg: dict, plan, profile: dict, cfg: dict,
         "cached_tag": cached_tag,
         "tag_material": tag_material,
         "max_tokens": max_tokens_for(n),
+        # None unless live fetching is on; see the grounding block above.
+        "grounding_live": grounding_live,
     }
 
 
@@ -275,6 +314,7 @@ def build_job_record(*, req: dict, kg: dict, plan, batch_id: str,
         "kg_notes": str(kg.get("notes") or ""),
         "kg_concept": str(kg.get("concept") or "").strip() if is_mq else "",
         "kg_explanation": str(kg.get("explanation") or "").strip() if is_mq else "",
+        "kg_resources": list(kg.get("resources") or []),
         # No panel, no attachments, no slides — mass create is topic-only.
         "panel_image_filenames": [],
         "attachment_paths": [],
@@ -295,6 +335,11 @@ def build_job_record(*, req: dict, kg: dict, plan, batch_id: str,
         "want_tag": bool(req["want_tag"]),
         "want_explanation": bool(req["want_explanation"]),
         "cached_tag": req["cached_tag"],
+        # Set only when "fetch live" is on. create_jobs._worker builds the
+        # guideline block from it on its own thread and appends it to the
+        # system prompt there — the fetch is network I/O and must not happen
+        # on the main thread, where this record is assembled.
+        "grounding_live": req.get("grounding_live"),
         # want_auto drives a SEPARATE classification call in the worker, and is
         # only for skill flows that forced a bare reply. With no skill the tag is
         # folded into the object reply (merge_tag) and this must stay off or the

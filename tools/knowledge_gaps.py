@@ -25,9 +25,11 @@ from aqt.qt import (
     QColor, QListWidgetItem, QMenu, QMessageBox, QPlainTextEdit, QPushButton,
     QRect,
     QScrollArea,
-    QSizePolicy, QSplitter, QStyle, QStyledItemDelegate, QStyleOptionViewItem,
+    QSizePolicy, QSplitter, QStackedWidget, QStyle, QStyledItemDelegate,
+    QStyleOptionViewItem,
     QHeaderView, QTableWidget, QTableWidgetItem,
-    Qt, QTextEdit, QTimer, QVBoxLayout, QWidget,
+    QKeySequence, QShortcut,
+    Qt, QTimer, QVBoxLayout, QWidget,
 )
 from aqt.utils import askUser, showWarning, tooltip
 
@@ -43,7 +45,6 @@ from ..core.qt_utils import (
 )
 from . import autotag
 from .kg import importers, store as kg_store
-from . import commit
 from . import pipeline
 
 
@@ -67,6 +68,53 @@ def _queue_owner(widget):
         return None
 
 
+def _gap_items(lst) -> list:
+    """Every gap row in a list, in page order. Headers are skipped."""
+    return [it for it in (lst.item(i) for i in range(lst.count()))
+            if isinstance(it, _KGListItem)]
+
+
+# A gap's tick box is its Closed state (see _KGListItem.refresh), so there is
+# no separate tick set to load, save or push onto the rows any more. The old
+# helpers read and wrote kg/ticks.py, which nothing calls now.
+
+
+def open_anki_browse(title: str, *, as_tag: bool) -> None:
+    """Open Anki's Browse window on this title — as a tag search or a card one.
+
+    Tags can't hold spaces, so the tag form joins the words with the underscore
+    Anki uses and wraps the lot in wildcards: "aortic stenosis" becomes
+    tag:*aortic_stenosis*, which matches it at any depth of your tree. The card
+    form is the bare title, unquoted — so Anki reads it as one term per word
+    and ANDs them, which finds a card whose wording isn't the gap's wording.
+    Quoting it would demand that exact phrase and find far less.
+
+    Deliberately NOT the gap's computed auto-tag. That tag is what a card WILL
+    be filed under once one exists; this button is for finding what is already
+    there, which was very often filed by hand under something close but not
+    identical."""
+    title = " ".join(str(title or "").split())
+    if not title:
+        tooltip("That gap has no title to search for.")
+        return
+    # Unquoted, both of them. The tag form needs no quotes — the underscores
+    # have already made it one word — and the card form is better off without
+    # them, as a set of ANDed words rather than one exact phrase.
+    if as_tag:
+        query = "tag:*{}*".format(title.replace(" ", "_").replace('"', ""))
+    else:
+        query = title.replace('"', "")
+    try:
+        from aqt import dialogs
+        browser = dialogs.open("Browser", mw)
+        browser.activateWindow()
+        browser.raise_()
+        browser.search_for(query)
+    except Exception as e:
+        print(f"[ankisstant] couldn't open Anki's browser: {e}")
+        showWarning(f"Couldn't open Anki's Browse screen:\n\n{e}")
+
+
 SOURCE_LABELS = {
     "manual":  "Manual",
     "analyse": "Analyse",
@@ -75,10 +123,18 @@ SOURCE_LABELS = {
     "chat":    "AI chat",
 }
 
+# Two states, and only two: Open or Closed.
+#
+# The store still carries "in_progress" and a `dismissed` flag — older records
+# have them, and bulk_search and mass_create still set in_progress when they
+# take a gap. Neither is a state you can pick or see any more. in_progress
+# READS as Open, because a gap handed to a tool is still a gap you haven't
+# closed; dismissed reads as Closed, because "closed without a card" and
+# "closed with one" were never worth a checkbox of their own.
 STATUS_LABELS = {
     "open":        "Open",
-    "in_progress": "In progress",
-    "done":        "Done",
+    "in_progress": "Open",
+    "done":        "Closed",
 }
 
 
@@ -147,12 +203,90 @@ def _format_levels(kg: dict) -> str:
     return " :: ".join(l for l in levels if l)
 
 
+def wake_group(name: str) -> list[str]:
+    """Bring a group back onto the page because work has just gone into it.
+
+    Archiving and collapsing are both pure UI state for a batch you are
+    finished with — neither touches a gap. That makes them a trap the moment
+    you file something new into an old batch: the gap is saved, the group is
+    still archived, the Groups page still hides it (unless "Show archived" is
+    on) and its section on the Gaps page is still collapsed, so the gap reads
+    as lost. A group with new work in it is by definition not finished, so
+    putting a gap in one wakes it up rather than making you go looking.
+
+    Returns the states it cleared ("archived", "collapsed") so the caller can
+    say what happened. One read-modify-write of the tool slice, the house
+    pattern — three saves is three chances to drop the other settings.
+    """
+    name = str(name or "").strip()
+    if not name:
+        return []
+    cleared: list[str] = []
+    try:
+        cfg = tool_config("knowledge_gaps")
+        for key, label in (("archived_groups", "archived"),
+                           ("collapsed_groups", "collapsed")):
+            cur = [str(g) for g in (cfg.get(key) or [])]
+            if name in cur:
+                cfg[key] = [g for g in cur if g != name]
+                cleared.append(label)
+        if cleared:
+            save_tool_config("knowledge_gaps", cfg)
+    except Exception as e:
+        # A failed save costs the group's visibility, not the gap.
+        print(f"[ankisstant] couldn't wake group {name!r}: {e}")
+        return []
+    return cleared
+
+
+def wake_groups(names) -> list[str]:
+    """wake_group over a batch, in ONE config write. Returns the groups woken.
+
+    A markdown import or an inbox drain can land gaps in a dozen groups at
+    once; looping wake_group would save the tool slice a dozen times, which is
+    a dozen chances to drop the rest of the settings."""
+    wanted = [n for n in dict.fromkeys(str(g or "").strip() for g in names) if n]
+    if not wanted:
+        return []
+    woken: list[str] = []
+    try:
+        cfg = tool_config("knowledge_gaps")
+        dirty = False
+        for key in ("archived_groups", "collapsed_groups"):
+            cur = [str(g) for g in (cfg.get(key) or [])]
+            hit = [n for n in wanted if n in cur]
+            if hit:
+                cfg[key] = [g for g in cur if g not in set(hit)]
+                woken.extend(hit)
+                dirty = True
+        if dirty:
+            save_tool_config("knowledge_gaps", cfg)
+    except Exception as e:
+        print(f"[ankisstant] couldn't wake groups: {e}")
+        return []
+    return list(dict.fromkeys(woken))
+
+
+def _woke_suffix(cleared: list[str]) -> str:
+    """The tail of a tooltip explaining that a put-away group came back."""
+    if not cleared:
+        return ""
+    return " — group un" + " and un".join(cleared) + "."
+
+
 # ── Add KG modal ─────────────────────────────────────────────────────────────
 
 class AddKGDialog(QDialog):
-    """Quick modal for the ＋ Add KG button (home screen + sidebar)."""
+    """Quick modal for the ＋ Add KG button (home screen + sidebar).
 
-    def __init__(self, parent=None):
+    `group` prefills the Group box. It is a prefill and not a hidden setting on
+    purpose: every door into this dialog knows something about which batch you
+    are working in (a group picked on the Groups page, a marked header, a
+    `group:` filter), and the old dialog threw all of it away — so filing a gap
+    meant saving it ungrouped and then opening a second dialog to move it.
+    """
+
+    def __init__(self, parent=None, group: str | None = None):
         super().__init__(parent or mw)
         self.setWindowTitle("＋ Add Knowledge Gap")
         self.setMinimumWidth(520)
@@ -182,6 +316,30 @@ class AddKGDialog(QDialog):
             self._type.setCurrentIndex(idx)
         type_row.addWidget(self._type, 1)
         layout.addLayout(type_row)
+
+        # Group — the batch this gap came in with. Editable, so a new batch can
+        # be started here rather than in Manage groups first.
+        group_row = QHBoxLayout()
+        group_row.addWidget(QLabel("<b>Group</b>"))
+        self._group = QComboBox()
+        self._group.setEditable(True)
+        self._group.addItem("")                      # blank = ungrouped
+        for g in kg_store.groups():
+            self._group.addItem(g)
+        self._group.setCurrentText(str(group or "").strip())
+        self._group.setToolTip(
+            "The batch this gap belongs to — an SRS, a week, a placement. "
+            "Leave blank to file it later.")
+        group_row.addWidget(self._group, 1)
+        layout.addLayout(group_row)
+        self._group_hint = QLabel("")
+        self._group_hint.setStyleSheet("color: gray; font-size: 10px;")
+        self._group_hint.setTextFormat(Qt.TextFormat.RichText)
+        self._group_hint.setWordWrap(True)
+        layout.addWidget(self._group_hint)
+        # Connected only once the label it writes into exists.
+        self._group.editTextChanged.connect(self._refresh_group_hint)
+        self._refresh_group_hint()
 
         layout.addWidget(QLabel("<b>Tags</b> <span style='color:gray;font-size:10px'>"
                                 "(space-separated; optional)</span>"))
@@ -228,6 +386,41 @@ class AddKGDialog(QDialog):
         theme_dialog(self)
         self._title.setFocus()
 
+    def _refresh_group_hint(self, *_a) -> None:
+        """Say what the group will tag, and whether it is one you put away.
+
+        The second half matters more than the first: filing into an archived
+        batch used to be silent, and this is the one place you can still see it
+        before the gap is written."""
+        name = self._group.currentText().strip()
+        if not name:
+            self._group_hint.setText("")
+            return
+        bits: list[str] = []
+        try:
+            branch = autotag.group_branch(name)
+        except Exception:
+            branch = ""
+        if branch:
+            bits.append("Tags <code>" + _html.escape(branch) + "</code>")
+        known = set(kg_store.groups())
+        if name not in known:
+            bits.append("new group")
+        else:
+            try:
+                cfg = tool_config("knowledge_gaps")
+                put_away = [
+                    label for key, label in (("archived_groups", "archived"),
+                                             ("collapsed_groups", "collapsed"))
+                    if name in [str(g) for g in (cfg.get(key) or [])]
+                ]
+            except Exception:
+                put_away = []
+            if put_away:
+                bits.append(" and ".join(put_away)
+                            + " — saving here brings it back")
+        self._group_hint.setText(" · ".join(bits))
+
     def _on_attach_image(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(
             self, "Attach image(s)",
@@ -267,6 +460,7 @@ class AddKGDialog(QDialog):
         tags = [t for t in self._tags.text().split() if t.strip()]
         notes = self._notes.toPlainText().strip()
         kg_type = self._type.currentData() or "kg"
+        group = self._group.currentText().strip()
         fields: dict = {}
         if self._image_filenames:
             fields["images"] = list(self._image_filenames)
@@ -275,10 +469,13 @@ class AddKGDialog(QDialog):
             source="manual",
             type=kg_type,
             status="open",
+            group=group,
             tags=tags,
             notes=notes,
             fields=fields,
         )
+        if group:
+            tooltip(f"Added to “{group}”{_woke_suffix(wake_group(group))}")
         refresh_deck_browser()
         # Tell any open KG panel to reload.
         try:
@@ -288,8 +485,8 @@ class AddKGDialog(QDialog):
         self.accept()
 
 
-def open_add_kg_dialog() -> None:
-    dlg = AddKGDialog()
+def open_add_kg_dialog(group: str | None = None) -> None:
+    dlg = AddKGDialog(group=group)
     dlg.show()
     dlg.raise_()
     dlg.activateWindow()
@@ -335,15 +532,29 @@ class _KGGroupHeader(QListWidgetItem):
 
     Enabled but not selectable, so it can still be right-clicked and clicked to
     collapse while never entering `selectedItems()` — which is what keeps every
-    existing bulk action working untouched."""
+    existing bulk action working untouched. Selecting SEVERAL groups therefore
+    can't use the list's own selection model; it is `marked`, a flag the panel
+    sets on Cmd-click and reads back off the headers."""
 
     def __init__(self, name: str, total: int, open_n: int, collapsed: bool,
-                 done_n: int = 0, archived: bool = False):
+                 done_n: int = 0, archived: bool = False,
+                 marked: bool = False, checked: str = "off"):
         super().__init__()
         self.group_name = name
         self.collapsed = collapsed
+        self.marked = marked
         self.setData(_HEADER_ROLE, name)
-        self.setFlags(Qt.ItemFlag.ItemIsEnabled)
+        # Checkable as well as enabled, and still not selectable: the header's
+        # tick means "close every gap under me", the same thing the box on a
+        # row means. `checked` is "off" / "on" / "part", worked out from the
+        # members rather than stored — a group is ticked exactly when its gaps
+        # are Closed. Selecting a group for a batch is Cmd-click (see `marked`).
+        self.setFlags(Qt.ItemFlag.ItemIsEnabled
+                      | Qt.ItemFlag.ItemIsUserCheckable)
+        self.setCheckState({
+            "on": Qt.CheckState.Checked,
+            "part": Qt.CheckState.PartiallyChecked,
+        }.get(checked, Qt.CheckState.Unchecked))
         arrow = "▸" if collapsed else "▾"
         label = name or NO_GROUP
         bits = [f"{total} gap" + ("s" if total != 1 else "")]
@@ -355,10 +566,16 @@ class _KGGroupHeader(QListWidgetItem):
             bits.append("all done ✓")
         if archived:
             bits.append("archived")
+        # Said in words as well as shown with a tick — a marker alone reads as
+        # decoration.
+        if marked:
+            bits.append("selected")
         self.setText(f"{arrow}  {label}   ·   " + "   ·   ".join(bits))
         self.setToolTip(
-            f"{label} — click to {'expand' if collapsed else 'collapse'}, "
-            "right-click for group actions."
+            f"{label} — tick to CLOSE every gap in it (untick to reopen), "
+            f"click to {'expand' if collapsed else 'collapse'}, Cmd-click to "
+            "select the group for the gap buttons, right-click for group "
+            "actions."
         )
 
 
@@ -413,7 +630,14 @@ class _KGItemDelegate(QStyledItemDelegate):
             except AttributeError:
                 pass
 
-        rect = opt.rect.adjusted(self._PAD + 2, 0, -self._PAD, 0)
+        # Start the text where the style says text starts, not at a fixed
+        # inset: with a tick box on every row, a fixed inset paints the title
+        # straight through the indicator.
+        text_left = style.subElementRect(
+            QStyle.SubElement.SE_ItemViewItemText, opt, widget).left()
+        rect = QRect(text_left, opt.rect.top(),
+                     max(0, opt.rect.right() - text_left - self._PAD),
+                     opt.rect.height())
         painter.save()
         if group is not None:
             f = QFont(opt.font)
@@ -508,8 +732,9 @@ class _GroupAssignDialog(QDialog):
         from ..core.config import source_tag as _source_tag
         esc = _html.escape
         bits = []
-        if autotag.group_is_absolute(name):
-            bits.append(f"<code>{esc(autotag.group_segment(name))}</code>")
+        branch = autotag.group_branch(name)
+        if branch:
+            bits.append(f"<code>{esc(branch)}</code>")
         src = _source_tag(autotag.group_source(name))
         if src:
             bits.append(f"<code>{esc(src)}</code>")
@@ -586,7 +811,26 @@ class _GroupEditDialog(QDialog):
         self._name.setToolTip("What the group is called in the list and the chips.")
         form.addWidget(self._name, 0, 1)
 
-        form.addWidget(QLabel("Source"), 1, 0)
+        # THE question about a group, and the reason the others got shorter:
+        # is this batch one subject, or just one afternoon? A lecture is one
+        # subject and every card off it wants a shared head node. A GP placement
+        # is not — the gaps have nothing in common but the day, and a branch
+        # over them would say something untrue.
+        self._as_group = QCheckBox("Tag every card in this group under one branch")
+        self._as_group.setChecked(bool((saved or {}).get("tag_as_group", True)))
+        self._as_group.setToolTip(
+            "On: every card made from these gaps carries one shared tag, with "
+            "the gap's own topic hanging under it —\n"
+            "    …::Antiepileptics::Atypical\n"
+            "    …::Antiepileptics::Typical\n\n"
+            "so “everything from that lecture” is one click in the sidebar.\n\n"
+            "Off: for a group that is a container rather than a subject — a "
+            "placement, a week of ward work. The cards still get their content "
+            "tag and their source tag; they just aren't claimed to be one topic."
+        )
+        form.addWidget(self._as_group, 1, 0, 1, 2)
+
+        form.addWidget(QLabel("Source"), 2, 0)
         self._source = QLineEdit(saved["source"] if saved else "")
         self._source.setPlaceholderText("e.g. Placements::GP — optional")
         # Source PATHS, not whole tags: the box wants what goes after
@@ -602,9 +846,10 @@ class _GroupEditDialog(QDialog):
             "Leave it blank for course work — the course branch already says "
             "where it came from."
         )
-        form.addWidget(self._source, 1, 1)
+        form.addWidget(self._source, 2, 1)
 
-        form.addWidget(QLabel("Course"), 2, 0)
+        self._seg_label = QLabel("Course")
+        form.addWidget(self._seg_label, 3, 0)
         self._seg = QLineEdit(saved["path"] if saved else "")
         self._seg.setPlaceholderText(
             "e.g. !!Curtanki::Year_3::SRS::02::KGs — optional")
@@ -619,10 +864,26 @@ class _GroupEditDialog(QDialog):
             "Blank for anything that isn't course work. The gaps still get "
             "their content tag and their source tag either way."
         )
-        form.addWidget(self._seg, 2, 1)
+        form.addWidget(self._seg, 3, 1)
+
+        # Only for a group with no course branch: WHERE inside the content tree
+        # its head node sits. Blank is the ordinary answer — the group's name
+        # becomes the segment — and this exists for the batch whose name reads
+        # badly as a tag ("Nirmala Anti epileptics" -> "Pharm::Antiepileptics").
+        self._gseg_label = QLabel("Group tag")
+        form.addWidget(self._gseg_label, 4, 0)
+        self._gseg = QLineEdit(
+            "" if (saved or {}).get("absolute") else ((saved or {}).get("path") or ""))
+        self._gseg.setToolTip(
+            "The head node this batch shares, inside your auto-tag base.\n\n"
+            "Leave it blank and the group's own name is used, cleaned up for a "
+            "tag. Type one when the name reads badly as a tag, or when the "
+            "batch belongs under something you already keep."
+        )
+        form.addWidget(self._gseg, 4, 1)
 
         self._levels_label = QLabel("Under it")
-        form.addWidget(self._levels_label, 3, 0)
+        form.addWidget(self._levels_label, 5, 0)
         self._levels = QComboBox()
         for key in ("full", "sub", "topic", "none"):
             self._levels.addItem(autotag.GROUP_LEVEL_LABELS[key], key)
@@ -639,7 +900,7 @@ class _GroupEditDialog(QDialog):
             "duplicate of your content tree — but dropping the topic too puts "
             "every gap in the case on one node with nothing to tell them apart."
         )
-        form.addWidget(self._levels, 3, 1)
+        form.addWidget(self._levels, 5, 1)
         root.addLayout(form)
 
         self._preview = QLabel("")
@@ -655,7 +916,9 @@ class _GroupEditDialog(QDialog):
 
         self._name.textChanged.connect(self._refresh_preview)
         self._seg.textChanged.connect(self._refresh_preview)
+        self._gseg.textChanged.connect(self._refresh_preview)
         self._source.textChanged.connect(self._refresh_preview)
+        self._as_group.toggled.connect(self._refresh_preview)
         self._levels.currentIndexChanged.connect(self._refresh_preview)
 
         buttons = QDialogButtonBox(
@@ -688,12 +951,33 @@ class _GroupEditDialog(QDialog):
         base = (auto_tag_base() or "").rstrip(":")
         esc = _html.escape
 
-        # The depth dial only shapes the course branch, so it is only on screen
-        # when there is one. Hidden rather than disabled: a greyed control reads
-        # as "broken", and this one simply has nothing to apply to.
+        as_group = self._as_group.isChecked()
         has_course = bool(path)
-        self._levels_label.setVisible(has_course)
-        self._levels.setVisible(has_course)
+        # The group's head node when it has no course branch of its own: what
+        # was typed, else the name cleaned up into a tag segment.
+        rel_seg = (autotag.clean_segment_path(self._gseg.text().strip())
+                   or autotag.derive_group_segment(name))
+        group_tag = ""
+        if as_group:
+            group_tag = (path + self._tail()) if has_course else (
+                f"{base}::KG::{rel_seg}{self._tail()}" if (base and rel_seg) else "")
+
+        # The depth dial shapes the group's branch, so it is on screen only when
+        # there is one. Hidden rather than disabled: a greyed control reads as
+        # "broken", and this one simply has nothing to apply to. Same for the
+        # segment box, which a course branch makes irrelevant — the course
+        # branch IS the head node then.
+        self._levels_label.setVisible(bool(group_tag))
+        self._levels.setVisible(bool(group_tag))
+        self._gseg_label.setVisible(as_group and not has_course)
+        self._gseg.setVisible(as_group and not has_course)
+        # A course branch IS tagging the batch as one group, so it has nothing
+        # to say when the box above is unticked. Hidden rather than left there
+        # to be filled in and quietly ignored.
+        self._seg_label.setVisible(as_group)
+        self._seg.setVisible(as_group)
+        self._gseg.setPlaceholderText(
+            autotag.derive_group_segment(name) or "e.g. Pharm::Antiepileptics")
 
         # Every tag a card in this group earns, on one screen and in commit
         # order. The point of showing all of them — including the two nobody
@@ -704,14 +988,15 @@ class _GroupEditDialog(QDialog):
         if content:
             lines.append(f"<code>{esc(content)}</code> &nbsp;— "
                          "classified per gap, automatic")
-        if has_course:
-            lines.append(f"<code>{esc(path + self._tail())}</code> &nbsp;— "
-                         "this group's branch")
+        if group_tag:
+            lines.append(f"<code>{esc(group_tag)}</code> &nbsp;— "
+                         + ("this group's course branch" if has_course
+                            else "this group's shared branch"))
         if src_tag:
             lines.append(f"<code>{esc(src_tag)}</code> &nbsp;— source")
-        elif not has_course:
-            lines.append("<i>no source and no branch — these gaps file by "
-                         "content alone</i>")
+        if not group_tag and not src_tag:
+            lines.append("<i>no source and no shared branch — these gaps file "
+                         "by content alone</i>")
         if not base and not has_course:
             lines = ["No auto-tag base is set, so nothing is tagged yet. "
                      "Give the group a course branch to tag without one."]
@@ -738,20 +1023,37 @@ class _GroupEditDialog(QDialog):
     def values(self) -> tuple[str, dict | None]:
         """(name, override) — None when the group says nothing beyond its name.
 
-        A typed course branch is always ABSOLUTE. The relative form — a segment
-        slotted inside the auto-tag base, so the batch label sat in the middle
-        of the content hierarchy — is gone from this dialog: it put a batch
-        where a body system goes, which is the thing the content axis exists to
-        stop. An old config entry that still says relative is still honoured on
-        read; nothing here can create a new one."""
-        path = autotag.clean_segment_path(self._seg.text().strip())
+        A typed COURSE branch is always absolute — it is a branch of a tree you
+        already keep, and the auto-tag base is not put in front of it.
+
+        Without one, a group that tags as a group gets a RELATIVE segment: a
+        head node inside the content tree with the gap's own classification
+        under it. That form was dropped from this dialog once, on the grounds
+        that it put a batch where a body system goes. It is back because the
+        alternative turned out to be worse: every group without a Curtanki case
+        behind it produced cards with no shared tag at all, so "everything from
+        that lecture" had no answer. The checkbox is what makes it honest —
+        a batch says it is one subject, rather than being assumed to be one."""
+        as_group = self._as_group.isChecked()
+        # Both path boxes are hidden when the group doesn't tag as one, so
+        # whatever they still hold is stale and must not be stored — a saved
+        # branch nobody can see is how an unticked group comes back tagging.
+        path = (autotag.clean_segment_path(self._seg.text().strip())
+                if as_group else "")
         source = autotag.clean_source_path(self._source.text().strip())
         name = self._name.text().strip()
-        if not path and not source:
-            return name, None
-        return name, {"path": path, "absolute": bool(path),
-                      "levels": self._levels_mode() if path else "none",
-                      "source": source}
+        if not path and as_group:
+            # Blank means "derive it from the name", and it is stored blank so
+            # renaming the group keeps moving the tag with it.
+            path = autotag.clean_segment_path(self._gseg.text().strip())
+        if not path and not source and as_group:
+            return name, None          # nothing said beyond the default
+        return name, {"path": path,
+                      "absolute": bool(as_group and autotag.clean_segment_path(
+                          self._seg.text().strip())),
+                      "levels": self._levels_mode(),
+                      "source": source,
+                      "tag_as_group": as_group}
 
 
 class _GroupManagerDialog(QDialog):
@@ -786,7 +1088,7 @@ class _GroupManagerDialog(QDialog):
         # course branch: the two are different answers and they now look it.
         self._table = QTableWidget(0, 7)
         self._table.setHorizontalHeaderLabels(
-            ["Group", "Course branch", "Source", "Gaps", "Open", "Done", "State"])
+            ["Group", "Course branch", "Source", "Gaps", "Open", "Closed", "State"])
         self._table.verticalHeader().setVisible(False)
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -893,7 +1195,8 @@ class _GroupManagerDialog(QDialog):
                 # looks faint reads as "disabled", not as "this has no gaps".
                 state = "Empty — no gaps left"
             ov = autotag.group_override(n)
-            course = (ov or {}).get("path", "") if (ov or {}).get("absolute") else ""
+            plan = autotag.group_tag_plan(n)
+            course = autotag.group_branch(n, plan)
             source = (ov or {}).get("source", "")
             cells = [n, course, source, str(st["total"]),
                      str(st["open"] + st["in_progress"]), str(st["done"]), state]
@@ -902,23 +1205,18 @@ class _GroupManagerDialog(QDialog):
                 if c == 1:
                     if course:
                         depth = autotag.GROUP_LEVEL_LABELS.get(
-                            ov["levels"], ov["levels"])
-                        it.setToolTip("Its own branch — tagged outside the "
-                                      f"auto-tag base.\nUnder it: {depth}")
-                    elif ov and ov.get("path"):
-                        # A path saved as relative: it would render inside the
-                        # base, which for a rooted path is a tag with two
-                        # roots. Named in words rather than left blank.
-                        it.setText("(not a branch — " + ov["path"] + ")")
+                            plan["levels"], plan["levels"])
                         it.setToolTip(
-                            "Saved as a segment inside the auto-tag base "
-                            "rather than a branch of its own. Open the group "
-                            "and press OK to file it as a branch.")
+                            ("Its own branch — tagged outside the auto-tag base."
+                             if plan.get("absolute") else
+                             "A shared head node inside the auto-tag base.")
+                            + f"\nUnder it: {depth}")
                     else:
                         it.setText("—")
-                        it.setToolTip("No course branch. Its gaps file by "
-                                      "content and source, which is the "
-                                      "ordinary case.")
+                        it.setToolTip(
+                            "Not tagged as one group — its gaps file by "
+                            "content and source only. Open the group to turn "
+                            "the shared branch on.")
                 if c == 2:
                     if source:
                         from ..core.config import source_tag as _st
@@ -1103,9 +1401,20 @@ class _GroupManagerDialog(QDialog):
 
 
 class _KGListItem(QListWidgetItem):
+    """One gap, with the tick box that closes it.
+
+    ONE CHECKBOX, ONE MEANING: ticked means done with. It used to be the
+    SELECTION — what the buttons acted on — while the real done-mark was a
+    second checkbox labelled "Closed" in the detail pane, and a gap finished by
+    a work-through pass went grey without its box ever being ticked. Nobody
+    reads a to-do list that way: a tick box beside an item is whether the item
+    is done. Selecting a batch is what highlighting the rows is for."""
+
     def __init__(self, kg: dict):
         super().__init__()
         self.kg_id = kg.get("id", "")
+        self.setFlags(self.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        self.setCheckState(Qt.CheckState.Unchecked)
         self.refresh(kg)
 
     def refresh(self, kg: dict) -> None:
@@ -1113,19 +1422,12 @@ class _KGListItem(QListWidgetItem):
         source_label = SOURCE_LABELS.get(kg.get("source", "manual"), "?")
         type_meta = _type_meta(kg.get("type", "kg"))
         status = kg.get("status", "open")
-        dismissed = bool(kg.get("dismissed", False))
         status_label = STATUS_LABELS.get(status, "Open")
-        if status == "done" and dismissed:
-            status_label = "Done (dismissed)"
         title = kg.get("title", "(untitled)") or "(untitled)"
         # Prefix the title with a compact type tag for at-a-glance scanning.
         text = f"[{type_meta['name']}]  {title}"
         if len(text) > 80:
             text = text[:80].rstrip() + "…"
-        # In-progress says so in words. Italic-grey alone would read as "done",
-        # and a colour alone tells you nothing about which state it is.
-        if status == "in_progress":
-            text += "   · sent, in progress"
         self.setText(text)
 
         # Second line, drawn by _KGItemDelegate. Empty means the row stays a
@@ -1136,6 +1438,13 @@ class _KGListItem(QListWidgetItem):
         except Exception:
             show_notes = True
         self.setData(_NOTES_ROLE, _notes_preview(kg) if show_notes else "")
+
+        # The box is the status, not a selection. Set before the grey so both
+        # say the same thing about the same row.
+        want = (Qt.CheckState.Checked if status == "done"
+                else Qt.CheckState.Unchecked)
+        if self.checkState() != want:
+            self.setCheckState(want)
 
         # Grey done items so they stay visible but recede.
         if status == "done":
@@ -1414,13 +1723,38 @@ class _LOAnalyserSection(QGroupBox):
 # ── Detail pane ──────────────────────────────────────────────────────────────
 
 class KGDetailPane(QWidget):
-    """Right column — shows / edits / actions a single KG."""
+    """Right column — shows / edits / actions a single KG.
 
-    def __init__(self, parent_panel, parent=None):
+    `compact` is the Groups page's copy of it, sitting in the bottom half of a
+    vertical split under the group it belongs to. Same pane, same actions, same
+    saving — with the sections that don't fit a half-height panel dropped: tags
+    (the group's own tag branch is what matters there, and it's shown above),
+    resources, and the LO analyser, all of which stay on the Gaps page."""
+
+    def __init__(self, parent_panel, parent=None, *, compact: bool = False,
+                 selection_provider=None):
         super().__init__(parent)
         self._parent_panel = parent_panel
         self._current: dict | None = None
+        self._compact = compact
+        # Whose selection the send buttons act on. The Gaps page's pane means
+        # the gap list; the Groups page's pane means the gap list inside the
+        # group — passing it in is what stops one pane acting on the other
+        # page's selection.
+        self._selection_provider = selection_provider
         self._build()
+        self._apply_compact()
+
+    def _apply_compact(self) -> None:
+        """Hide what a half-height pane has no room for. Called after every
+        load() too, because load() shows the LO analyser for an LO gap."""
+        if not self._compact:
+            return
+        for w in (self._tag_row_w, self._res_box, self._lo_analyser):
+            try:
+                w.setVisible(False)
+            except Exception:
+                pass
 
     def _build(self) -> None:
         root = QVBoxLayout(self)
@@ -1440,24 +1774,30 @@ class KGDetailPane(QWidget):
         root.addWidget(self._title_input)
 
         meta_row = QHBoxLayout()
-        meta_row.addWidget(QLabel("Type:"))
+        # These two labels carry the selection count when there is one. The
+        # controls under them act on the whole selection, and the ONLY thing
+        # that used to say so was the send buttons further down — which say it
+        # about themselves, not about these.
+        self._type_lbl = QLabel("Type:")
+        meta_row.addWidget(self._type_lbl)
         self._type = QComboBox()
         self._rebuild_type_combo()
         meta_row.addWidget(self._type)
         meta_row.addSpacing(8)
-        meta_row.addWidget(QLabel("Status:"))
-        self._status = QComboBox()
-        for key, label in STATUS_LABELS.items():
-            self._status.addItem(label, key)
-        meta_row.addWidget(self._status)
-        # "Dismissed" is a sub-flag that's only meaningful when status=done.
-        # Replaces the old standalone "dismissed" status.
-        self._dismissed = QCheckBox("Dismissed")
-        self._dismissed.setToolTip(
-            "Mark this Done item as dismissed (won't be revisited). "
-            "Hidden unless 'Include dismissed' is on."
+        # A WORD, NOT A SECOND TICK BOX. This used to be a "Closed" checkbox,
+        # inches from the tick box on every row of the list — two checkboxes
+        # for what a reader takes to be one question ("am I done with this?"),
+        # and they meant different things. The row's box is the answer now (see
+        # _KGListItem.refresh); this only reports it, so the pane can still be
+        # read on its own.
+        self._status_lbl = QLabel("")
+        self._status_lbl.setStyleSheet("font-size: 11px;")
+        self._status_lbl.setToolTip(
+            "Open or Closed. Tick the box beside the gap in the list to close "
+            "it — a card written, or a card found that already covers it. "
+            "Untick to put it back on the list."
         )
-        meta_row.addWidget(self._dismissed)
+        meta_row.addWidget(self._status_lbl)
         meta_row.addSpacing(8)
         # Group. A button rather than a combo: it opens the same dialog the
         # list's right-click uses, so there is exactly one place the SRS 4 ->
@@ -1480,20 +1820,17 @@ class KGDetailPane(QWidget):
         meta_row.addWidget(self._created_lbl)
         root.addLayout(meta_row)
 
-        # Status change & dismissed flag auto-persist so users don't have to
-        # remember to hit Save just to mark a KG closed.
-        self._status.currentIndexChanged.connect(self._on_status_changed)
-        self._dismissed.toggled.connect(self._on_dismissed_changed)
-
         # Tags
-        tag_row = QHBoxLayout()
+        self._tag_row_w = QWidget()
+        tag_row = QHBoxLayout(self._tag_row_w)
+        tag_row.setContentsMargins(0, 0, 0, 0)
         tag_row.addWidget(QLabel("Tags:"))
         self._tags_input = QLineEdit()
         self._tags_input.setPlaceholderText("space-separated — School::Year3::Cardio")
         attach_tag_completer(self._tags_input, multi=True)
         self._tags_input.editingFinished.connect(self._commit_edit)
         tag_row.addWidget(self._tags_input, 1)
-        root.addLayout(tag_row)
+        root.addWidget(self._tag_row_w)
 
         # ── Dynamic schema-driven fields container ───────────────────────────
         # Built from the active type's `fields` list. Each entry yields a
@@ -1533,22 +1870,87 @@ class KGDetailPane(QWidget):
         # Labels are rewritten by refresh_send_labels() to name the selection
         # size, because these buttons act on every selected gap, not just the
         # one on screen.
-        self._browse_btn = QPushButton("🔍 Send to AI Browse")
-        self._browse_btn.setAutoDefault(False)
-        self._browse_btn.clicked.connect(self._send_to_browse)
-        actions_row.addWidget(self._browse_btn)
-        self._create_btn = QPushButton("＋ Create card from this KG")
-        self._create_btn.setAutoDefault(False)
+        # One button, one verb.
+        #
+        # Work through already IS search-and-create: it looks for the gap in
+        # your deck and writes cards for whatever nothing covered. Standing AI
+        # Browse and AI Create beside it as equal buttons made three ways to
+        # start the same job and invited you to pick a half by accident. They
+        # are still here — under the ▾, named "only", where picking one is a
+        # deliberate narrowing rather than the default.
+        self._work_btn = QPushButton("⚡ Work through")
+        self._work_btn.setAutoDefault(False)
+        self._work_btn.setToolTip(
+            "Park this on the work-through queue. It waits there — send as "
+            "many as you like, from either page — until you press the "
+            "bottom-right button, which works through the lot in one pass, "
+            "then empties.\n\nRight-click a gap to take it back off the "
+            "queue.")
+        self._work_btn.clicked.connect(self._queue_work_through)
+        actions_row.addWidget(self._work_btn)
+
+        # A QPushButton, NOT a QToolButton. The theme styles QPushButton — the
+        # rounded fill every other button in this row has — and says nothing
+        # about QToolButton, so the tool button rendered as a bare chevron
+        # floating between two pills. Its own menu indicator is hidden because
+        # the ▾ is already the label.
+        self._work_menu_btn = QPushButton("▾")
+        self._work_menu_btn.setAutoDefault(False)
+        self._work_menu_btn.setStyleSheet(
+            "QPushButton::menu-indicator { image: none; width: 0px; }")
+        self._work_menu_btn.setToolTip(
+            "Send one half only — or run the whole pass now, without queueing "
+            "it.")
+        _wm = QMenu(self._work_menu_btn)
+        self._create_btn = _wm.addAction("＋ AI Create only")
         self._create_btn.setToolTip(
-            "Send this gap to AI Create, with its notes attached, and let the "
-            "AI write the card.")
-        self._create_btn.clicked.connect(self._send_to_create)
-        actions_row.addWidget(self._create_btn)
+            "Skip the search. Sends this gap to AI Create with its notes "
+            "attached and lets the AI write the card.")
+        self._create_btn.triggered.connect(self._send_to_create)
+        self._browse_btn = _wm.addAction("🔍 AI Browse only")
+        self._browse_btn.setToolTip(
+            "Skip the writing. Sends this gap to AI Browse to find what your "
+            "deck already has.")
+        self._browse_btn.triggered.connect(self._send_to_browse)
+        _wm.addSeparator()
+        self._work_now_act = _wm.addAction("⚡ Work through now — skip the queue")
+        self._work_now_act.setToolTip(
+            "Open the unified pass on this selection straight away, without "
+            "parking it first.")
+        self._work_now_act.triggered.connect(self._work_through_now)
+        self._work_menu_btn.setMenu(_wm)
+        self._work_menu = _wm
+        actions_row.addWidget(self._work_menu_btn)
+
+        # Straight to Anki's own browser, with the gap's title as the search.
+        # Neither of these asks an AI anything — they are the "just let me look"
+        # door, and they were the one thing this pane made you leave it for.
+        #
+        # Named in words, and no emoji. 🏷 and 🔎 are outside the font this
+        # theme renders with, so they came out as a blank block and a dark
+        # blob — two buttons that looked broken and said nothing. A label that
+        # can't render is worse than a longer one that can.
+        self._find_tag_btn = QPushButton("Find tags")
+        self._find_tag_btn.setAutoDefault(False)
+        self._find_tag_btn.setToolTip(
+            "Open Anki's own Browse screen, searching the tags for this "
+            "gap's title.")
+        self._find_tag_btn.clicked.connect(lambda: self._open_anki_browse(True))
+        actions_row.addWidget(self._find_tag_btn)
+        self._find_cards_btn = QPushButton("Find cards")
+        self._find_cards_btn.setAutoDefault(False)
+        self._find_cards_btn.setToolTip(
+            "Open Anki's own Browse screen, searching the cards for this "
+            "gap's title.")
+        self._find_cards_btn.clicked.connect(lambda: self._open_anki_browse(False))
+        actions_row.addWidget(self._find_cards_btn)
+
         self._own_btn = QPushButton("✎ Write my own card")
         self._own_btn.setAutoDefault(False)
         self._own_btn.setToolTip(
             "Write the card yourself. No AI in the path at all — it lands in "
-            "the same deck, with the same tags, as a generated one would.")
+            "the same deck, with the same tags, as a generated one would. "
+            "Select several gaps to work through them one after another.")
         self._own_btn.clicked.connect(self._write_own_card)
         actions_row.addWidget(self._own_btn)
         actions_row.addStretch(1)
@@ -1627,16 +2029,10 @@ class KGDetailPane(QWidget):
         self._source_lbl.setText(f"from <i>{source_label}</i>")
         self._source_lbl.setTextFormat(Qt.TextFormat.RichText)
 
-        status = kg.get("status", "open")
-        self._status.blockSignals(True)
-        idx = self._status.findData(status)
-        self._status.setCurrentIndex(idx if idx >= 0 else 0)
-        self._status.blockSignals(False)
-        self._dismissed.blockSignals(True)
-        self._dismissed.setChecked(bool(kg.get("dismissed", False)))
-        # Dismissed only makes sense as a sub-flag of Done.
-        self._dismissed.setEnabled(status == "done")
-        self._dismissed.blockSignals(False)
+        closed = kg.get("status", "open") == "done"
+        self._status_lbl.setText(
+            "<i>Closed</i>" if closed else "Open")
+        self._status_lbl.setTextFormat(Qt.TextFormat.RichText)
 
         self._tags_input.setText(" ".join(kg.get("tags", [])))
 
@@ -1653,6 +2049,7 @@ class KGDetailPane(QWidget):
         # LO analyser visibility — reset its transient state on KG change.
         self._lo_analyser.reset()
         self._lo_analyser.setVisible(type_key == "lo")
+        self._apply_compact()
 
     def _clear(self) -> None:
         self._current = None
@@ -1660,11 +2057,12 @@ class KGDetailPane(QWidget):
         self._empty_lbl.setVisible(True)
 
     def _set_widgets_visible(self, visible: bool) -> None:
-        for w in (self._title_input, self._type, self._source_lbl, self._status,
-                  self._dismissed, self._group_btn, self._created_lbl,
+        for w in (self._title_input, self._type, self._source_lbl,
+                  self._status_lbl, self._group_btn, self._created_lbl,
                   self._tags_input,
-                  self._schema_container, self._res_box, self._browse_btn,
-                  self._create_btn, self._own_btn, self._delete_btn,
+                  self._schema_container, self._res_box, self._work_btn,
+                  self._work_menu_btn, self._find_tag_btn,
+                  self._find_cards_btn, self._own_btn, self._delete_btn,
                   self._save_btn):
             w.setVisible(visible)
         # The LO analyser stays hidden when nothing is selected; load() re-
@@ -1717,55 +2115,28 @@ class KGDetailPane(QWidget):
         # Auto-persist the type change. Without this, switching the type
         # and navigating away silently reverts because the explicit Save
         # button is the only thing that wrote the new type to disk.
-        try:
-            updated = kg_store.update(
-                self._current["id"], type=new_type, fields=merged,
-            )
-            if updated:
-                self._current = updated
-                self._parent_panel.refresh_list(preserve_selection=updated["id"])
-        except Exception as e:
-            print(f"[ankisstant] auto-save type change failed: {e}")
-
-    def _on_status_changed(self, _idx: int) -> None:
-        if self._current is None:
-            return
-        new_status = self._status.currentData() or "open"
-        # Dismissed is only meaningful for Done items — disable + clear when
-        # switching back to Open.
-        self._dismissed.blockSignals(True)
-        if new_status != "done":
-            self._dismissed.setChecked(False)
-        self._dismissed.setEnabled(new_status == "done")
-        self._dismissed.blockSignals(False)
-        try:
-            updated = kg_store.update(
-                self._current["id"],
-                status=new_status,
-                dismissed=bool(self._dismissed.isChecked()) if new_status == "done" else False,
-            )
-            if updated:
-                self._current = updated
-                self._parent_panel.refresh_list(preserve_selection=updated["id"])
-                if new_status == "done":
-                    maybe_sync_to_things()
-        except Exception as e:
-            print(f"[ankisstant] auto-save status change failed: {e}")
-
-    def _on_dismissed_changed(self, checked: bool) -> None:
-        if self._current is None:
-            return
-        # Only persist when the status is Done (the checkbox is disabled
-        # otherwise, but guard anyway).
-        if (self._status.currentData() or "open") != "done":
-            return
-        try:
-            updated = kg_store.update(self._current["id"], dismissed=bool(checked))
-            if updated:
-                self._current = updated
-                self._parent_panel.refresh_list(preserve_selection=updated["id"])
-        except Exception as e:
-            print(f"[ankisstant] auto-save dismissed flag failed: {e}")
+        ids = self._send_ids()
+        cur_id = (self._current or {}).get("id")
+        done = 0
+        for kid in ids:
+            try:
+                # Only the gap on screen has its FIELDS merged — those are the
+                # values in the widgets in front of you. The others get the
+                # type and keep their own content.
+                got = (kg_store.update(kid, type=new_type, fields=merged)
+                       if kid == cur_id else kg_store.update(kid, type=new_type))
+            except Exception as e:
+                print(f"[ankisstant] auto-save type change failed: {e}")
+                continue
+            if got:
+                done += 1
+                if kid == cur_id:
+                    self._current = got
+        if done:
+            self._parent_panel.refresh_list(
+                preserve_selection=(self._current or {}).get("id"))
+            if done > 1:
+                tooltip(f"{done} gaps → {self._type.currentText()}")
 
     def _rebuild_schema_for_type(self, type_key: str, kg: dict | None = None) -> None:
         # Tear down existing widgets.
@@ -1955,8 +2326,11 @@ class KGDetailPane(QWidget):
         kg = dict(self._current or {})
         kg["title"]     = self._title_input.text().strip()
         kg["type"]      = self._type.currentData() or kg.get("type", "kg")
-        kg["status"]    = self._status.currentData() or "open"
-        kg["dismissed"] = bool(self._dismissed.isChecked()) if kg["status"] == "done" else False
+        # The pane does not EDIT the status any more — the list's tick box owns
+        # it — so the stored value rides along untouched. It stays in the record
+        # (and in _EDITABLE_KEYS) so a save can never blank a field it simply
+        # isn't asking about, which is what dropping it here would do.
+        kg["status"] = str((self._current or {}).get("status") or "open")
         kg["tags"]      = [t for t in self._tags_input.text().split() if t.strip()]
         kg["fields"]    = self._collect_schema_fields()
         kg["resources"] = self._collect_resources()
@@ -1968,7 +2342,7 @@ class KGDetailPane(QWidget):
 
     # Everything _gather() owns. Compared against the stored record to decide
     # whether an unsaved edit is sitting in the pane.
-    _EDITABLE_KEYS = ("title", "type", "status", "dismissed", "tags",
+    _EDITABLE_KEYS = ("title", "type", "status", "tags",
                       "fields", "resources")
 
     def flush(self) -> bool:
@@ -2034,35 +2408,104 @@ class KGDetailPane(QWidget):
     def _delete(self) -> None:
         if not self._current:
             return
-        if not askUser(
-            f"Delete this knowledge gap?\n\n{self._current.get('title', '')}",
-            defaultno=True,
-        ):
-            return
-        kg_store.remove(self._current["id"])
+        ids = self._send_ids()
+        if len(ids) > 1:
+            if not askUser(f"Delete {len(ids)} knowledge gaps?\n\n"
+                           "This can't be undone.", defaultno=True):
+                return
+            kg_store.remove_many(ids)
+        else:
+            if not askUser(
+                f"Delete this knowledge gap?\n\n{self._current.get('title', '')}",
+                defaultno=True,
+            ):
+                return
+            kg_store.remove(self._current["id"])
         self._parent_panel.refresh_list()
 
     # ── actions ──────────────────────────────────────────────────────────────
 
     def refresh_send_labels(self, n: int) -> None:
-        """Say out loud how many gaps the buttons will send, so a multi-select
-        can't silently send one."""
-        if n > 1:
-            self._browse_btn.setText(f"🔍 Send {n} gaps to AI Browse")
-            self._create_btn.setText(f"＋ Send {n} gaps to AI Create")
+        """Say out loud how many gaps each control will act on, so a
+        multi-select can't silently act on one.
+
+        It covers the whole pane now, not only the send buttons. Type, Status,
+        Dismissed and Delete act on the selection too — they always looked as
+        though they did, and for a long time they didn't."""
+        many = n > 1
+        if many:
+            self._work_btn.setText(f"⚡ Work through {n} gaps")
+            self._browse_btn.setText(f"🔍 AI Browse only ({n} gaps)")
+            self._create_btn.setText(f"＋ AI Create only ({n} gaps)")
+            self._work_now_act.setText(
+                f"⚡ Work through {n} gaps now — skip the queue")
+            self._own_btn.setText(f"✎ Write my own for {n} gaps")
         else:
-            self._browse_btn.setText("🔍 Send to AI Browse")
-            self._create_btn.setText("＋ Create card from this KG")
+            self._work_btn.setText("⚡ Work through")
+            self._browse_btn.setText("🔍 AI Browse only")
+            self._create_btn.setText("＋ AI Create only")
+            self._work_now_act.setText("⚡ Work through now — skip the queue")
+            self._own_btn.setText("✎ Write my own card")
+        # The two Browse doors search ONE title, so they say so when the
+        # selection is bigger than one rather than implying they'll do the lot.
+        for b, what in ((getattr(self, "_find_tag_btn", None), "tags"),
+                        (getattr(self, "_find_cards_btn", None), "cards")):
+            if b is not None:
+                b.setToolTip(
+                    f"Open Anki's own Browse screen, searching the {what} for "
+                    + ("the title of the gap shown above."
+                       if many else "this gap's title."))
+        lbl = getattr(self, "_type_lbl", None)
+        if lbl is not None:
+            lbl.setText(f"Type of {n}:" if many else "Type:")
+            lbl.setToolTip(f"Applies to all {n} selected gaps." if many else "")
+        btn = getattr(self, "_delete_btn", None)
+        if btn is not None:
+            btn.setText(f"🗑 Delete {n} gaps" if many else "🗑 Delete")
 
     def _send_ids(self) -> list[str]:
         """What the send buttons act on: the whole list selection, falling back
         to the loaded gap. Selecting five gaps and pressing the button used to
         send only the one the pane happened to be showing."""
-        ids = self._parent_panel._selected_ids()
+        provider = self._selection_provider or self._parent_panel._selected_ids
+        try:
+            ids = list(provider() or [])
+        except Exception:
+            ids = []
         cur = (self._current or {}).get("id")
         if not ids and cur:
             ids = [cur]
         return ids
+
+    def _queue_work_through(self) -> None:
+        """Park the selection on the work-through queue and say so.
+
+        Nothing opens. That is the point: you can send a gap, carry on reading,
+        send three more from the other page, and deal with the lot in one pass
+        when you're ready."""
+        self.flush()
+        ids = self._send_ids()
+        if ids:
+            self._parent_panel._queue_work_through(ids)
+
+    def _work_through_now(self) -> None:
+        self.flush()
+        ids = self._send_ids()
+        if ids:
+            self._parent_panel._work_through_now(ids)
+
+    def _open_anki_browse(self, as_tag: bool) -> None:
+        """Anki's own Browse screen, searching this gap's title.
+
+        One gap's title, even on a multi-select: a browser search is a thing you
+        read, and OR-ing six titles into one query gives you a pile nobody can
+        tell apart. The gap shown in the pane is the one you're looking at."""
+        self.flush()
+        kg = self._current
+        if not kg:
+            tooltip("Pick a gap first.")
+            return
+        open_anki_browse(str(kg.get("title") or ""), as_tag=as_tag)
 
     def _send_to_browse(self) -> None:
         # Persist local edits first so the handoff carries fresh data.
@@ -2078,25 +2521,25 @@ class KGDetailPane(QWidget):
             self._parent_panel._bulk_send_to_create(ids)
 
     def _write_own_card(self) -> None:
-        """No AI: type the card, it goes straight into the collection."""
+        """No AI: type the card yourself, in Anki's own Add window.
+
+        The editor is Anki's — cloze button, formatting, image paste, occlusion,
+        every shortcut already in your hands. Ankisstant's contribution is the
+        side-car beside it: the gap, what you wrote down about it, the tag the
+        card should carry, and closing the gap once the card is in.
+
+        Acts on the whole selection, like the two Send buttons beside it: pick
+        six gaps and the side-car walks them, offering the next one each time a
+        card goes in. It never advances on its own — two cards for one gap is
+        an ordinary thing to want. See kg/write_own.py."""
         self.flush()
-        if self._current is None:
-            return
-        kg = kg_store.get(self._current.get("id")) or self._current
-        dlg = _WriteOwnCardDialog(kg, parent=self.window())
-        dlg.exec()
-        if not dlg.created_ids:
-            return
-        n = len(dlg.created_ids)
-        if dlg._done_cb.isChecked():
-            try:
-                kg_store.update(kg["id"], status="done")
-                maybe_sync_to_things()
-            except Exception as e:
-                log.warn(f"write-your-own: couldn't mark {kg.get('id')} done: {e}")
-        tooltip(f"Added {n} card(s) — Ctrl+Z in the main window undoes the "
-                "last one.", period=4000)
-        self._parent_panel.refresh_list(preserve_selection=kg.get("id"))
+        gaps = [g for g in (kg_store.get(i) for i in self._send_ids()) if g]
+        if not gaps:
+            if self._current is None:
+                return
+            gaps = [kg_store.get(self._current.get("id")) or self._current]
+        from .kg import write_own
+        write_own.open_write_own(gaps, parent=self.window())
 
     def _on_group_clicked(self) -> None:
         self.flush()
@@ -2212,202 +2655,6 @@ def _run_pending_things_sync() -> None:
         sync_done_to_things(silent=True)
     except Exception as e:
         log.warn(f"things: write-back failed: {e}")
-
-
-class _WriteOwnCardDialog(QDialog):
-    """Write a card for this gap yourself — no AI anywhere in the path.
-
-    Not a fallback for when the AI is unavailable. Plenty of gaps are one line
-    you already know how to phrase, and for those the AI round trip is slower
-    than typing it and worse at it — it doesn't know the wording your deck
-    already uses. The gap's own notes sit above the editor, because they are
-    usually the answer you wrote down at the time.
-
-    It commits through the same commit_cards / CommitCtx path AI Create uses,
-    so the note lands with the same fields, the same tags and the same shape a
-    generated one would have.
-    """
-
-    def __init__(self, kg: dict, parent=None):
-        super().__init__(parent)
-        self._kg = dict(kg or {})
-        self.created_ids: list = []
-        self.setWindowTitle("Write your own card")
-        self.setMinimumSize(700, 620)
-        self._build()
-        theme_dialog(self)
-
-    def _build(self) -> None:
-        from .kg.mass_create import _deck_names, _notetype_profiles
-        cc_cfg = tool_config("card_creator")
-
-        root = QVBoxLayout(self)
-        root.setContentsMargins(14, 12, 14, 12)
-        root.setSpacing(8)
-
-        title = str(self._kg.get("title") or "(untitled)")
-        head = QLabel(f"<b>{_html.escape(title)}</b>")
-        head.setWordWrap(True)
-        root.addWidget(head)
-
-        notes = kg_store.field(self._kg, "notes") or ""
-        stem = kg_store.field(self._kg, "stem_html") or ""
-        if notes or stem:
-            ref = QTextEdit()
-            ref.setReadOnly(True)
-            ref.setMaximumHeight(120)
-            ref.setHtml(stem if stem else _html.escape(notes).replace("\n", "<br>"))
-            ref.setToolTip("What you wrote down about this gap. Read-only here "
-                           "— edit it on the gap itself.")
-            root.addWidget(ref)
-
-        strip = QHBoxLayout()
-        strip.addWidget(QLabel("Into"))
-        self._deck = QComboBox()
-        self._deck.setEditable(True)
-        self._deck.addItems(_deck_names())
-        self._deck.setCurrentText(cc_cfg.get("default_deck") or "Default")
-        strip.addWidget(self._deck, 1)
-        strip.addWidget(QLabel("as"))
-        self._notetype = QComboBox()
-        for prof in _notetype_profiles(cc_cfg):
-            self._notetype.addItem(prof["name"])
-        want = (cc_cfg.get("selected_notetype")
-                or cc_cfg.get("default_notetype") or "").strip()
-        ix = self._notetype.findText(want)
-        if ix >= 0:
-            self._notetype.setCurrentIndex(ix)
-        strip.addWidget(self._notetype, 1)
-        root.addLayout(strip)
-
-        self._front = QPlainTextEdit()
-        self._front.setPlaceholderText(
-            "The front. Use {{c1::…}} for a cloze card — whatever the notetype "
-            "you picked expects.")
-        root.addWidget(QLabel("<b>Front</b>"))
-        root.addWidget(self._front, 2)
-
-        self._back = QPlainTextEdit()
-        self._back.setPlaceholderText("The back / Extra — the mechanism or the "
-                                      "clinical 'so what'. Optional.")
-        root.addWidget(QLabel("<b>Back / Extra</b>"))
-        root.addWidget(self._back, 1)
-
-        tag_row = QHBoxLayout()
-        tag_row.addWidget(QLabel("Tag"))
-        self._tag = QLineEdit(self._suggest_tag())
-        self._tag.setPlaceholderText("no tag")
-        self._tag.setToolTip(
-            "Prefilled from this gap's own type, group and levels — the same "
-            "tag AI Create would give a card written for it. Edit or clear it.")
-        attach_tag_completer(self._tag, multi=False)
-        tag_row.addWidget(self._tag, 1)
-        root.addLayout(tag_row)
-
-        self._done_cb = QCheckBox("Mark this gap done once the card is added")
-        self._done_cb.setChecked(True)
-        root.addWidget(self._done_cb)
-
-        self._status = QLabel("")
-        self._status.setStyleSheet("color: gray; font-size: 11px;")
-        self._status.setWordWrap(True)
-        root.addWidget(self._status)
-
-        row = QHBoxLayout()
-        row.addStretch(1)
-        cancel = QPushButton("Cancel")
-        cancel.setAutoDefault(False)
-        cancel.clicked.connect(self.reject)
-        row.addWidget(cancel)
-        self._again_btn = QPushButton("Add and write another")
-        self._again_btn.setAutoDefault(False)
-        self._again_btn.setToolTip("Add this card and clear the editor, so one "
-                                   "gap can produce several cards in a row.")
-        self._again_btn.clicked.connect(lambda: self._commit(keep_open=True))
-        row.addWidget(self._again_btn)
-        ok = QPushButton("Add card")
-        ok.setDefault(True)
-        ok.clicked.connect(lambda: self._commit(keep_open=False))
-        row.addWidget(ok)
-        root.addLayout(row)
-
-    def _suggest_tag(self) -> str:
-        """The tag AI Create would give a card written for this gap."""
-        try:
-            levels = {k: kg_store.field(self._kg, k) or ""
-                      for k in ("system", "subsystem", "topic")}
-            if not any(levels.values()):
-                levels["topic"] = str(self._kg.get("title") or "")
-            key = str(self._kg.get("type") or "kg")
-            return autotag.content_tag_from_levels(
-                levels, kg_type_key=key, type_meta=_type_meta(key),
-                group=str(self._kg.get("group") or ""))
-        except Exception as e:
-            log.warn(f"write-your-own: couldn't suggest a tag: {e}")
-            return ""
-
-    def _commit(self, *, keep_open: bool) -> None:
-        from . import card_creator as cc
-        front = self._front.toPlainText().strip()
-        if not front:
-            self._status.setText("A card needs a front.")
-            return
-        if not anki_utils.require_col():
-            return
-        profile = cc._resolved_profile(tool_config("card_creator"),
-                                       self._notetype.currentText().strip())
-        nt = cc.resolve_notetype(profile)
-        if nt is None:
-            self._status.setText(
-                "That notetype profile doesn't resolve to a notetype in this "
-                "collection — check Settings → AI Create.")
-            return
-
-        tags = [t.strip() for t in (tool_config("card_creator")
-                                    .get("default_tags") or []) if str(t).strip()]
-        box = self._tag.text().strip()
-        if box and box.lower() not in {t.lower() for t in tags}:
-            tags.append(box)
-        mtag = month_tag()
-        if mtag and mtag.lower() not in {t.lower() for t in tags}:
-            tags.append(mtag)
-        for t in (self._kg.get("tags") or []):
-            t = str(t).strip()
-            if t and t.lower() not in {x.lower() for x in tags}:
-                tags.append(t)
-
-        ctx = cc.CommitCtx(
-            profile=profile, tags=tags, mode="topic",
-            kg_stem_html=kg_store.field(self._kg, "stem_html") or "",
-            kg_notes=kg_store.field(self._kg, "notes") or "",
-            kg_concept=str(self._kg.get("title") or ""),
-            kg_type_for_image=str(self._kg.get("type") or ""),
-            type_meta=_type_meta(str(self._kg.get("type") or "kg")),
-            kg_field_values=dict(self._kg.get("fields") or {}),
-        )
-        card = {"front": front, "extra": self._back.toPlainText().strip()}
-        cplan = pipeline.CommitPlan(
-            label="Ankisstant: write your own card", new_cards=[card],
-            deck_name=self._deck.currentText().strip() or "Default",
-            commit_ctx=ctx, notetype=nt)
-        res = commit.run(cplan)
-        if res.errors:
-            log.error("write-your-own: commit failed: " + "; ".join(res.errors))
-            self._status.setText("Couldn't add that card: "
-                                 + "; ".join(res.errors))
-            return
-        self.created_ids.extend(cplan.created_ids)
-        commit.refresh()
-
-        if keep_open:
-            self._front.setPlainText("")
-            self._back.setPlainText("")
-            self._front.setFocus()
-            self._status.setText(
-                f"Added. {len(self.created_ids)} card(s) so far — "
-                "Ctrl+Z in the main window undoes the last one.")
-            return
-        self.accept()
 
 
 # ── Bulk import modal ──────────────────────────────────────────────────────────
@@ -2851,7 +3098,12 @@ class _BulkImportDialog(QDialog):
             for k, v in (src.get("levels") or {}).items():
                 rec["fields"].setdefault(k, v)
         kg_store.add_many(records)
+        # A markdown import writes its own groups; any of them you had put away
+        # comes back, same as adding one gap does — see wake_group.
+        woken = wake_groups(r.get("group") for r in records)
         self.imported_count = len(records)
+        if woken:
+            tooltip("Brought back: " + ", ".join(woken), period=4000)
         if dupes:
             tooltip(f"Skipped {len(dupes)} already in your list.", period=4000)
         self.accept()
@@ -2859,25 +3111,663 @@ class _BulkImportDialog(QDialog):
 
 # ── Main panel ───────────────────────────────────────────────────────────────
 
+# Open covers in-progress too. A gap that has been sent to Browse or Create is
+# still a gap you haven't closed, and giving it a chip of its own split the
+# working list in two — the row already says "sent, in progress" in words.
 _STATUS_FILTERS = [
-    ("open",        "Open"),
-    ("in_progress", "In progress"),
-    ("done",        "Done"),
+    ("open", "Open"),
+    ("done", "Closed"),
 ]
+
+
+def group_state(st: dict) -> str:
+    """A group's state in one word, derived from its gaps: Closed once none of
+    them are still open, Open while any is. Said in words wherever it is shown —
+    a row that merely goes grey reads as disabled, not as finished."""
+    if not st.get("total"):
+        return "Empty — no gaps"
+    return "Closed" if (st["open"] + st["in_progress"]) == 0 else "Open"
+
+
+class _KGGroupRow(QListWidgetItem):
+    """One group in the Groups view — name on top, counts and state beneath,
+    drawn as two lines by _KGItemDelegate."""
+
+    def __init__(self, name: str, st: dict, *, archived: bool = False):
+        super().__init__()
+        self.group_name = name
+        self.state = group_state(st)
+        open_n = st["open"] + st["in_progress"]
+        bits = [f"{st['total']} gap" + ("s" if st["total"] != 1 else "")]
+        if open_n:
+            bits.append(f"{open_n} open")
+        if st["done"]:
+            bits.append(f"{st['done']} done")
+        bits.append(self.state)
+        if archived:
+            bits.append("archived")
+        self.setText(name or NO_GROUP)
+        self.setData(_NOTES_ROLE, "   ·   ".join(bits))
+
+
+class _GroupsView(QWidget):
+    """The Groups page: every group down the left, the one you picked on the
+    right — what it is tagged as, whether it is open or closed, and every gap
+    in it.
+
+    It replaces a horizontal row of group chips, which stopped being readable at
+    about eight groups and could only ever filter the gap list. Picking several
+    groups here is the list's own selection (Shift/Cmd-click), not the marking
+    gesture the gap page needs for its unselectable headers, and every batch
+    tool runs on the union of what you picked."""
+
+    def __init__(self, panel):
+        super().__init__(panel)
+        self._panel = panel
+        self._stats: dict[str, dict] = {}
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(6)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setSizePolicy(QSizePolicy.Policy.Expanding,
+                               QSizePolicy.Policy.Expanding)
+
+        # ── left: the groups ──
+        left = QWidget()
+        lcol = QVBoxLayout(left)
+        lcol.setContentsMargins(0, 0, 6, 0)
+        lcol.setSpacing(4)
+        self._count = QLabel("")
+        self._count.setStyleSheet("color: gray; font-size: 11px;")
+        lcol.addWidget(self._count)
+        self._list = QListWidget()
+        self._list.setAlternatingRowColors(True)
+        self._list.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._list.setItemDelegate(_KGItemDelegate(self._list))
+        self._list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._list.customContextMenuRequested.connect(self._on_menu)
+        self._list.itemSelectionChanged.connect(self._on_select)
+        lcol.addWidget(self._list, 1)
+        hint = QLabel("Shift/Cmd-click to pick several groups and run them "
+                      "together.")
+        hint.setStyleSheet("color: gray; font-size: 10px;")
+        hint.setWordWrap(True)
+        lcol.addWidget(hint)
+        self._show_archived = QCheckBox("Show archived")
+        self._show_archived.setStyleSheet("font-size: 11px; color: gray;")
+        self._show_archived.setToolTip(
+            "Archived groups are put away, not deleted — their gaps and cards "
+            "are untouched.")
+        self._show_archived.toggled.connect(lambda _v: self.refresh())
+        lcol.addWidget(self._show_archived)
+        brow = QHBoxLayout()
+        manage = QPushButton("⚙︎ Manage groups…")
+        manage.setAutoDefault(False)
+        manage.setStyleSheet("font-size: 11px;")
+        manage.setToolTip(
+            "Every group, finished and archived ones included: rename them, "
+            "change the tag they file under, or put a finished batch away.")
+        manage.clicked.connect(panel._open_group_manager)
+        brow.addWidget(manage)
+        brow.addStretch(1)
+        refresh = QPushButton("⟳")
+        refresh.setFixedWidth(28)
+        refresh.setAutoDefault(False)
+        refresh.clicked.connect(lambda: self.refresh())
+        brow.addWidget(refresh)
+        lcol.addLayout(brow)
+        splitter.addWidget(left)
+
+        # ── right: the group on top, the gap you clicked underneath ──
+        #
+        # One page that does the lot: pick a group, see what it is, pick a gap
+        # inside it and edit or send it without ever leaving for the Gaps page.
+        right = QSplitter(Qt.Orientation.Vertical)
+        top = QWidget()
+        rcol = QVBoxLayout(top)
+        rcol.setContentsMargins(6, 0, 0, 0)
+        rcol.setSpacing(6)
+        self._title = QLabel("")
+        self._title.setTextFormat(Qt.TextFormat.RichText)
+        self._title.setWordWrap(True)
+        rcol.addWidget(self._title)
+        self._state = QLabel("")
+        self._state.setTextFormat(Qt.TextFormat.RichText)
+        self._state.setWordWrap(True)
+        rcol.addWidget(self._state)
+        self._meta = QLabel("")
+        self._meta.setTextFormat(Qt.TextFormat.RichText)
+        self._meta.setWordWrap(True)
+        self._meta.setStyleSheet("font-size: 11px;")
+        self._meta.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        rcol.addWidget(self._meta)
+
+        # The same condensing as the gap pane, for the same reason: Bulk
+        # search and Mass AI Create were the two halves of Work through
+        # standing next to it as rivals. One button sends the group to the
+        # queue; the ▾ holds the halves for when you want only one.
+        self._buttons: dict[str, QPushButton] = {}
+        run_row = QHBoxLayout()
+        run_row.setSpacing(4)
+        b = QPushButton("⚡ Work through…")
+        b.setAutoDefault(False)
+        b.setToolTip(
+            "Park this group's open gaps on the work-through queue. They wait "
+            "there — add as many groups as you like — until you press the "
+            "bottom-right button, which works through the lot in one pass, "
+            "then empties.\n\nRight-click a gap to take it back off the "
+            "queue.")
+        self._buttons["work"] = b
+        run_row.addWidget(b)
+
+        # QPushButton for the same reason as the gap pane's — see there.
+        self._work_menu_btn = QPushButton("▾")
+        self._work_menu_btn.setAutoDefault(False)
+        self._work_menu_btn.setStyleSheet(
+            "QPushButton::menu-indicator { image: none; width: 0px; }")
+        self._work_menu_btn.setToolTip(
+            "Send one half only — or run the whole pass now, without queueing "
+            "it.")
+        _gm = QMenu(self._work_menu_btn)
+        _gm.addAction("＋ AI Create only",
+                      lambda: self._run(panel._bulk_send_to_create))
+        _gm.addAction("🔍 AI Browse only",
+                      lambda: self._run(panel._bulk_send_to_browse))
+        _gm.addSeparator()
+        _gm.addAction("⚡ Work through now — skip the queue",
+                      lambda: self._run(panel._work_through_now))
+        self._work_menu_btn.setMenu(_gm)
+        run_row.addWidget(self._work_menu_btn)
+        run_row.addStretch(1)
+        rcol.addLayout(run_row)
+        self._buttons["work"].clicked.connect(
+            lambda: self._run(panel._queue_work_through))
+
+        edit_row = QHBoxLayout()
+        edit_row.setSpacing(4)
+        for key, text, tip in (
+            ("add", "＋ Add KG",
+             "Add a gap straight into this group (⌘N) — no saving it loose "
+             "and moving it afterwards."),
+            ("rename", "Rename / edit tag…",
+             "Rename the group, or change the tag branch it files under. Cards "
+             "already tagged the old way move with it."),
+            ("retag", "Retag…",
+             "Bring this group's tags up to date: rebuild each gap's content "
+             "tag, and put the group's shared branch and source onto cards "
+             "that don't carry them yet. Shows you what changes before "
+             "writing — this is also how you fix a batch made before you set "
+             "the group up."),
+            ("regroup", "Regroup…", "Move these gaps into another group."),
+            ("done", "Close all", "Close every gap in this group."),
+            ("archive", "Archive", "Put a finished batch away. Its gaps and "
+                                   "cards are untouched."),
+        ):
+            b = QPushButton(text)
+            b.setAutoDefault(False)
+            b.setStyleSheet("font-size: 11px;")
+            b.setToolTip(tip)
+            self._buttons[key] = b
+            edit_row.addWidget(b)
+        edit_row.addStretch(1)
+        rcol.addLayout(edit_row)
+        self._buttons["add"].clicked.connect(self._on_add)
+        self._buttons["rename"].clicked.connect(self._on_rename)
+        self._buttons["retag"].clicked.connect(self._on_retag)
+        self._buttons["regroup"].clicked.connect(
+            lambda: self._run(panel._assign_group))
+        self._buttons["done"].clicked.connect(self._on_done)
+        self._buttons["archive"].clicked.connect(self._on_archive)
+
+        self._gaps_lbl = QLabel("")
+        self._gaps_lbl.setStyleSheet("color: gray; font-size: 11px;")
+        rcol.addWidget(self._gaps_lbl)
+        self._gaps = QListWidget()
+        self._gaps.setAlternatingRowColors(True)
+        self._gaps.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._gaps.setItemDelegate(_KGItemDelegate(self._gaps))
+        self._gaps.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._gaps.customContextMenuRequested.connect(self._on_gap_menu)
+        self._gaps.itemDoubleClicked.connect(self._on_gap_opened)
+        self._gaps.setToolTip(
+            "The tick box closes a gap. Highlight the rows you want the pane "
+            "below to act on — click, Shift-click a run, Cmd-click to add one. "
+            "Double-click a gap to open it on the Gaps page. Right-click for "
+            "the same actions the gap list has.")
+        rcol.addWidget(self._gaps, 1)
+        self._gaps.itemSelectionChanged.connect(self._on_gap_select)
+        # Same rule as the Gaps page: the box is the Closed state, the
+        # highlight is the batch. Both pages write through
+        # panel.set_gaps_closed, so a gap closed here is closed there.
+        self._gaps.itemSelectionChanged.connect(self._after_gap_ticks)
+        self._gaps.itemChanged.connect(self._on_gap_ticked)
+        gtick_row = QHBoxLayout()
+        gtick_row.setSpacing(4)
+        for _text, _on in (("Select all", True), ("Clear selection", False)):
+            _tb = QPushButton(_text)
+            _tb.setAutoDefault(False)
+            _tb.setStyleSheet("font-size: 10px; padding: 1px 8px;")
+            _tb.clicked.connect(lambda _c=False, v=_on: self._tick_all_gaps(v))
+            gtick_row.addWidget(_tb)
+        self._gaps_tick_lbl = QLabel("")
+        self._gaps_tick_lbl.setStyleSheet("color: gray; font-size: 10px;")
+        gtick_row.addWidget(self._gaps_tick_lbl)
+        gtick_row.addStretch(1)
+        rcol.addLayout(gtick_row)
+        right.addWidget(top)
+
+        # The gap pane: the same one the Gaps page uses, minus what won't fit
+        # (see KGDetailPane.compact). Its send buttons act on THIS list, not the
+        # Gaps page's selection — hence the provider.
+        self._detail = KGDetailPane(
+            panel, compact=True, selection_provider=self.gap_ids)
+        det_wrap = QScrollArea()
+        det_wrap.setWidgetResizable(True)
+        det_wrap.setFrameShape(QScrollArea.Shape.NoFrame)
+        det_wrap.setWidget(self._detail)
+        right.addWidget(det_wrap)
+        right.setSizes([420, 320])
+        splitter.addWidget(right)
+        splitter.setSizes([260, 640])
+        root.addWidget(splitter, 1)
+        self._show([])
+
+    # ── the list ──────────────────────────────────────────────────────────────
+
+    def refresh(self) -> None:
+        """Rebuild from the store, keeping whatever was selected."""
+        panel = self._panel
+        keep = set(self.selected_names())
+        self._keep_gap = (self._detail._current or {}).get("id") \
+            if getattr(self, "_detail", None) else None
+        self._stats = panel._group_stats()
+        archived = set(panel._archived_groups())
+        ungrouped = kg_store.in_group("")
+        if ungrouped:
+            # Loose gaps are a group in every sense that matters here — they
+            # have a state, they can be worked through, and leaving them off
+            # this page would make it lie about how many gaps you have.
+            self._stats[""] = {
+                "total": len(ungrouped),
+                "open": sum(1 for k in ungrouped
+                            if k.get("status") == "open"),
+                "in_progress": sum(1 for k in ungrouped
+                                   if k.get("status") == "in_progress"),
+                "done": sum(1 for k in ungrouped
+                            if k.get("status") == "done"),
+                "last": "",
+            }
+        names = list(self._stats)
+        if not self._show_archived.isChecked():
+            names = [n for n in names if n not in archived]
+
+        def bucket(n: str) -> int:
+            if n in archived:
+                return 2
+            return 1 if group_state(self._stats[n]) != "Open" else 0
+
+        names.sort(key=lambda n: (bucket(n), kg_store.group_sort_key(n)))
+        self._list.blockSignals(True)
+        self._list.clear()
+        for n in names:
+            self._list.addItem(
+                _KGGroupRow(n, self._stats[n], archived=n in archived))
+        self._list.blockSignals(False)
+        open_n = sum(1 for n in names if group_state(self._stats[n]) == "Open")
+        self._count.setText(
+            f"{len(names)} group(s) · {open_n} open · "
+            f"{len(names) - open_n} closed or empty")
+        if keep:
+            for i in range(self._list.count()):
+                it = self._list.item(i)
+                if it.group_name in keep:
+                    it.setSelected(True)
+        self._on_select()
+
+    def selected_names(self) -> list[str]:
+        return [it.group_name for it in self._list.selectedItems()
+                if isinstance(it, _KGGroupRow)]
+
+    def _ids(self) -> list[str]:
+        ids: list[str] = []
+        seen: set[str] = set()
+        for n in self.selected_names():
+            for kid in self._panel._group_ids(n):
+                if kid not in seen:
+                    seen.add(kid)
+                    ids.append(kid)
+        return ids
+
+    def _run(self, fn) -> None:
+        """Run one of the three batch tools over the picked group(s).
+
+        Done gaps are left out — see KGPanel._live_ids. A group you have worked
+        through is meant to shrink, not to be re-read every time you press the
+        button again."""
+        ids = self._ids()
+        if not ids:
+            tooltip("Pick a group first.")
+            return
+        live = self._panel._live_ids(ids)
+        if not live:
+            tooltip(f"All {len(ids)} gap(s) here are Closed — nothing to run.")
+            return
+        if len(live) != len(ids):
+            tooltip(f"Running {len(live)} gap(s) — "
+                    f"{len(ids) - len(live)} already Closed.")
+        fn(live)
+
+    # ── the right-hand pane ───────────────────────────────────────────────────
+
+    def _on_select(self) -> None:
+        self._show(self.selected_names())
+
+    def _show(self, names: list[str]) -> None:
+        for b in self._buttons.values():
+            b.setEnabled(bool(names))
+        # The ▾ isn't in self._buttons (it's built beside them, not with them),
+        # so it has to be told separately — otherwise it stays live over an
+        # empty pick and offers to send nothing anywhere.
+        self._work_menu_btn.setEnabled(bool(names))
+        if not names:
+            self._title.setText("<h3 style='margin:0'>No group picked</h3>")
+            self._state.setText("")
+            self._meta.setText(
+                "Pick a group on the left to see its tag, its state and the "
+                "gaps in it.")
+            self._gaps_lbl.setText("")
+            self._gaps.clear()
+            self._after_gap_ticks()
+            self._buttons["work"].setText("⚡ Work through…")
+            for k in ("rename", "retag", "archive"):
+                self._buttons[k].setEnabled(False)
+            return
+
+        stats = {n: self._stats.get(n) or {"total": 0, "open": 0,
+                                           "in_progress": 0, "done": 0}
+                 for n in names}
+        total = sum(s["total"] for s in stats.values())
+        open_n = sum(s["open"] + s["in_progress"] for s in stats.values())
+        done_n = sum(s["done"] for s in stats.values())
+        one = names[0] if len(names) == 1 else None
+        archived = set(self._panel._archived_groups())
+
+        if one is not None:
+            self._title.setText(
+                f"<h3 style='margin:0'>{_html.escape(one or NO_GROUP)}</h3>")
+        else:
+            self._title.setText(
+                f"<h3 style='margin:0'>{len(names)} groups</h3>"
+                + _html.escape(", ".join(n or NO_GROUP for n in names)))
+        state = "Open" if open_n else ("Closed" if total else "Empty")
+        detail = (f"{open_n} of {total} gap(s) still open"
+                  if open_n else
+                  (f"all {total} gap(s) done" if total else "no gaps in it"))
+        arch_names = [n for n in names if n in archived]
+        arch = (f" · archived ({len(arch_names)})" if len(names) > 1 and arch_names
+                else (" · archived" if arch_names else ""))
+        self._state.setText(f"<b>{state}</b> — {detail}{arch}")
+
+        rows: list[str] = []
+        if one is not None and one:
+            try:
+                prefix = autotag.group_tag_prefix(one)
+            except Exception:
+                prefix = ""
+            rows.append("Tag branch: <code>"
+                        + _html.escape(prefix or "—") + "</code>")
+            try:
+                ov = autotag.group_override(one) or {}
+            except Exception:
+                ov = {}
+            try:
+                gplan = autotag.group_tag_plan(one)
+            except Exception:
+                gplan = {}
+            if autotag.group_branch(one, gplan or None):
+                depth = autotag.GROUP_LEVEL_LABELS.get(gplan.get("levels"),
+                                                       gplan.get("levels"))
+                rows.append(("Its own branch — outside the auto-tag base. "
+                             if gplan.get("absolute") else
+                             "A shared head node inside the auto-tag base. ")
+                            + f"Under it: {_html.escape(str(depth))}")
+            elif gplan:
+                rows.append("Not tagged as one group — these file by content "
+                            "and source only.")
+            if ov.get("source"):
+                rows.append("Source: " + _html.escape(str(ov["source"])))
+            last = (self._stats.get(one) or {}).get("last") or ""
+            if last:
+                rows.append("Last touched: " + _html.escape(last[:16]))
+        elif one == "":
+            rows.append("Not in a group — these file by content and source "
+                        "only.")
+        else:
+            rows.append(f"{total} gap(s) across {len(names)} groups: "
+                        f"{open_n} open, {done_n} done.")
+            rows.append("Rename and Retag are about one group's own identity, "
+                        "so they're off while several are picked.")
+        self._meta.setText("<br>".join(rows))
+
+        single = one is not None and bool(one)
+        # Enabled for exactly one pick, the ungrouped section included — a new
+        # loose gap is a perfectly good answer there.
+        self._buttons["add"].setEnabled(one is not None)
+        self._buttons["rename"].setEnabled(single)
+        self._buttons["retag"].setEnabled(single)
+        self._buttons["archive"].setEnabled(any(n for n in names))
+        self._buttons["archive"].setText(
+            "Restore" if single and one in archived else "Archive")
+        # The buttons name the LIVE count, so the page never offers to work
+        # through 12 gaps and then quietly run 4. Nothing to run = disabled,
+        # and the button says why rather than just going grey.
+        if open_n:
+            self._buttons["work"].setEnabled(True)
+            self._work_menu_btn.setEnabled(True)
+            self._buttons["work"].setText(f"⚡ Work through {open_n} gap(s)…")
+        else:
+            self._buttons["work"].setEnabled(False)
+            self._work_menu_btn.setEnabled(False)
+            self._buttons["work"].setText("⚡ Work through — all Closed")
+
+        # Rebuilt with signals off, then _on_gap_select is called ONCE at the
+        # end: clearing a list emits a selection change per row, and each one
+        # would flush and reload the pane underneath mid-rebuild.
+        self._gaps.blockSignals(True)
+        self._gaps.clear()
+        # Re-read before the rows are built: a tick made on the Gaps page has
+        # to show on the first refresh, not the second.
+        shown = 0
+        for n in names:
+            for kg in sorted(kg_store.in_group(n),
+                             key=lambda k: ({"open": 0, "in_progress": 0,
+                                             "done": 1}.get(
+                                                 str(k.get("status") or "open"), 0),
+                                            str(k.get("title") or "").lower())):
+                li = _KGListItem(kg)
+                self._gaps.addItem(li)
+                shown += 1
+        self._gaps_lbl.setText(
+            f"Gaps in {'this group' if one is not None else 'these groups'} "
+            f"({shown}) — click one to edit it below, double-click to open it "
+            "on the Gaps page")
+        keep_gap = getattr(self, "_keep_gap", None)
+        self._keep_gap = None
+        if keep_gap:
+            for i in range(self._gaps.count()):
+                it = self._gaps.item(i)
+                if isinstance(it, _KGListItem) and it.kg_id == keep_gap:
+                    self._gaps.setCurrentItem(it)
+                    break
+        self._gaps.blockSignals(False)
+        self._on_gap_select()
+        self._after_gap_ticks()
+
+    # ── actions ───────────────────────────────────────────────────────────────
+
+    def _on_menu(self, pos) -> None:
+        it = self._list.itemAt(pos)
+        if isinstance(it, _KGGroupRow) and not it.isSelected():
+            self._list.setCurrentItem(it)
+        names = self.selected_names()
+        if not names:
+            return
+        self._panel._group_menu_for(names, self._list).exec(
+            self._list.mapToGlobal(pos))
+
+    def _on_gap_menu(self, pos) -> None:
+        it = self._gaps.itemAt(pos)
+        if isinstance(it, _KGListItem) and not it.isSelected():
+            self._gaps.setCurrentItem(it)
+        ids = self.gap_ids()
+        if not ids:
+            return
+        menu = self._panel._gap_actions_menu(ids)
+        menu.addSeparator()
+        menu.addAction("Open on the Gaps page",
+                       lambda: self._panel.jump_to_gap(ids[0]))
+        menu.exec(self._gaps.mapToGlobal(pos))
+
+    def _on_gap_select(self) -> None:
+        """Load the clicked gap into the pane underneath, saving whatever the
+        pane was holding first — load() blows the widgets away, so an unsaved
+        title would go with it."""
+        prev = (self._detail._current or {}).get("id")
+        try:
+            if self._detail.flush():
+                self._panel.refresh_row(prev)
+        except Exception as e:
+            print(f"[ankisstant] groups pane flush failed: {e}")
+        items = self._gaps.selectedItems()
+        it = self._gaps.currentItem()
+        if not isinstance(it, _KGListItem) or it not in items:
+            it = next((x for x in items if isinstance(x, _KGListItem)), None)
+        if it is None:
+            self._detail.load(None)
+            return
+        self._detail.refresh_send_labels(len(self.gap_ids()))
+        # Extending a selection over the gap already loaded must not reload it —
+        # that would revert edits still in the boxes.
+        if prev and prev == it.kg_id:
+            return
+        self._detail.load(kg_store.get(it.kg_id))
+
+    def _on_gap_opened(self, item) -> None:
+        if isinstance(item, _KGListItem) and item.kg_id:
+            self._panel.jump_to_gap(item.kg_id)
+
+    # ── ticking ───────────────────────────────────────────────────────────────
+
+    def gap_ids(self) -> list[str]:
+        """What this page's pane and menus act on: the HIGHLIGHTED gaps. Same
+        rule as the Gaps page, so the two lists behave identically."""
+        return [x.kg_id for x in self._gaps.selectedItems()
+                if isinstance(x, _KGListItem) and x.kg_id]
+
+    def _on_gap_ticked(self, item) -> None:
+        """The box on a row closes that gap — see _KGListItem. Deferred for the
+        same reason the Gaps page defers: the write rebuilds this list, and
+        rebuilding it inside its own itemChanged tears down the row mid-signal."""
+        if not isinstance(item, _KGListItem) or not item.kg_id:
+            return
+        kid = item.kg_id
+        closed = item.checkState() == Qt.CheckState.Checked
+        QTimer.singleShot(0, lambda: self._close_gap(kid, closed))
+
+    def _close_gap(self, kid: str, closed: bool) -> None:
+        # No refresh of our own: set_gaps_closed ends in panel.refresh_list(),
+        # which rebuilds this page when it is the one on show.
+        self._panel.set_gaps_closed([kid], closed)
+
+    def _tick_all_gaps(self, on: bool) -> None:
+        """Highlight every gap this group shows, or drop the highlight. The
+        batch-building gesture, now that the box means Closed."""
+        self._gaps.clearSelection()
+        if on:
+            for it in _gap_items(self._gaps):
+                it.setSelected(True)
+        self._after_gap_ticks()
+
+    def _after_gap_ticks(self) -> None:
+        n = len(self.gap_ids())
+        self._gaps_tick_lbl.setText(
+            "" if not n else f"{n} selected" if n > 1 else "1 selected")
+        try:
+            self._detail.refresh_send_labels(n)
+        except Exception as e:
+            print(f"[ankisstant] couldn't relabel the groups pane: {e}")
+
+    def _on_rename(self) -> None:
+        """Rename is genuinely one-at-a-time — you are typing the new name.
+
+        It says so instead of doing nothing: both buttons stayed enabled on a
+        multi-select and then returned silently, which reads as a broken
+        button rather than as a restriction."""
+        names = [n for n in self.selected_names() if n]
+        if not names:
+            return
+        if len(names) > 1:
+            tooltip("Rename takes one group at a time — you're naming it. "
+                    f"{len(names)} are picked.")
+            return
+        self._panel._rename_group(names[0])
+        self.refresh()
+
+    def _on_retag(self) -> None:
+        names = [n for n in self.selected_names() if n]
+        if not names:
+            return
+        self._panel._retag_groups(names)
+        self.refresh()
+
+    def _on_add(self) -> None:
+        """Add a gap into the one group picked here.
+
+        Off while several are picked: a new gap belongs to one batch, and
+        silently choosing the first of five would be a worse answer than
+        asking you to narrow it down."""
+        names = self.selected_names()
+        if len(names) != 1:
+            tooltip("Pick one group to add into.")
+            return
+        self._panel._on_add_kg(group=names[0])
+        self.refresh()
+
+    def _on_done(self) -> None:
+        ids = self._ids()
+        if not ids:
+            return
+        self._panel._bulk_set_status(ids, "done")
+        self.refresh()
+
+    def _on_archive(self) -> None:
+        names = [n for n in self.selected_names() if n]
+        if not names:
+            return
+        archived = set(self._panel._archived_groups())
+        if len(names) == 1 and names[0] in archived:
+            self._panel._set_group_archived(names[0], False)
+        else:
+            self._panel._archive_groups([n for n in names
+                                         if n not in archived])
+        self.refresh()
 
 
 class KnowledgeGapsPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._filter = "open"
-        # Sub-toggle on the Done filter — false by default so dismissed
-        # items stay hidden unless explicitly requested.
-        self._include_dismissed: bool = False
         self._build()
         self.refresh_list()
 
     def showEvent(self, ev):
         super().showEvent(ev)
+        # The queue can be added to from the Groups page, or emptied from the
+        # dashboard, while this page is off screen.
+        self.refresh_work_badge()
         # Tag completer on the detail pane's tag field is stale after a
         # session of adding new tags; rebuild on every show.
         try:
@@ -2900,6 +3790,42 @@ class KnowledgeGapsPanel(QWidget):
         title.setTextFormat(Qt.TextFormat.RichText)
         title_row.addWidget(title)
         title_row.addStretch(1)
+        # View switch. Groups used to be a horizontal chip row, which stopped
+        # being readable at about eight of them and could only ever filter this
+        # list — they get a page of their own instead.
+        self._view = "gaps"
+        self._view_buttons: dict[str, QPushButton] = {}
+        # Deliberately bigger than the filter chips below them: these switch the
+        # whole page, the chips only narrow one list, and a switch that reads
+        # like a filter gets missed. The checked one is filled AND bold — the
+        # state is never carried by colour alone.
+        from ..core import synapse as _syn
+        _sel_bg = _syn.color("blue", "palette(highlight)")
+        _sel_fg = _syn.color("surface", "palette(highlighted-text)")
+        _hover = _syn.color("hover_subtle", "rgba(127,127,127,0.12)")
+        _view_css = (
+            "QPushButton { padding: 6px 20px; font-size: 13px; "
+            "border: 1px solid rgba(127,127,127,0.35); "
+            "border-radius: 6px; background: transparent; }"
+            f"QPushButton:checked {{ background: {_sel_bg}; color: {_sel_fg}; "
+            "font-weight: bold; }"
+            f"QPushButton:hover:!checked {{ background: {_hover}; }}")
+        for _key, _text, _tip in (
+            ("gaps", "📋 Gaps", "Every gap, in group sections."),
+            ("groups", "🗂 Groups",
+             "Your groups: what each one is tagged as, whether it's open or "
+             "closed, and every gap in it."),
+        ):
+            _b = QPushButton(_text)
+            _b.setCheckable(True)
+            _b.setAutoDefault(False)
+            _b.setMinimumHeight(30)
+            _b.setToolTip(_tip)
+            _b.setStyleSheet(_view_css)
+            _b.clicked.connect(lambda _c=False, k=_key: self._set_view(k))
+            self._view_buttons[_key] = _b
+            title_row.addWidget(_b)
+        self._view_buttons["gaps"].setChecked(True)
         title_row.addWidget(make_help_button(
             "Knowledge Gaps — help",
             "<h3>What it does</h3>"
@@ -2908,22 +3834,37 @@ class KnowledgeGapsPanel(QWidget):
             "<h3>Workflow</h3>"
             "<ol>"
             "<li>Add a KG via <b>＋ Add KG</b> (here or from the home screen).</li>"
-            "<li>Pick a KG. Either <b>Send to Browse</b> to find existing cards, "
-            "or <b>Create card from this KG</b> to draft a new one.</li>"
+            "<li><b>Highlight</b> the gaps you want — click, Shift-click a "
+            "run, Cmd-click to add one, or press <i>Select all</i>. Cmd-click a "
+            "group header to act on the whole group. The <b>tick box</b> is not "
+            "the selection: ticking a gap CLOSES it, which is also what a "
+            "finished work-through pass does to it.</li>"
+            "<li>Press <b>⚡ Work through</b> to park them on the queue. Send "
+            "as many as you like, from either page; they wait there, and they "
+            "survive quitting Anki.</li>"
+            "<li>Press the <b>bottom-right</b> button to work through the "
+            "whole queue in one pass — your deck is searched for each gap AND "
+            "cards are written for whatever nothing covers. Right-click it to "
+            "clear the queue instead. The <b>▾</b> beside Work through has "
+            "<i>AI Create only</i> and <i>AI Browse only</i> if you want just "
+            "one half.</li>"
+            "<li>The <b>🏷</b> and <b>🔎</b> buttons open Anki's own Browse "
+            "screen on the gap's title — as a tag search and a card search.</li>"
             "<li>For <b>LO</b>-type KGs, the detail pane shows an inline "
             "<i>Analyse this LO</i> section that pulls cards under the LO's tag "
             "and flags concepts they don't cover — accepted gaps append into "
             "the LO's Notes.</li>"
             "<li>When a card is added (or matching cards re-graded), the KG "
-            "is marked Done automatically.</li>"
+            "is closed automatically.</li>"
             "</ol>",
             self,
         ))
         root.addLayout(title_row)
 
         intro = QLabel(
-            "Every gap from every source. Pick one, then send it to Browse or "
-            "straight to Create."
+            "Every gap from every source. Tick the ones you want, press ⚡ Work "
+            "through to park them, then work through the lot with the button "
+            "in the bottom right."
         )
         intro.setStyleSheet("color: gray; font-size: 11px;")
         intro.setWordWrap(True)
@@ -2931,38 +3872,52 @@ class KnowledgeGapsPanel(QWidget):
 
         # Filter chips — two rows: status filters on top, type filters below.
         self._chip_buttons: dict[str, QPushButton] = {}
-        # Status row is built directly so we can wedge the "Include dismissed"
-        # toggle onto the end after the Open / Done chips.
         status_row = QHBoxLayout()
         status_row.setSpacing(4)
         for entry in _STATUS_FILTERS:
             self._add_chip(status_row, entry)
-        # Include-dismissed sub-toggle, only meaningful when Done is active.
-        self._include_dismissed_cb = QCheckBox("Include dismissed")
-        self._include_dismissed_cb.setStyleSheet("font-size: 11px; color: gray;")
-        self._include_dismissed_cb.setToolTip(
-            "Dismissed Done items are hidden by default. Tick to include them "
-            "in the Done view."
-        )
-        self._include_dismissed_cb.toggled.connect(self._on_include_dismissed_toggled)
-        status_row.addWidget(self._include_dismissed_cb)
         status_row.addStretch(1)
-        root.addLayout(status_row)
+        # Both filter rows live in one wrapper so the Groups page can hide them
+        # in a single call: they filter the gap list, and the gap list is not on
+        # screen there.
+        self._filters_wrap = QWidget()
+        fcol = QVBoxLayout(self._filters_wrap)
+        fcol.setContentsMargins(0, 0, 0, 0)
+        fcol.setSpacing(4)
+        fcol.addLayout(status_row)
         # Types row is rebuilt on every settings save (see refresh_chips).
         self._type_chip_row_holder = QHBoxLayout()
-        root.addLayout(self._type_chip_row_holder)
+        fcol.addLayout(self._type_chip_row_holder)
+        root.addWidget(self._filters_wrap)
         self._rebuild_type_chip_row()
-        # Groups row. Unlike types (a settings-managed list) groups are derived
-        # from the gaps themselves, so this rebuilds whenever the set of live
-        # groups changes — see refresh_list.
-        self._group_chip_row_holder = QHBoxLayout()
-        root.addLayout(self._group_chip_row_holder)
+        # Groups are derived from the gaps themselves rather than settings, so
+        # the Groups page is rebuilt whenever the live set changes — see
+        # refresh_list and _on_groups_changed.
         self._known_groups: list[str] = []
+        # Cmd-clicked group headers. Deliberately NOT the list's selection model
+        # (headers are unselectable, which is what keeps the gap-level bulk
+        # actions honest) — the panel owns this and the headers render it.
+        self._marked_groups: set[str] = set()
+        self._last_marked: str | None = None
+        # The Closed gaps, by id — the tri-state for the group headers, which
+        # have to answer for gaps that are collapsed out of sight. Rebuilt from
+        # the store on every refresh_list; the STATE lives in kg_queue.json,
+        # not here. A gap's own row reads its own status (_KGListItem.refresh).
+        self._done_ids: set[str] = set()
+        # Set while tick state is being written programmatically, so the
+        # itemChanged handler doesn't recurse through its own writes.
+        self._tick_guard = False
+        # A click that landed on a header's tick box must not also collapse the
+        # group. Qt toggles the check state before it emits itemClicked, so the
+        # tick handler can veto the click that is about to arrive.
+        self._suppress_next_click = False
+        # Visible gap ids per group, filled by refresh_list. A header tick ticks
+        # these — read from here rather than from the rows, so ticking a
+        # COLLAPSED group still ticks the gaps inside it.
+        self._group_members: dict[str, list[str]] = {}
         self._archived_set: set[str] = set(self._archived_groups())
-        self._rebuild_group_chip_row()
         if self._filter in self._chip_buttons:
             self._chip_buttons[self._filter].setChecked(True)
-        self._refresh_include_dismissed_visibility()
 
         # Splitter: list / detail
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -2973,6 +3928,24 @@ class KnowledgeGapsPanel(QWidget):
         lcol = QVBoxLayout(left)
         lcol.setContentsMargins(0, 0, 6, 0)
         lcol.setSpacing(4)
+        # With the chip row gone, nothing else says the list is showing one
+        # group — so the list says it itself, with the way out beside it.
+        self._group_filter_row = QWidget()
+        gfr = QHBoxLayout(self._group_filter_row)
+        gfr.setContentsMargins(0, 0, 0, 0)
+        gfr.setSpacing(6)
+        self._group_filter_lbl = QLabel("")
+        self._group_filter_lbl.setTextFormat(Qt.TextFormat.RichText)
+        self._group_filter_lbl.setStyleSheet("font-size: 11px;")
+        self._group_filter_lbl.setWordWrap(True)
+        gfr.addWidget(self._group_filter_lbl, 1)
+        gf_clear = QPushButton("Show all")
+        gf_clear.setAutoDefault(False)
+        gf_clear.setStyleSheet("font-size: 11px; padding: 1px 8px;")
+        gf_clear.clicked.connect(lambda: self.set_filter("all"))
+        gfr.addWidget(gf_clear)
+        self._group_filter_row.setVisible(False)
+        lcol.addWidget(self._group_filter_row)
         self._count_lbl = QLabel("")
         self._count_lbl.setStyleSheet("color: gray; font-size: 11px;")
         lcol.addWidget(self._count_lbl)
@@ -2984,9 +3957,27 @@ class KnowledgeGapsPanel(QWidget):
         self._list.itemSelectionChanged.connect(self._on_select)
         self._list.setItemDelegate(_KGItemDelegate(self._list))
         self._list.itemClicked.connect(self._on_item_clicked)
+        self._list.itemChanged.connect(self._on_item_checked)
         lcol.addWidget(self._list, 1)
+        tick_row = QHBoxLayout()
+        tick_row.setSpacing(4)
+        for _text, _on in (("Select all", True), ("Clear selection", False)):
+            _b = QPushButton(_text)
+            _b.setAutoDefault(False)
+            _b.setStyleSheet("font-size: 10px; padding: 1px 8px;")
+            _b.clicked.connect(lambda _c=False, v=_on: self._select_all(v))
+            tick_row.addWidget(_b)
+        self._tick_lbl = QLabel("")
+        self._tick_lbl.setStyleSheet("color: gray; font-size: 10px;")
+        tick_row.addWidget(self._tick_lbl)
+        tick_row.addStretch(1)
+        lcol.addLayout(tick_row)
         sel_hint = QLabel(
-            "Shift/Cmd-click to select several, then right-click for bulk actions."
+            "The tick box closes a gap — tick it when you're done with it. "
+            "Tick a group header to close everything in it. The buttons act on "
+            "the HIGHLIGHTED rows: click, Shift-click a run, Cmd-click to add "
+            "one, or press Select all. Cmd-click a group header to act on the "
+            "whole group, collapsed or not."
         )
         sel_hint.setStyleSheet("color: gray; font-size: 10px;")
         sel_hint.setWordWrap(True)
@@ -2994,7 +3985,12 @@ class KnowledgeGapsPanel(QWidget):
         btn_row = QHBoxLayout()
         add_btn = QPushButton("＋ Add KG")
         add_btn.setAutoDefault(False)
-        add_btn.clicked.connect(self._on_add_kg)
+        add_btn.setToolTip(
+            "Add one gap (⌘N). Prefilled with the group you are working in — "
+            "the one you have picked, marked, or filtered to.")
+        # Lambda, not the bound method: clicked() passes `checked`, which would
+        # land in `group` and quietly kill the prefill.
+        add_btn.clicked.connect(lambda: self._on_add_kg())
         import_btn = QPushButton("⇪ Bulk import")
         import_btn.setAutoDefault(False)
         import_btn.setToolTip(
@@ -3051,7 +4047,7 @@ class KnowledgeGapsPanel(QWidget):
         self._clear_btn.setAutoDefault(False)
         self._clear_btn.setStyleSheet("font-size: 11px;")
         self._clear_btn.setToolTip(
-            "Remove every Done KG (including dismissed). Open items stay."
+            "Remove every Closed KG. Open ones stay."
         )
         self._clear_btn.clicked.connect(self._on_clear_completed)
         clear_row.addWidget(self._clear_btn)
@@ -3078,7 +4074,92 @@ class KnowledgeGapsPanel(QWidget):
         splitter.addWidget(right_wrap)
 
         splitter.setSizes([280, 620])
-        root.addWidget(splitter, 1)
+
+        # Two pages: the gaps, and the groups.
+        self._stack = QStackedWidget()
+        self._stack.addWidget(splitter)
+        self._groups_view = _GroupsView(self)
+        self._stack.addWidget(self._groups_view)
+        root.addWidget(self._stack, 1)
+
+        # The queue, bottom right of the whole page — OUTSIDE the stack, so it
+        # is in the same corner whichever page you are on. It is the one
+        # control here that isn't about the gap in front of you: it is
+        # everything you've parked, and pressing it works through the lot.
+        queue_row = QHBoxLayout()
+        queue_row.addStretch(1)
+        self._work_queue_btn = QPushButton("⚡ Work through queue")
+        self._work_queue_btn.setAutoDefault(False)
+        self._work_queue_btn.setMinimumHeight(30)
+        self._work_queue_btn.setStyleSheet(
+            "QPushButton { padding: 5px 16px; font-size: 12px; "
+            "border: 1px solid rgba(127,127,127,0.35); border-radius: 6px; }")
+        self._work_queue_btn.clicked.connect(self._run_work_queue)
+        self._work_queue_btn.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self._work_queue_btn.customContextMenuRequested.connect(
+            self._work_queue_menu)
+        queue_row.addWidget(self._work_queue_btn)
+        root.addLayout(queue_row)
+        self.refresh_work_badge()
+
+        # ⌘N / Ctrl+N adds a gap, from either page. Scoped to this widget and
+        # its children rather than the window, so it can't fire while another
+        # Ankisstant tool is on screen. StandardKey.New rather than a literal
+        # "Ctrl+N" so it is ⌘N on his Mac and Ctrl+N everywhere else.
+        self._add_shortcut = QShortcut(
+            QKeySequence(QKeySequence.StandardKey.New), self)
+        self._add_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._add_shortcut.activated.connect(lambda: self._on_add_kg())
+
+    # ── the two pages ────────────────────────────────────────────────────────
+
+    def _set_view(self, key: str) -> None:
+        self._view = key if key in self._view_buttons else "gaps"
+        for k, b in self._view_buttons.items():
+            b.setChecked(k == self._view)
+        self._filters_wrap.setVisible(self._view == "gaps")
+        self._stack.setCurrentIndex(1 if self._view == "groups" else 0)
+        if self._view == "groups":
+            self._groups_view.refresh()
+
+    def jump_to_gap(self, kg_id: str) -> None:
+        """Show one gap on the Gaps page, whatever page you were on and
+        whatever filter is set. A gap opened from the Groups page is usually
+        done or dismissed, so the filter is widened rather than leaving you on
+        an empty list wondering where it went."""
+        self._set_view("gaps")
+        # A gap inside a collapsed section has no row to select, so its section
+        # is opened before we go looking for it.
+        grp = str((kg_store.get(kg_id) or {}).get("group") or "").strip()
+        if grp in set(self._collapsed_groups()):
+            self._set_group_collapsed(grp, False)
+        self.refresh_list(preserve_selection=kg_id)
+        it = self._row_for(kg_id)
+        if it is None:
+            self.set_filter("all")
+            self.refresh_list(preserve_selection=kg_id)
+            it = self._row_for(kg_id)
+        if it is not None:
+            self._list.setCurrentItem(it)
+            self._list.scrollToItem(it)
+
+    def _row_for(self, kg_id: str):
+        for i in range(self._list.count()):
+            it = self._list.item(i)
+            if isinstance(it, _KGListItem) and it.kg_id == kg_id:
+                return it
+        return None
+
+    def _refresh_group_filter_banner(self) -> None:
+        on = self._filter.startswith("group:")
+        if on:
+            name = self._filter.split(":", 1)[1]
+            self._group_filter_lbl.setText(
+                "Showing one group: <b>"
+                + _html.escape(name or NO_GROUP) + "</b>")
+        self._group_filter_row.setVisible(on)
 
     # ── chip rows ────────────────────────────────────────────────────────────
 
@@ -3188,19 +4269,7 @@ class KnowledgeGapsPanel(QWidget):
 
     def _set_filter(self, key: str) -> None:
         self._filter = key
-        self._refresh_include_dismissed_visibility()
         self.refresh_list()
-
-    def _on_include_dismissed_toggled(self, checked: bool) -> None:
-        self._include_dismissed = bool(checked)
-        self.refresh_list()
-
-    def _refresh_include_dismissed_visibility(self) -> None:
-        # Only meaningful when the Done filter is active.
-        try:
-            self._include_dismissed_cb.setVisible(self._filter == "done")
-        except Exception:
-            pass
 
     def _matches_filter(self, kg: dict) -> bool:
         f = self._filter
@@ -3210,23 +4279,15 @@ class KnowledgeGapsPanel(QWidget):
         grp = str(kg.get("group") or "").strip()
         if grp and grp in self._archived_set and f != f"group:{grp}":
             return False
+        # Closed is status == done, and Open is everything else — in_progress
+        # included, because a gap handed to a tool is still one you haven't
+        # closed, and sending it somewhere must not make it vanish from under
+        # you. Dismissed doesn't enter into it any more: it is just Closed.
         status = kg.get("status", "open")
-        dismissed = bool(kg.get("dismissed", False))
         if f == "open":
-            # Not-yet-done, in one view: sending a gap to Browse must not make it
-            # disappear out from under you. The "In progress" chip isolates the
-            # sent ones when you want just those.
-            return status in ("open", "in_progress")
-        if f == "in_progress":
-            return status == "in_progress"
+            return status != "done"
         if f == "done":
-            # By default hide dismissed items even within the Done filter;
-            # the "Include dismissed" toggle flips this back on.
-            if status != "done":
-                return False
-            if dismissed and not self._include_dismissed:
-                return False
-            return True
+            return status == "done"
         if f.startswith("type:"):
             return kg.get("type", "kg") == f.split(":", 1)[1]
         if f.startswith("group:"):
@@ -3243,7 +4304,7 @@ class KnowledgeGapsPanel(QWidget):
         items = kg_store.load_all()
         # Active items above done; newest first within each bucket.
         # Python's sort is stable so we can apply secondary then primary.
-        status_order = {"open": 0, "in_progress": 1, "done": 2}
+        status_order = {"open": 0, "in_progress": 0, "done": 1}
         items.sort(key=lambda k: k.get("created_at", ""), reverse=True)
         items.sort(key=lambda k: status_order.get(k.get("status", "open"), 4))
 
@@ -3256,6 +4317,13 @@ class KnowledgeGapsPanel(QWidget):
         self._clear_btn.setEnabled(done_count > 0)
 
         prev_id = preserve_selection
+        # The WHOLE selection, not just the current row. Every bulk action ends
+        # in a rebuild, and a rebuild that keeps one id collapsed eleven
+        # selected gaps down to one — so the second half of "mark these Done,
+        # then dismiss them" quietly acted on a single gap, and the pane's
+        # labels went back to saying "Status:" as though nothing were selected.
+        prev_ids = [i.kg_id for i in self._list.selectedItems()
+                    if isinstance(i, _KGListItem) and i.kg_id]
         if prev_id is None:
             sel = self._list.currentItem()
             if isinstance(sel, _KGListItem):
@@ -3270,25 +4338,52 @@ class KnowledgeGapsPanel(QWidget):
                        or self._filter == f"group:{g}"]
         if live_groups != self._known_groups:
             self._known_groups = live_groups
-            QTimer.singleShot(0, self._rebuild_group_chip_row)
+            QTimer.singleShot(0, self._on_groups_changed)
+        self._refresh_group_filter_banner()
+        if self._view == "groups":
+            self._groups_view.refresh()
 
         collapsed = set(self._collapsed_groups())
         self._list.blockSignals(True)
         self._list.clear()
         target_row = -1
-        for name, members in self._sections(visible):
+        row_of: dict[str, int] = {}
+        sections = self._sections(visible)
+        # A group that is no longer on the page can't stay selected — otherwise
+        # a filter change leaves an invisible group in the next batch.
+        self._marked_groups &= {name for name, _ in sections}
+        if self._last_marked not in self._marked_groups:
+            self._last_marked = None
+        self._group_members = {
+            name: [str(k.get("id") or "") for k in members if k.get("id")]
+            for name, members in sections
+        }
+        # Which gaps are Closed, for the group headers' tick boxes. From the
+        # WHOLE store, not the page: a collapsed group still has to know, and
+        # the header is the only thing that can say so while it is shut.
+        self._done_ids = {str(k.get("id") or "") for k in items
+                          if k.get("status") == "done"}
+        for name, members in sections:
             is_collapsed = name in collapsed
             open_n = sum(1 for k in members if k.get("status") == "open")
             done_n = sum(1 for k in members if k.get("status") == "done")
             self._list.addItem(
                 _KGGroupHeader(name, len(members), open_n, is_collapsed,
                                done_n=done_n,
-                               archived=name in self._archived_set))
+                               archived=name in self._archived_set,
+                               marked=name in self._marked_groups,
+                               checked={
+                                   Qt.CheckState.Checked: "on",
+                                   Qt.CheckState.PartiallyChecked: "part",
+                               }.get(self._header_state(name), "off")))
             if is_collapsed:
                 continue
             for kg in members:
+                # The row sets its own box from the gap's status (see
+                # _KGListItem.refresh) — nothing to restore here.
                 li = _KGListItem(kg)
                 self._list.addItem(li)
+                row_of[str(kg.get("id") or "")] = self._list.count() - 1
                 if prev_id and kg.get("id") == prev_id:
                     target_row = self._list.count() - 1
         self._list.blockSignals(False)
@@ -3311,6 +4406,26 @@ class KnowledgeGapsPanel(QWidget):
                 self._list.setCurrentRow(first)
             else:
                 self._detail.load(None)
+
+        # Put the rest of the selection back. Anything the filter has just
+        # hidden (the gaps you marked Done, on a page that hides Done) simply
+        # isn't there to reselect, which is the right answer — the count in the
+        # pane's labels then tells you so rather than over-promising.
+        want = set(prev_ids) | ({prev_id} if prev_id else set())
+        cur = self._list.currentRow()
+        extra = sorted({row_of[k] for k in want if k in row_of} - {cur})
+        if extra:
+            self._list.blockSignals(True)
+            for r in extra:
+                it = self._list.item(r)
+                if it is not None:
+                    it.setSelected(True)
+            self._list.blockSignals(False)
+        # The pane's labels name the selection ("Status of 11:"). Left unsaid,
+        # they went on claiming eleven after a rebuild had reduced it.
+        self._after_selection_changed()
+        # A gap deleted, imported or closed changes what is queued too.
+        self.refresh_work_badge()
 
     # ── groups ───────────────────────────────────────────────────────────────
 
@@ -3357,57 +4472,163 @@ class KnowledgeGapsPanel(QWidget):
             print(f"[ankisstant] couldn't save collapse state: {e}")
 
     def _on_item_clicked(self, item) -> None:
-        if isinstance(item, _KGGroupHeader):
-            self._set_group_collapsed(item.group_name, not item.collapsed)
-            self.refresh_list()
+        # The click that toggled a tick box is not also a click on the row.
+        # Without this, ticking a group folded it shut in the same gesture.
+        if self._suppress_next_click:
+            self._suppress_next_click = False
+            return
+        if not isinstance(item, _KGGroupHeader):
+            return
+        mods = QApplication.keyboardModifiers()
+        # Qt reports Cmd as ControlModifier on macOS, so this is Cmd-click here
+        # and Ctrl-click elsewhere — the same "add to the selection" gesture the
+        # list already uses for gaps.
+        if mods & Qt.KeyboardModifier.ControlModifier:
+            self._toggle_group_mark(item.group_name)
+            return
+        if mods & Qt.KeyboardModifier.ShiftModifier and self._last_marked is not None:
+            self._extend_group_marks(item.group_name)
+            return
+        # A plain click is the reset — it drops any group selection and then
+        # does exactly what it always did.
+        if self._marked_groups:
+            self._marked_groups.clear()
+            self._last_marked = None
+        self._on_collapse_clicked(item)
 
-    def _rebuild_group_chip_row(self) -> None:
-        """Rebuild the group filter chips. Mirrors _rebuild_type_chip_row, with
-        the difference that the entries are derived from the gaps rather than
-        read from settings — so the row disappears entirely when nothing is
-        grouped, instead of showing an empty 'Groups:' label forever."""
-        for key in list(self._chip_buttons.keys()):
-            if key.startswith("group:"):
-                btn = self._chip_buttons.pop(key)
-                btn.setParent(None)
-                btn.deleteLater()
-        while self._group_chip_row_holder.count():
-            item = self._group_chip_row_holder.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
-        groups = self._known_groups
-        if not groups and self._filter.startswith("group:"):
-            # The active group chip has just stopped existing (emptied, or
+    def _on_collapse_clicked(self, header) -> None:
+        self._set_group_collapsed(header.group_name, not header.collapsed)
+        self.refresh_list()
+
+    # ── closing, and choosing what to act on ─────────────────────────────────
+
+    def _on_item_checked(self, item) -> None:
+        """A tick box changed: close, or reopen, what it belongs to.
+
+        Deferred a tick before it writes. The write ends in refresh_list(),
+        which clears the list — and clearing a list inside a signal emitted BY
+        one of its own items tears down the object mid-signal. The same reason
+        _on_groups_changed is deferred a few lines up."""
+        if self._tick_guard:
+            return
+        if isinstance(item, _KGGroupHeader):
+            # Part-ticked is a state a header REPORTS, never one you click
+            # into: clicking a part-closed group closes the rest of it.
+            closed = item.checkState() != Qt.CheckState.Unchecked
+            self._suppress_next_click = True
+            ids = list(self._group_members.get(item.group_name, []))
+        elif isinstance(item, _KGListItem) and item.kg_id:
+            closed = item.checkState() == Qt.CheckState.Checked
+            ids = [item.kg_id]
+        else:
+            return
+        if not ids:
+            return
+        # A header's box closes a whole group, and it sits one slip away from
+        # the collapse arrow. Asked only when it would close a batch big enough
+        # to be annoying to put back — never when reopening, which loses
+        # nothing.
+        if closed and isinstance(item, _KGGroupHeader) and len(ids) > 8:
+            n_open = sum(1 for i in ids if i not in self._done_ids)
+            if n_open > 8 and not askUser(
+                    f"Close all {n_open} open gap(s) in "
+                    f"“{item.group_name or NO_GROUP}”?\n\n"
+                    "Untick the header to put them all back."):
+                self.refresh_list()
+                return
+        QTimer.singleShot(0, lambda: self.set_gaps_closed(ids, closed))
+
+    def _select_all(self, on: bool) -> None:
+        """Highlight every gap row on the page, or drop the highlight.
+
+        This is how a batch is built now that the tick box means Closed. Rows
+        only: a header cannot be highlighted, and a COLLAPSED group has no rows
+        at all — Cmd-clicking its header is what covers that (see
+        _toggle_group_mark, and _selected_ids which reads both)."""
+        self._list.clearSelection()
+        if on:
+            for li in _gap_items(self._list):
+                li.setSelected(True)
+        self._after_selection_changed()
+
+    def _header_state(self, name: str):
+        """A group is ticked when all its gaps are Closed, part-ticked when
+        some are.
+
+        Read from the gaps rather than stored, so it can never disagree with
+        the rows underneath it — including when they are collapsed out of
+        sight, which is why it reads the id set and not the items."""
+        ids = self._group_members.get(name, [])
+        if not ids:
+            return Qt.CheckState.Unchecked
+        done = getattr(self, "_done_ids", set())
+        n = sum(1 for i in ids if i in done)
+        if not n:
+            return Qt.CheckState.Unchecked
+        return (Qt.CheckState.Checked if n == len(ids)
+                else Qt.CheckState.PartiallyChecked)
+
+    def _after_selection_changed(self) -> None:
+        """Say how many gaps are selected, and re-label the pane to match."""
+        n = len(self._selected_ids())
+        lbl = getattr(self, "_tick_lbl", None)
+        if lbl is not None:
+            lbl.setText("" if not n else f"{n} selected" if n > 1
+                        else "1 selected")
+        try:
+            self._detail.refresh_send_labels(n)
+        except Exception as e:
+            print(f"[ankisstant] couldn't relabel the pane: {e}")
+
+    # ── selecting several groups ───────────────────────────────────────────────
+
+    def _header_items(self) -> list:
+        """The group headers currently on the page, in page order."""
+        return [it for it in (self._list.item(i)
+                              for i in range(self._list.count()))
+                if isinstance(it, _KGGroupHeader)]
+
+    def _toggle_group_mark(self, name: str) -> None:
+        if name in self._marked_groups:
+            self._marked_groups.discard(name)
+            if self._last_marked == name:
+                self._last_marked = None
+        else:
+            self._marked_groups.add(name)
+            self._last_marked = name
+        self.refresh_list()
+
+    def _extend_group_marks(self, name: str) -> None:
+        """Shift-click: mark every group between the last one marked and this
+        one, in the order they sit on the page."""
+        order = [h.group_name for h in self._header_items()]
+        if self._last_marked not in order or name not in order:
+            self._toggle_group_mark(name)
+            return
+        a, b = sorted((order.index(self._last_marked), order.index(name)))
+        self._marked_groups.update(order[a:b + 1])
+        self._last_marked = name
+        self.refresh_list()
+
+    def _clear_group_marks(self) -> None:
+        self._marked_groups.clear()
+        self._last_marked = None
+        self.refresh_list()
+
+    def _on_groups_changed(self) -> None:
+        """The set of live groups changed. Deferred a tick by every caller:
+        refresh_list can run from inside a widget's own signal handler, and
+        tearing that widget down there is a crash rather than a bug."""
+        if not self._known_groups and self._filter.startswith("group:"):
+            # The group being filtered to has just stopped existing (emptied, or
             # archived from the manager). Fall back to All rather than showing
             # an empty list with no way to tell why.
             self._set_filter("all")
             if "all" in self._chip_buttons:
                 self._chip_buttons["all"].setChecked(True)
-        row = QHBoxLayout()
-        row.setSpacing(4)
-        prefix = QLabel("Groups:" if groups else "Groups: none yet —")
-        prefix.setStyleSheet("color: gray; font-size: 11px;")
-        wrapper = QWidget()
-        wrapper.setLayout(row)
-        row.addWidget(prefix)
-        for g in groups:
-            self._add_chip(row, (f"group:{g}", g))
-        # The manager is the only route to a finished or archived group, so its
-        # button stays put even when there are no chips to sit beside.
-        manage = QPushButton("⚙︎ Manage groups…")
-        manage.setAutoDefault(False)
-        manage.setStyleSheet("font-size: 11px; padding: 2px 8px;")
-        manage.setToolTip(
-            "Every group, finished and archived ones included: rename them, "
-            "change the tag they file under, or put a finished batch away."
-        )
-        manage.clicked.connect(self._open_group_manager)
-        row.addWidget(manage)
-        row.addStretch(1)
-        self._group_chip_row_holder.addWidget(wrapper)
-        if self._filter in self._chip_buttons:
-            self._chip_buttons[self._filter].setChecked(True)
+        self._refresh_group_filter_banner()
+        if self._view == "groups":
+            self._groups_view.refresh()
 
     def _group_ids(self, name: str) -> list[str]:
         """Every KG id in a group — the whole group, not just the rows the
@@ -3415,6 +4636,25 @@ class KnowledgeGapsPanel(QWidget):
         off the header must act on those 12."""
         return [str(kg.get("id") or "")
                 for kg in kg_store.in_group(name) if kg.get("id")]
+
+    def _live_ids(self, ids: list[str]) -> list[str]:
+        """The gaps in a group selection that a RUN should actually touch.
+
+        Sending a group to work-through means "do what's left of it", not "redo
+        the ones I already closed" — a Done gap has had its cards found or
+        written, and re-reading it spends a Read call and a Find pass to
+        rediscover that. So the run and send actions act on the not-Done gaps.
+
+        Edit actions (regroup, retag, archive, mark done) still act on the WHOLE
+        group: those mean the group's identity, not its remaining work. That
+        asymmetry is the point of having this as a separate helper rather than
+        filtering inside _group_ids."""
+        out: list[str] = []
+        for i in ids:
+            kg = kg_store.get(i) or {}
+            if str(kg.get("status") or "open") != "done":
+                out.append(i)
+        return out
 
     def _assign_group(self, ids: list[str]) -> None:
         if not ids:
@@ -3437,7 +4677,11 @@ class KnowledgeGapsPanel(QWidget):
             tooltip("No change — they were already there.")
             return
         if name:
-            tooltip(f"{changed} gap(s) → {name}  ({autotag.group_segment(name)})")
+            # Moving work INTO a batch you had put away wakes it, for the same
+            # reason adding one does — see wake_group.
+            tooltip(f"{changed} gap(s) → {name}  "
+                    f"({autotag.group_segment(name)})"
+                    f"{_woke_suffix(wake_group(name))}")
         else:
             tooltip(f"{changed} gap(s) ungrouped.")
         self.refresh_list()
@@ -3499,38 +4743,204 @@ class KnowledgeGapsPanel(QWidget):
         return self._rename_note_tags(
             [(old, new) for _kg, old, new in changes if old])
 
+    def _planned_backfill(self, members: list[dict],
+                          name: str) -> tuple[list, int]:
+        """Which cards in this group are MISSING a tag the scheme says they
+        earn, and which tags. Returns ([(tag, [nid, ...]), ...], n_cards).
+
+        This is the half of retagging that did not exist. _planned_retag only
+        ever recomputed the CONTENT tag and renamed cards from the old one to
+        the new one — so a card that never carried the group's branch, or the
+        batch's source, could not be given one by any screen in the add-on.
+        Every card written before the written half of a run started applying
+        the full scheme is in exactly that state, and the only repair on offer
+        was to make the cards again.
+
+        The cards are found through each gap's own content tag, which is the
+        one tag they are known to carry.
+        """
+        if mw is None or mw.col is None:
+            return [], 0
+        by_tag: dict[str, set] = {}
+        seen_nids: set = set()
+        plan = autotag.group_tag_plan(name)
+        # One collection search per distinct tag, not per gap: a group's shared
+        # branch and source are the SAME tag for all forty of its gaps, and
+        # looking each up forty times is most of the wait.
+        have_cache: dict[str, set] = {}
+
+        def _notes_under(tag: str) -> set:
+            if tag not in have_cache:
+                try:
+                    have_cache[tag] = set(
+                        mw.col.find_notes(f'"tag:{tag}" OR "tag:{tag}::*"'))
+                except Exception as e:
+                    print(f"[ankisstant] backfill: finding {tag}: {e}")
+                    have_cache[tag] = set()
+            return have_cache[tag]
+        for kg in members:
+            content = str(kg_store.field(kg, "auto_tag") or "").strip()
+            if not content:
+                continue          # no card of its own to find
+            levels = {k: kg_store.field(kg, k)
+                      for k in ("system", "subsystem", "topic")}
+            try:
+                wanted = autotag.tags_for(
+                    levels, group=name, group_plan=plan, tool="knowledge_gaps",
+                    kg_type_key=str(kg.get("type") or "kg").lower())
+            except Exception as e:
+                print(f"[ankisstant] backfill: tags for {kg.get('id')}: {e}")
+                continue
+            wanted = [t for t in wanted if t and t != content]
+            if not wanted:
+                continue
+            nids = _notes_under(content)
+            if not nids:
+                continue          # nothing was ever made from this gap
+            for tag in wanted:
+                missing = [n for n in nids if n not in _notes_under(tag)]
+                if missing:
+                    by_tag.setdefault(tag, set()).update(missing)
+                    seen_nids.update(missing)
+        return ([(t, sorted(n)) for t, n in by_tag.items()], len(seen_nids))
+
+    def _apply_backfill(self, ops: list) -> int:
+        """Put the missing tags on. One bulk write per tag, never per note —
+        looping tag writes over notes is what turns a repair into an
+        out-of-memory crash."""
+        from ..core import anki_utils
+        n = 0
+        for tag, nids in ops:
+            try:
+                n += anki_utils.tag_notes([int(x) for x in nids], tag)
+            except Exception as e:
+                print(f"[ankisstant] backfill: tagging {tag}: {e}")
+        return n
+
     def _retag_group(self, name: str) -> None:
-        """Recompute every KG's auto-tag in this group, previewing first.
+        self._retag_groups([name])
 
-        Preview-first is not politeness: these gaps may already have cards
-        carrying the old tag, and the rename below moves those cards too. You
-        should see the list before it happens."""
-        members = [kg for kg in kg_store.in_group(name) if kg.get("id")]
-        if not members:
-            tooltip("That group is empty.")
+    def _retag_groups(self, names: list[str]) -> None:
+        """Bring these groups' tags up to date, previewing first — both halves:
+
+          * every gap's CONTENT tag, recomputed, with cards already under the
+            old one moved across;
+          * every tag the scheme says the group's cards earn but they do not
+            carry — its shared branch, its source — added to them.
+
+        The second half is the one that was missing, and it is the only way to
+        repair cards written before the written half of a run applied the full
+        scheme. Preview-first is not politeness: this writes to cards already in
+        the collection, and you should see the list before it happens.
+
+        SEVERAL groups at once, in one preview and one checkpoint. Retag was
+        wired to a button that stayed enabled on a multi-select and then did
+        nothing at all — no dialog, no message — which is the worst possible
+        behaviour for the one action that repairs missing tags. Doing them in
+        turn would have meant N confirms and N undo steps for what is one
+        decision.
+        """
+        names = [n for n in dict.fromkeys(names) if n]
+        if not names:
             return
+        # (name, changes, skipped, ops, n_cards) for every group with work to do.
+        jobs: list[tuple] = []
+        empty, skipped_total = 0, 0
+        for name in names:
+            members = [kg for kg in kg_store.in_group(name) if kg.get("id")]
+            if not members:
+                empty += 1
+                continue
+            changes, skipped = self._planned_retag(
+                members, name, autotag.group_tag_plan(name))
+            ops, n_cards = self._planned_backfill(members, name)
+            skipped_total += skipped
+            if changes or ops:
+                jobs.append((name, changes, skipped, ops, n_cards))
 
-        changes, skipped = self._planned_retag(
-            members, name, autotag.group_tag_plan(name))
-        if not changes:
+        if not jobs:
+            if empty == len(names):
+                tooltip("That group is empty." if len(names) == 1
+                        else f"All {empty} of those groups are empty.")
+                return
+            where = (f"“{names[0]}”" if len(names) == 1
+                     else f"any of those {len(names)} groups")
             showWarning(
-                f"Nothing to retag in “{name}”.\n\n"
-                + (f"{skipped} gap(s) have no system/subsystem/topic yet, so "
-                   "there's no tag to build — they get one the first time they "
-                   "go through Browse or Create."
-                   if skipped else "Every tag is already up to date."))
+                f"Nothing to retag in {where}.\n\n"
+                + (f"{skipped_total} gap(s) have no system/subsystem/topic yet, "
+                   "so there's no tag to build — they get one the first time "
+                   "they go through Browse or Create."
+                   if skipped_total else "Every tag is already up to date."))
             return
 
-        body = self._retag_preview_text(
-            changes, skipped,
-            f"Retag {len(changes)} gap(s) in “{name}”?\n\n")
-        if not askUser(body, defaultno=True, title="Retag group"):
+        if len(jobs) == 1:
+            name, changes, skipped, ops, n_cards = jobs[0]
+            head = (f"Retag {len(changes)} gap(s) in “{name}”?\n\n" if changes
+                    else f"Update the tags on “{name}”?\n\n")
+            body = (self._retag_preview_text(changes, skipped, head)
+                    if changes else head)
+            if ops:
+                body += ("\n\nAdding to cards that don't carry them yet:\n"
+                         + "\n".join(
+                             f"• {t}   [{len(n)} card{'s' if len(n) != 1 else ''}]"
+                             for t, n in sorted(ops)[:10])
+                         + (f"\n… and {len(ops) - 10} more"
+                            if len(ops) > 10 else "")
+                         + f"\n\n{n_cards} card(s) affected.")
+        else:
+            # A per-group summary rather than every tag: several groups is
+            # already dozens of lines, and the question being answered here is
+            # "which groups are about to change, and by how much".
+            n_gaps = sum(len(j[1]) for j in jobs)
+            n_cards_all = sum(j[4] for j in jobs)
+            lines = []
+            for name, changes, _sk, ops, n_cards in jobs:
+                bits = []
+                if changes:
+                    bits.append(f"{len(changes)} gap(s) retagged")
+                if ops:
+                    bits.append(f"{len(ops)} tag(s) added to {n_cards} card(s)")
+                lines.append(f"• {name} — " + ", ".join(bits))
+            body = (f"Retag {len(jobs)} group(s)?\n\n"
+                    + "\n".join(lines)
+                    + (f"\n\n{len(names) - len(jobs)} of the groups you picked "
+                       "need no changes." if len(jobs) != len(names) else "")
+                    + (f"\n\n{skipped_total} gap(s) skipped — not classified "
+                       "yet." if skipped_total else "")
+                    + f"\n\n{n_gaps} gap(s) and {n_cards_all} card(s) affected in "
+                      "total. One Ctrl+Z takes all of it back out.")
+
+        if not askUser(body, defaultno=True,
+                       title="Retag group" if len(jobs) == 1 else "Retag groups"):
             return
 
-        moved = self._apply_retag(changes)
+        if hasattr(mw, "checkpoint"):
+            mw.checkpoint("Ankisstant: retag group"
+                          if len(jobs) == 1 else "Ankisstant: retag groups")
+        n_changes = moved = added = affected = 0
+        for _name, changes, _sk, ops, n_cards in jobs:
+            n_changes += len(changes)
+            moved += self._apply_retag(changes) if changes else 0
+            if ops:
+                added += self._apply_backfill(ops)
+                affected += n_cards
+        try:
+            mw.col.reset()
+            mw.reset()
+        except Exception:
+            pass
         self.refresh_list()
-        tooltip(f"Retagged {len(changes)} gap(s)"
-                + (f" and moved {moved} card(s)." if moved else "."), period=3500)
+        bits = []
+        if len(jobs) > 1:
+            bits.append(f"{len(jobs)} groups")
+        if n_changes:
+            bits.append(f"retagged {n_changes} gap(s)")
+        if moved:
+            bits.append(f"moved {moved} card(s)")
+        if added:
+            bits.append(f"added tags to {affected} card(s)")
+        tooltip("Done — " + ", ".join(bits) + "." if bits else "Nothing to do.",
+                period=3500)
 
     # ── renaming, archiving, and the groups manager ──────────────────────────
 
@@ -3653,9 +5063,9 @@ class KnowledgeGapsPanel(QWidget):
 
         # The plan for the values on screen, which are not saved yet — so the
         # preview below is of what OK would actually write.
-        plan = new_override or {
-            "path": autotag.derive_group_segment(new_name),
-            "absolute": False, "levels": True, "source": ""}
+        plan = new_override or autotag.group_tag_plan(
+            new_name, path=autotag.derive_group_segment(new_name),
+            absolute=False)
         changes, skipped = self._planned_retag(members, new_name, plan)
         if changes:
             what = (f"Rename “{name}” to “{new_name}”"
@@ -3690,9 +5100,9 @@ class KnowledgeGapsPanel(QWidget):
         it deliberately works for archived groups — an explicit group filter is
         how you look inside one without un-archiving it."""
         key = f"group:{name}"
-        self._known_groups = []          # force the chip row to include it
+        self._set_view("gaps")
         self._set_filter(key)
-        QTimer.singleShot(0, self._rebuild_group_chip_row)
+        self._refresh_group_filter_banner()
 
     def _open_group_manager(self) -> None:
         _GroupManagerDialog(self, parent=self.window()).exec()
@@ -3755,7 +5165,14 @@ class KnowledgeGapsPanel(QWidget):
         for i in range(self._list.count()):
             li = self._list.item(i)
             if isinstance(li, _KGListItem) and li.kg_id == kg_id:
-                li.refresh(kg)
+                # The row sets its tick box from the status, and that emits
+                # itemChanged — which is the signal that CLOSES a gap. Guarded,
+                # or re-rendering a row would read as ticking its box.
+                self._tick_guard = True
+                try:
+                    li.refresh(kg)
+                finally:
+                    self._tick_guard = False
                 return
 
     def _on_select(self) -> None:
@@ -3768,6 +5185,7 @@ class KnowledgeGapsPanel(QWidget):
         items = self._list.selectedItems()
         if not items:
             self._detail.load(None)
+            self._after_selection_changed()
             return
         # The gap you just CLICKED, not selectedItems()[0] — that's list order,
         # so extending a multi-select downwards left the pane pinned to the
@@ -3778,8 +5196,9 @@ class KnowledgeGapsPanel(QWidget):
         if not isinstance(li, _KGListItem) or li not in items:
             li = next((x for x in items if isinstance(x, _KGListItem)), None)
         if li is None:
+            self._after_selection_changed()
             return
-        self._detail.refresh_send_labels(len(items))
+        self._after_selection_changed()
         # Extending a selection over the gap that's already loaded must not
         # reload it — that would revert edits still in the boxes.
         if prev_id and prev_id == li.kg_id:
@@ -3790,11 +5209,32 @@ class KnowledgeGapsPanel(QWidget):
     # ── bulk actions ───────────────────────────────────────────────────────────
 
     def _selected_ids(self) -> list[str]:
-        ids: list[str] = []
+        """What every bulk action acts on: the HIGHLIGHTED gaps on this page,
+        plus every gap in a MARKED group.
+
+        The tick box is the Closed state now, so choosing a batch is the
+        ordinary list selection — click, Shift-click a run, Cmd-click to add
+        one, or Select all. It used to be the ticks, which put a to-do tick and
+        a selection tick in the same box.
+
+        Marked groups are in because a COLLAPSED group has no rows to
+        highlight, and because "these three groups" is a real batch: Cmd-click
+        the headers (see _toggle_group_mark) and the gap buttons act on all of
+        their gaps.
+
+        Group members lead the list, then the highlighted rows, deduped — order
+        is only what the confirm dialogs show, but it should be stable."""
+        out, seen = [], set()
+        for name in self._marked_groups:
+            for i in self._group_members.get(name, []):
+                if i and i not in seen:
+                    seen.add(i)
+                    out.append(i)
         for li in self._list.selectedItems():
-            if isinstance(li, _KGListItem) and li.kg_id:
-                ids.append(li.kg_id)
-        return ids
+            if isinstance(li, _KGListItem) and li.kg_id and li.kg_id not in seen:
+                seen.add(li.kg_id)
+                out.append(li.kg_id)
+        return out
 
     def _on_list_context_menu(self, pos) -> None:
         # A right-click on a group header is about the GROUP, not the selection
@@ -3807,39 +5247,44 @@ class KnowledgeGapsPanel(QWidget):
         ids = self._selected_ids()
         if not ids:
             return
+        self._gap_actions_menu(ids).exec(self._list.mapToGlobal(pos))
+
+    def _gap_actions_menu(self, ids: list[str]) -> QMenu:
+        """The bulk menu for a set of gaps, built rather than shown, so the
+        Groups page's gap list offers exactly the same actions — one menu, two
+        places it can be raised from."""
         menu = QMenu(self._list)
         n = len(ids)
         label = "1 gap" if n == 1 else f"{n} gaps"
         # The unified pass. First in the menu because it is the one that ends
         # with the gap actually closed: search and create were always two halves
         # of one question ("is this in my deck, and if not, write it").
-        work = menu.addAction(f"⚡ Work through {label}…",
-                              lambda: self._work_through(ids))
+        work = menu.addAction(f"⚡ Work through {label}",
+                              lambda: self._queue_work_through(ids))
         work.setToolTip(
-            "One screen: your deck is searched for every point, and cards are "
-            "written for the points nothing covered — both shown together, "
-            "reviewed together, and added by one button in one undoable step."
+            "Park these on the work-through queue. They wait there until you "
+            "press the bottom-right button, which works through the lot in "
+            "one pass: your deck is searched for every point, cards are "
+            "written for the points nothing covered, and one button adds both "
+            "in one undoable step."
         )
-        menu.addSeparator()
-        # Bulk search runs the whole selection through AI Lecture's engine in one
-        # pass, sized per gap — as opposed to Browse, which works one at a time.
-        bulk = menu.addAction(f"🔍 Bulk search {label}",
-                              lambda: self._bulk_search(ids))
-        bulk.setToolTip(
-            "Search your deck for all of these at once. Each gap is read for how "
-            "broad it is, so a whole-disease gap pulls more cards than a "
-            "one-fact gap, and each gap's matches are tagged under its own tag."
-        )
-        # The generation-side twin of bulk search, and its peer in the menu:
-        # same "size the whole selection, then run it once" shape, except it
-        # WRITES the cards instead of finding them.
-        mass = menu.addAction(f"⚡ Mass AI Create {label}…",
-                              lambda: self._mass_create(ids))
-        mass.setToolTip(
-            "Generate cards for all of these in one run. Each gap is read for how "
-            "broad it is, you set how many cards it's worth, and the whole batch "
-            "is reviewed together before anything is added."
-        )
+        now = menu.addAction(f"⚡ Work through {label} now…",
+                             lambda: self._work_through_now(ids))
+        now.setToolTip("Open the unified pass on these straight away, without "
+                       "parking them first.")
+        # Only when there is something to take off — an always-there entry that
+        # is usually a no-op reads as a second queue button.
+        on_queue = self._queued_set()
+        queued = [i for i in ids if i in on_queue]
+        if queued:
+            off = menu.addAction(
+                f"Take {'it' if len(queued) == 1 else f'{len(queued)} of them'}"
+                " off the queue",
+                lambda: self._unqueue_work_through(queued))
+            off.setToolTip(
+                "Un-send: these stop waiting for the bottom-right button. The "
+                "gaps are not changed — they stay exactly as they are in the "
+                "list.")
         menu.addSeparator()
         grp = menu.addAction(f"Group {label}…",
                              lambda: self._assign_group(ids))
@@ -3849,94 +5294,252 @@ class KnowledgeGapsPanel(QWidget):
             "ends up as one branch of your tag tree."
         )
         menu.addSeparator()
-        menu.addAction(f"Send {label} to Create",
+        menu.addAction(f"＋ AI Create only — {label}",
                        lambda: self._bulk_send_to_create(ids))
-        menu.addAction(f"Send {label} to Browse",
+        menu.addAction(f"🔍 AI Browse only — {label}",
                        lambda: self._bulk_send_to_browse(ids))
         menu.addSeparator()
-        menu.addAction(f"Mark {label} In progress",
-                       lambda: self._bulk_set_status(ids, "in_progress", dismissed=False))
-        menu.addAction(f"Mark {label} Done",
-                       lambda: self._bulk_set_status(ids, "done", dismissed=False))
-        menu.addAction(f"Dismiss {label}",
-                       lambda: self._bulk_set_status(ids, "done", dismissed=True))
+        # Anki's own Browse, on the gap you right-clicked. One title, not six —
+        # see open_anki_browse.
+        first = kg_store.get(ids[0]) or {}
+        first_title = str(first.get("title") or "")
+        if first_title:
+            menu.addAction(
+                "🏷 Find in Anki Browse — tags",
+                lambda t=first_title: open_anki_browse(t, as_tag=True))
+            menu.addAction(
+                "🔎 Find in Anki Browse — cards",
+                lambda t=first_title: open_anki_browse(t, as_tag=False))
+        menu.addSeparator()
+        menu.addAction(f"Close {label}",
+                       lambda: self._bulk_set_status(ids, "done"))
         menu.addAction(f"Reopen {label}",
-                       lambda: self._bulk_set_status(ids, "open", dismissed=False))
+                       lambda: self._bulk_set_status(ids, "open"))
+        menu.addSeparator()
+        reread = menu.addAction(f"↻ Read {label} again next run",
+                                lambda: self._forget_readings(ids))
+        reread.setToolTip(
+            "A gap is read once and the reading is kept, so re-running a batch "
+            "only pays for what changed. Use this when the AI read a gap wrong "
+            "— it throws that reading away so the next run reads it fresh."
+        )
         menu.addSeparator()
         menu.addAction(f"Delete {label}…",
                        lambda: self._bulk_delete(ids))
-        menu.exec(self._list.mapToGlobal(pos))
+        return menu
 
     def _on_group_context_menu(self, header, pos) -> None:
         """Actions on a whole group. This is the point of groups — the batch is
         the unit of work, so the tools that run on a batch are one click from
-        its header rather than requiring you to select twelve rows first."""
-        name = header.group_name
-        ids = self._group_ids(name)
-        label = name or NO_GROUP
+        its header rather than requiring you to select twelve rows first.
+
+        Right-clicking a header that is part of a Cmd-click selection of several
+        groups acts on all of them instead, the same rule as right-clicking one
+        row of a multi-selection of gaps."""
+        if (header.group_name in self._marked_groups
+                and len(self._marked_groups) > 1):
+            names = [h.group_name for h in self._header_items()
+                     if h.group_name in self._marked_groups]
+        else:
+            names = [header.group_name]
+        menu = self._group_menu_for(names, self._list)
+        # Collapse belongs to the header you clicked rather than to the batch,
+        # so it goes above the shared actions instead of into them.
+        act = menu.addAction("Collapse" if not header.collapsed else "Expand",
+                             lambda: self._on_collapse_clicked(header))
+        first = menu.actions()[0]
+        menu.insertAction(first, act)
+        menu.insertSeparator(first)
+        menu.exec(self._list.mapToGlobal(pos))
+
+    def _group_menu_for(self, names: list[str], parent=None) -> QMenu:
+        """The actions for one group or several.
+
+        One builder for both, because the only real difference is that Rename
+        and Retag are about a single group's own identity — everything else
+        means the same thing over one group or six. The Gaps page raises this
+        off a section header, the Groups page off its list."""
+        names = list(names)
+        ids: list[str] = []
+        seen: set[str] = set()
+        for g in names:
+            for kid in self._group_ids(g):
+                if kid not in seen:
+                    seen.add(kid)
+                    ids.append(kid)
+        one = names[0] if len(names) == 1 else None
+        label = (one or NO_GROUP) if one is not None else f"{len(names)} groups"
         n = len(ids)
-        menu = QMenu(self._list)
-        menu.addAction("Collapse" if not header.collapsed else "Expand",
-                       lambda: self._on_item_clicked(header))
-        menu.addSeparator()
+        menu = QMenu(parent or self)
+        if one is None:
+            head = menu.addAction(", ".join(g or NO_GROUP for g in names))
+            head.setEnabled(False)
+            menu.addSeparator()
+        else:
+            # First, and above the early return below, because an empty group
+            # is exactly the one that needs a gap put in it.
+            menu.addAction(f"＋ Add KG into “{one or NO_GROUP}”",
+                           lambda: self._on_add_kg(group=one))
+            menu.addSeparator()
         if not ids:
-            menu.exec(self._list.mapToGlobal(pos))
-            return
-        grp_work = menu.addAction(f"⚡ Work through {label} ({n})…",
-                                  lambda: self._work_through(ids))
-        grp_work.setToolTip(
-            "One screen: your deck is searched for every point, and cards are "
-            "written for the points nothing covered — both shown together, "
-            "reviewed together, and added by one button in one undoable step."
+            empty = menu.addAction("No gaps in it")
+            empty.setEnabled(False)
+            if len(self._marked_groups) > 1:
+                menu.addAction("Clear group selection", self._clear_group_marks)
+            menu.addSeparator()
+            menu.addAction("Manage groups…", self._open_group_manager)
+            return menu
+        # Runs act on what's LEFT of the group; edits act on all of it. See
+        # _live_ids. The count in the label is the live one, so the menu never
+        # promises to work through 12 gaps and then read 4.
+        live = self._live_ids(ids)
+        m = len(live)
+        done_note = f" — {n - m} already Closed" if m != n else ""
+        if not live:
+            skipped = menu.addAction(f"All {n} gap(s) are Closed — nothing to run")
+            skipped.setEnabled(False)
+        else:
+            work = menu.addAction(f"⚡ Work through {label} ({m}){done_note}…",
+                                  lambda: self._queue_work_through(live))
+            work.setToolTip(
+                "Park these on the work-through queue. They wait there until "
+                "you press the bottom-right button, which works through the "
+                "lot in one pass: your deck is searched for every point, "
+                "cards are written for the points nothing covered, and one "
+                "button adds both in one undoable step."
+                + ("\n\nGaps already Closed are left out." if done_note else "")
+            )
+            menu.addAction(f"⚡ Work through {label} ({m}){done_note} now…",
+                           lambda: self._work_through_now(live))
+            on_queue = self._queued_set()
+            queued = [i for i in ids if i in on_queue]
+            if queued:
+                menu.addAction(f"Take {len(queued)} off the queue",
+                               lambda: self._unqueue_work_through(queued))
+            menu.addSeparator()
+            menu.addAction(f"＋ AI Create only — {label} ({m})",
+                           lambda: self._bulk_send_to_create(live))
+            menu.addAction(f"🔍 AI Browse only — {label} ({m})",
+                           lambda: self._bulk_send_to_browse(live))
+        menu.addSeparator()
+        menu.addAction(f"Regroup {label} ({n})…",
+                       lambda: self._assign_group(ids))
+        if one:
+            menu.addAction(f"Rename / edit tag: {label}…",
+                           lambda: self._rename_group(one))
+        retag = menu.addAction(f"Retag {label}…",
+                               lambda: self._retag_groups(list(names)))
+        retag.setToolTip(
+            "Rebuild every tag in "
+            + ("this group" if one else "these groups")
+            + " so it carries the group segment, and add the shared branch and "
+            "source to cards written before the scheme did. Shows you what "
+            "changes before writing anything."
+            + ("" if one else "\n\nAll of them in one preview and one undo step.")
         )
         menu.addSeparator()
-        menu.addAction(f"🔍 Bulk search {label} ({n})",
-                       lambda: self._bulk_search(ids))
-        menu.addAction(f"⚡ Mass AI Create {label} ({n})…",
-                       lambda: self._mass_create(ids))
-        menu.addSeparator()
-        menu.addAction(f"Send {label} to Create",
-                       lambda: self._bulk_send_to_create(ids))
-        menu.addAction(f"Send {label} to Browse",
-                       lambda: self._bulk_send_to_browse(ids))
-        menu.addSeparator()
-        menu.addAction(f"Regroup {label}…", lambda: self._assign_group(ids))
-        if name:
-            menu.addAction(f"Rename / edit tag: {label}…",
-                           lambda: self._rename_group(name))
-            retag = menu.addAction(f"Retag {label}…",
-                                   lambda: self._retag_group(name))
-            retag.setToolTip(
-                "Rebuild every tag in this group so it carries the group "
-                "segment. Shows you what changes before writing, and moves any "
-                "cards already under the old tags."
-            )
-        menu.addSeparator()
-        menu.addAction(f"Mark {label} Done",
-                       lambda: self._bulk_set_status(ids, "done", dismissed=False))
-        if name:
-            archived = name in self._archived_set
+        menu.addAction(f"Close {label}",
+                       lambda: self._bulk_set_status(ids, "done"))
+        if one:
+            archived = one in self._archived_set
             act = menu.addAction(
                 f"Restore {label}" if archived else f"Archive {label}",
-                lambda: self._set_group_archived(name, not archived))
+                lambda: self._set_group_archived(one, not archived))
             act.setToolTip(
                 "Bring it back onto this page." if archived else
                 "Put a finished batch away. The gaps and their cards are "
                 "untouched — it stays in Manage groups."
             )
+        else:
+            live = [g for g in names if g and g not in self._archived_set]
+            if live:
+                menu.addAction(f"Archive {len(live)} group(s)",
+                               lambda: self._archive_groups(live))
         menu.addSeparator()
+        menu.addAction(f"↻ Read {label} again next run",
+                       lambda: self._forget_readings(ids))
+        menu.addSeparator()
+        if len(self._marked_groups) > 1:
+            menu.addAction("Clear group selection", self._clear_group_marks)
         menu.addAction("Manage groups…", self._open_group_manager)
-        menu.exec(self._list.mapToGlobal(pos))
+        return menu
 
-    def _bulk_set_status(self, ids: list[str], status: str, dismissed: bool) -> None:
-        for kid in ids:
-            kg_store.update(kid, status=status, dismissed=dismissed)
-        verb = {"done": "Done", "open": "Open",
-                "in_progress": "In progress"}.get(status, status)
-        if status == "done" and dismissed:
-            verb = "Dismissed"
-        tooltip(f"{len(ids)} gap(s) → {verb}.")
+    def _archive_groups(self, names: list[str]) -> None:
+        """Archive several groups in ONE config write. Looping
+        _set_group_archived would save and rebuild the page once per group, and
+        fire a tooltip per group over the top of the last."""
+        names = [g for g in names if g]
+        if not names:
+            return
+        try:
+            cfg = tool_config("knowledge_gaps")
+            cur = [str(g) for g in (cfg.get("archived_groups") or [])]
+            for name in names:
+                if name not in cur:
+                    cur.append(name)
+            cfg["archived_groups"] = cur
+            save_tool_config("knowledge_gaps", cfg)
+        except Exception as e:
+            print(f"[ankisstant] couldn't save archive state: {e}")
+            return
+        self._marked_groups.difference_update(names)
+        tooltip(f"{len(names)} group(s) archived.")
         self.refresh_list()
+
+    def _bulk_set_status(self, ids: list[str], status: str) -> None:
+        self.set_gaps_closed(ids, status == "done", quiet=False)
+
+    def set_gaps_closed(self, ids: list[str], closed: bool, *,
+                        quiet: bool = True) -> int:
+        """Open or close these gaps. THE one path that writes the status.
+
+        Every door goes through here — the tick box on a row, the tick box on a
+        group header, the bulk menu — so closing a gap does the same things
+        whichever way you did it: the store, the Things sync, the list, and the
+        pane if it is showing one of them. Two half-implementations of this is
+        how the row's tick and the pane's "Closed" box came to disagree.
+
+        `quiet` suppresses the tooltip for a single gap you just ticked (you
+        watched it happen); a bulk change still says what it did."""
+        wanted = "done" if closed else "open"
+        done = 0
+        for kid in ids:
+            try:
+                # dismissed is always cleared — it was only ever a shade of
+                # Closed, and nothing can set it any more.
+                if kg_store.update(kid, status=wanted, dismissed=False):
+                    done += 1
+            except Exception as e:
+                print(f"[ankisstant] couldn't set the status: {e}")
+        if not done:
+            return 0
+        if closed:
+            maybe_sync_to_things()
+        if not quiet or done > 1:
+            tooltip(f"{done} gap(s) → " + ("Closed" if closed else "Open") + ".")
+        cur = None
+        try:
+            cur = (self._detail._current or {}).get("id")
+        except Exception:
+            cur = None
+        self.refresh_list(preserve_selection=cur if cur in set(ids) else None)
+        return done
+
+    def _forget_readings(self, ids: list[str]) -> None:
+        """Throw away the AI's cached reading of these gaps.
+
+        The read is cached per gap so a re-run only pays for what changed; the
+        cost of that is a bad reading sticking around, since the gap's wording
+        is what the cache is keyed on. This is the way out."""
+        try:
+            from .kg import triage as kg_triage
+            n = kg_triage.forget(ids)
+        except Exception as e:
+            print(f"[ankisstant] couldn't clear cached readings: {e}")
+            showWarning(f"Couldn't clear the cached reading:\n\n{e}")
+            return
+        tooltip(f"{n or 0} cached reading(s) cleared — "
+                f"{len(ids)} gap(s) will be read fresh next run.")
 
     def _bulk_delete(self, ids: list[str]) -> None:
         if not ids:
@@ -3967,7 +5570,161 @@ class KnowledgeGapsPanel(QWidget):
             return
         open_bulk_search(kgs, parent=self.window())
 
-    def _work_through(self, ids: list[str]) -> None:
+    # ── the work-through queue ───────────────────────────────────────────────
+
+    def _queue_work_through(self, ids: list[str]) -> None:
+        """Park these gaps on the queue. Nothing opens.
+
+        The whole point of the queue is that sending is cheap: you tick a gap,
+        it goes, you carry on reading. Popping a dialog on every send would
+        make building a batch across four groups a fight with four dialogs."""
+        from .kg import work_queue
+        live = [i for i in ids
+                if (kg_store.get(i) or {}).get("status") != "done"]
+        skipped = len(ids) - len(live)
+        if not live:
+            tooltip("Those gaps are all Closed already — nothing to queue."
+                    if skipped else "Those gaps are no longer in the list.")
+            return
+        added, dupes = work_queue.add(live)
+        self.refresh_work_badge()
+        bits = []
+        if added:
+            bits.append(f"Queued {added} gap(s)")
+        if dupes:
+            bits.append(f"{dupes} already waiting")
+        if skipped:
+            bits.append(f"{skipped} skipped as Closed")
+        total = work_queue.count()
+        tooltip("   ·   ".join(bits)
+                + f" — {total} on the queue. Work through the lot with the "
+                  "button in the bottom right.")
+
+    def _unqueue_work_through(self, ids: list[str]) -> None:
+        """Take these off the queue. The gaps themselves are untouched — this
+        is un-sending, not closing."""
+        from .kg import work_queue
+        n = work_queue.remove(ids)
+        self.refresh_work_badge()
+        if not n:
+            tooltip("None of those were on the queue.")
+            return
+        left = work_queue.count()
+        tooltip(f"Took {n} gap(s) off the queue"
+                + (f" — {left} still waiting." if left else " — queue empty."))
+
+    def _queued_set(self) -> set[str]:
+        """What is on the queue right now, as a set, for menus that need to ask
+        about several gaps at once without re-reading the file per gap."""
+        try:
+            from .kg import work_queue
+            return set(work_queue.ids())
+        except Exception as e:
+            print(f"[ankisstant] couldn't read the queue: {e}")
+            return set()
+
+    def refresh_work_badge(self) -> None:
+        """The badge is the only thing on the page that says how many are
+        waiting, so it is refreshed after anything that could change that."""
+        btn = getattr(self, "_work_queue_btn", None)
+        if btn is None:
+            return
+        try:
+            from .kg import work_queue
+            n = work_queue.count()
+        except Exception as e:
+            print(f"[ankisstant] work queue count failed: {e}")
+            return
+        btn.setText(f"⚡ Work through queue  ({n})" if n
+                    else "⚡ Work through queue")
+        btn.setEnabled(bool(n))
+        btn.setToolTip(
+            "Nothing waiting yet — tick gaps and press ⚡ Work through to "
+            "park them here." if not n else
+            f"Work through all {n} queued gap(s) now, in one pass.\n\n"
+            "The queue empties as that window opens — this is the sitting. "
+            "Gaps you don't run stay Open in the list; re-tick them to queue "
+            "them again.\n\nRight-click for the queue's housekeeping."
+        )
+
+    def _run_work_queue(self) -> None:
+        """Run everything on the queue, in one pass.
+
+        There is no queue window. A screen listing the queued gaps so you could
+        pick some of them would be the work-through screen with a worse table —
+        and picking is the thing the queue exists to save you. You parked them
+        because you meant to work through them; this works through them.
+
+        The queue empties when the pass OPENS — all of it, not just what got
+        closed. The queue is the list of gaps you meant to deal with in this
+        sitting; one you opened the pass on and didn't finish has still had its
+        turn, and leaving it to pile up is how a queue stops meaning anything.
+        Nothing is lost: the gap stays Open in the list, and re-queueing it is
+        one tick away, deliberately.
+
+        The draining itself lives in _work_through_now (see _drain_queue) so
+        that a pass started from a row, a group or "Work through now" tidies up
+        exactly the same way this one does."""
+        from .kg import work_queue
+        ids = work_queue.ids()
+        if not ids:
+            tooltip("Nothing queued yet — tick gaps and press ⚡ Work through "
+                    "to park them here.")
+            return
+        self._work_through_now(ids)
+
+    def _work_queue_menu(self, pos) -> None:
+        """Right-click the badge: the queue's housekeeping, without a screen
+        of its own to hold it."""
+        from .kg import work_queue
+        n = work_queue.count()
+        menu = QMenu(self._work_queue_btn)
+        run = menu.addAction(f"⚡ Work through all {n} now…",
+                             self._run_work_queue)
+        run.setEnabled(bool(n))
+        menu.addSeparator()
+        # The queue's contents, one entry each, so taking one gap back off
+        # doesn't mean hunting for its row. This is the only place the queue
+        # is ever listed — a menu you click once, not a screen to manage.
+        off = menu.addMenu(f"Take one off the queue  ({n})")
+        off.setEnabled(bool(n))
+        LIMIT = 30
+        for kid in work_queue.ids()[:LIMIT]:
+            kg = kg_store.get(kid) or {}
+            title = " ".join(str(kg.get("title") or "(untitled)").split())
+            if len(title) > 60:
+                title = title[:60].rstrip() + "…"
+            off.addAction(title,
+                          lambda _c=False, i=kid: self._unqueue_work_through([i]))
+        if n > LIMIT:
+            more = off.addAction(f"…and {n - LIMIT} more")
+            more.setEnabled(False)
+        menu.addSeparator()
+        cd = menu.addAction("Clear the closed ones",
+                            lambda: self._clear_work_queue(done_only=True))
+        cd.setEnabled(bool(n))
+        ca = menu.addAction("Clear the queue",
+                            lambda: self._clear_work_queue(done_only=False))
+        ca.setEnabled(bool(n))
+        menu.exec(self._work_queue_btn.mapToGlobal(pos))
+
+    def _clear_work_queue(self, *, done_only: bool) -> None:
+        from .kg import work_queue
+        if done_only:
+            n = work_queue.clear_done()
+            tooltip("Nothing closed to clear." if not n
+                    else f"Cleared {n} closed gap(s) off the queue.")
+        else:
+            n = work_queue.count()
+            if n and not askUser(
+                    f"Take all {n} gap(s) off the work-through queue?\n\n"
+                    "The gaps themselves are untouched.", parent=self):
+                return
+            work_queue.clear()
+            tooltip(f"Queue cleared — {n} gap(s) taken off it.")
+        self.refresh_work_badge()
+
+    def _work_through_now(self, ids: list[str]) -> None:
         """Search AND create, on ONE screen.
 
         The same dialog as Bulk search, in unified mode: the deck is searched
@@ -3975,18 +5732,76 @@ class KnowledgeGapsPanel(QWidget):
         bottom of that same results screen while you read the found ones, and a
         single button commits both under one checkpoint. Bulk search and Mass AI
         Create stay on the menu underneath it — this adds a path, it doesn't
-        replace either."""
+        replace either.
+
+        Returns the dialog so the queue can tell when the pass is over. The
+        window is modeless: this function returning means it has opened, not
+        that anything has happened in it."""
         try:
             from .kg.bulk_search import open_unified
         except Exception as e:
             print(f"[ankisstant] unified pass unavailable: {e}")
             showWarning(f"Couldn't open the unified pass:\n\n{e}")
-            return
+            return None
         kgs = [kg for kg in (kg_store.get(i) for i in ids) if kg]
         if not kgs:
             tooltip("Those gaps are no longer in the list.")
+            return None
+        dlg = open_unified(kgs, parent=self.window())
+        self._drain_queue(dlg)
+        return dlg
+
+    def _drain_queue(self, dlg) -> None:
+        """Empty the work queue the moment a pass OPENS — every pass, any door.
+
+        THE QUEUE IS A SITTING, NOT A BACKLOG. Everything parked on it when the
+        pass opens has had its turn: the gaps that get worked, and the ones
+        looked at and decided against. A gap passed over stays OPEN in the
+        list; what it stops being is queued. Leaving those behind is how a
+        queue of four becomes a queue of sixteen with no way to tell which of
+        them you had already seen.
+
+        AT OPEN, NOT AT CLOSE. This hung off dialog.finished, which reads well
+        and never fired once: BulkSearchDialog overrides closeEvent without
+        calling up to QDialog, so the signal that empties this queue could not
+        be emitted by any route. That is fixed too — but the queue should not
+        depend on it. Draining on the way in is better on its own merits:
+
+          · the badge clears when you press the button, which is when you
+            expect to see it clear, not minutes later when the window shuts;
+          · a gap ticked and queued DURING the pass belongs to the next
+            sitting, and it survives, because it is added after this;
+          · it cannot be skipped by a crash, a force-quit, or a window left
+            open all afternoon — which is exactly what happened.
+
+        Nothing is lost by draining early: the queue holds ids, the gaps are
+        untouched, and re-queueing one is a tick away. Deliberately.
+        """
+        if dlg is None:
             return
-        open_unified(kgs, parent=self.window())
+        try:
+            from .kg import work_queue
+            # clear(), not remove(ids()): ids() prunes entries whose gap has
+            # since been deleted, so removing exactly what it lists would leave
+            # those rows on disk for good. Draining is draining. The count is
+            # read first, from the live list, so the number reported is gaps
+            # rather than rows.
+            n = work_queue.count()
+            work_queue.clear()
+        except Exception as e:
+            print(f"[ankisstant] couldn't empty the work queue: {e}")
+            return
+        if not n:
+            return
+        try:
+            self.refresh_work_badge()
+            self.refresh_list()
+        except RuntimeError:
+            # The panel went away. The queue is on disk and has been emptied;
+            # there is nothing left to redraw.
+            return
+        tooltip(f"Work queue cleared ({n} gap(s)) — this is the sitting. Any "
+                "you don't run stay Open in the list.")
 
     def _mass_create(self, ids: list[str]) -> None:
         """Open the mass-create dialog on this selection. Deliberately does NOT
@@ -4044,6 +5859,7 @@ class KnowledgeGapsPanel(QWidget):
                 "kg_type":     (kg.get("type") or "").lower(),
                 "group":       str(kg.get("group") or "").strip(),
                 "tags":        [t for t in (kg.get("tags") or []) if t],
+                "resources":   list(kg.get("resources") or []),
             })
             sent.append(kid)
         if hasattr(main, "refresh_queue_badge"):
@@ -4091,10 +5907,38 @@ class KnowledgeGapsPanel(QWidget):
 
     # ── add / analyse ────────────────────────────────────────────────────────
 
-    def _on_add_kg(self) -> None:
-        dlg = AddKGDialog(self)
+    def _current_group_context(self) -> str | None:
+        """The group you are plainly working in, or None if nothing says.
+
+        Read off whichever page you are on, in order of how explicit the
+        gesture was: a group picked on the Groups page, then a marked header,
+        then a `group:` filter, then the group of the gap you have selected.
+        It only ever PREFILLS the Add dialog's Group box, so guessing wide is
+        safe — you can see it and change it before saving. "" is a real answer
+        (the ungrouped section); None means don't prefill."""
+        if self._view == "groups":
+            picked = self._groups_view.selected_names()
+            return picked[0] if len(picked) == 1 else None
+        if len(self._marked_groups) == 1:
+            return next(iter(self._marked_groups))
+        if self._filter.startswith("group:"):
+            return self._filter.split(":", 1)[1]
+        sel = [i.kg_id for i in self._list.selectedItems()
+               if isinstance(i, _KGListItem) and i.kg_id]
+        if len(sel) == 1:
+            grp = str((kg_store.get(sel[0]) or {}).get("group") or "").strip()
+            if grp:
+                return grp
+        return None
+
+    def _on_add_kg(self, group: str | None = None) -> None:
+        if group is None:
+            group = self._current_group_context()
+        dlg = AddKGDialog(self, group=group)
         if dlg.exec():
             self.refresh_list()
+            if self._view == "groups":
+                self._groups_view.refresh()
 
     def _on_kg_from_chat(self) -> None:
         """Condense SynapsePro's latest chat answer into gaps.
@@ -4160,6 +6004,7 @@ class KnowledgeGapsPanel(QWidget):
             type_key=(tool_config("knowledge_gaps").get("default_type_on_add")
                       or "kg"))
         kg_store.add_many(records)
+        wake_groups(r.get("group") for r in records)
         tooltip(f"Imported {len(records)} gap(s) from Things.", period=4000)
         self.refresh_list()
 

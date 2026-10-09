@@ -81,6 +81,7 @@
       "extra_field": "Extra",
       "one_by_one_field": "One by one",
       "cite_source": false,
+      "attach_resources": true,
       "images": {
         "card_max_w": 400,
         "card_max_h": 560,

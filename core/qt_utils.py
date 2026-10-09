@@ -3,6 +3,14 @@
 #    blocking Claude / network call runs in the foreground.
 #  - attach_tag_completer(line_edit, multi=False):  Anki-tag autocomplete on
 #    a QLineEdit. multi=True handles a comma-separated tag list.
+#  - tips_on_checkbox_only(view):  quieten a dense QTreeWidget/QTableWidget so
+#    item tooltips only fire over the checkbox, not over every cell.
+#  - dock_beside(helper, host):  glue one of our windows to the edge of an Anki
+#    window so the pair moves, resizes and closes as one. Returns the dock —
+#    call detach() on it when the helper closes.
+#  - resurface_at_home(win):  re-show a backgrounded window only once you're
+#    back on Anki's main window, so a finished run never chases you across
+#    desktops.
 
 from __future__ import annotations
 
@@ -11,8 +19,9 @@ from contextlib import contextmanager
 
 from aqt import mw
 from aqt.qt import (
-    QApplication, QCompleter, QDialog, QDialogButtonBox, QEventLoop, QFrame,
-    QHBoxLayout, QLabel, QPlainTextEdit, QProgressDialog, QPushButton, Qt,
+    QApplication, QCompleter, QDialog, QDialogButtonBox, QEvent, QEventLoop,
+    QFrame, QHBoxLayout, QLabel, QObject, QPlainTextEdit, QProgressDialog,
+    QPushButton, QRect, QStyle, QStyleOptionViewItem, Qt, QTimer, QToolTip,
     QVBoxLayout, QWidget,
 )
 from aqt.utils import tooltip
@@ -632,3 +641,358 @@ def theme_dialog(widget) -> None:
         synapse.apply_stylesheet(widget, dialog=True)
     except Exception as e:
         log.error(f"theme_dialog failed: {e}")
+
+
+class _CheckboxTips(QObject):
+    """Event filter behind `tips_on_checkbox_only`. See that function."""
+
+    # A few pixels of slack, so the target is the checkbox as you SEE it rather
+    # than the exact indicator rect.
+    SLACK = 3
+
+    def __init__(self, view):
+        super().__init__(view)
+        self._view = view
+
+    def _check_rect(self, index):
+        """Where this cell's check indicator is drawn, in viewport coords."""
+        view = self._view
+        rect = view.visualRect(index)      # for a tree column 0 this already
+        if not rect.isValid():             # has the indentation added on
+            return None
+        box = QRect()
+        try:
+            opt = QStyleOptionViewItem()
+            opt.initFrom(view)
+            opt.rect = rect
+            opt.features = QStyleOptionViewItem.ViewItemFeature.HasCheckIndicator
+            box = view.style().subElementRect(
+                QStyle.SubElement.SE_ItemViewItemCheckIndicator, opt, view)
+        except Exception:
+            box = QRect()
+        if box.isNull() or box.width() <= 0:
+            # Whatever the style does with the rest of the row, the indicator is
+            # drawn at the leading edge; a fixed band there is a safe fallback.
+            box = QRect(rect.left(), rect.top(), 20, rect.height())
+        return box.adjusted(-self.SLACK, -self.SLACK, self.SLACK, self.SLACK)
+
+    def eventFilter(self, obj, ev):
+        try:
+            if ev.type() != QEvent.Type.ToolTip:
+                return False
+            view = self._view
+            pos = ev.pos()
+            index = view.indexAt(pos)
+            if (not index.isValid()
+                    or index.data(Qt.ItemDataRole.CheckStateRole) is None):
+                QToolTip.hideText()        # nothing here to aim at
+                return True
+            box = self._check_rect(index)
+            tip = index.data(Qt.ItemDataRole.ToolTipRole)
+            if box is None or not box.contains(pos) or not tip:
+                QToolTip.hideText()
+                return True
+            QToolTip.showText(ev.globalPos(), str(tip), view)
+            return True
+        except Exception:
+            return False               # never break hovering over a list
+
+
+def tips_on_checkbox_only(view) -> None:
+    """Only pop an item's tooltip while the cursor is over its CHECKBOX.
+
+    A dense item view ends up with a tooltip on nearly every cell — the card
+    text, the gap's notes, what the AI read it as — and the result is that you
+    cannot rest the cursor anywhere on the page without something popping up
+    over the thing you were reading. The information is still worth having, so
+    the fix isn't to delete the tooltips: it is to make asking for one
+    deliberate. The check indicator is a small, unambiguous target you only
+    land on when you mean to, and everything else stays quiet.
+
+    Cells with NO checkbox then show nothing at all. Where that text explained
+    a column rather than a row, move it to the column HEADER — a thin strip you
+    never rest the cursor on, and the right place for "what is this column"
+    anyway.
+    """
+    filt = _CheckboxTips(view)
+    view.viewport().installEventFilter(filt)
+    # Parented to the view, but hold a reference anyway: the filter must not be
+    # collected while the viewport is still sending it events.
+    view._ankisstant_tip_filter = filt
+
+
+class _EdgeDock(QObject):
+    """Event filter behind `dock_beside`. See that function."""
+
+    MIN_H = 220
+    # A host squeezed narrower than this to make room isn't usable any more, so
+    # below this we stop taking room and let the helper overlap instead.
+    MIN_HOST_W = 520
+
+    def __init__(self, helper, host, side: str, make_room: bool = True):
+        super().__init__(helper)
+        self._helper, self._host, self._side = helper, host, side
+        self._make_room = make_room
+        self._alive = True
+        # Did WE hide the helper (because the host hid), or did the user close
+        # it? Only the first may be undone — see reposition().
+        self._hidden_by_dock = False
+        # Host geometry we shrank to make room, kept so it can be handed back —
+        # alongside what we actually set it to, so a host the user has since
+        # resized themselves is left exactly as they left it.
+        self._host_geom = None
+        self._host_set = None
+        self._left_fullscreen = False
+        host.installEventFilter(self)
+
+    # ── letting go ──────────────────────────────────────────────────────────
+    def detach(self) -> None:
+        """Stop following the host, and give back any room we took.
+
+        A dock that outlives its helper is not harmless. It stays installed on
+        the host, and the host is usually a SHARED Anki window (aqt.dialogs
+        hands out one Add window for the whole profile), so the next Move or
+        Show event repositions — and re-shows — a helper the user closed ages
+        ago. That is how a closed side-car walks back on screen beside the Add
+        window, one zombie per time the feature was used. Detaching on close is
+        the whole fix: no filter, no resurrection.
+        """
+        if not self._alive:
+            return
+        self._alive = False
+        try:
+            self._host.removeEventFilter(self)
+        except Exception:
+            pass
+        self._restore_host()
+
+    def eventFilter(self, obj, ev):
+        if not self._alive:
+            return False
+        try:
+            t = ev.type()
+            if t in (QEvent.Type.Move, QEvent.Type.Resize,
+                     QEvent.Type.WindowStateChange):
+                # Deferred: during a drag the host's geometry is still settling,
+                # and repositioning off the in-flight value makes the helper
+                # visibly lag a frame behind.
+                QTimer.singleShot(0, self.reposition)
+            elif t == QEvent.Type.Show:
+                QTimer.singleShot(0, self.reposition)
+            elif t == QEvent.Type.WindowActivate:
+                QTimer.singleShot(0, self._follow_up)
+            elif t == QEvent.Type.Hide:
+                self._helper.hide()
+                self._hidden_by_dock = True
+            elif t == QEvent.Type.Close:
+                # Filters run before the target's own closeEvent, so the host
+                # gets its full width back BEFORE Anki saves that window's
+                # geometry — otherwise the squeeze we made for the helper is
+                # what reopens next time.
+                self._restore_host()
+                QTimer.singleShot(0, self._helper.close)
+        except RuntimeError:
+            pass          # helper already deleted; the filter dies with it
+        except Exception as e:
+            log.error(f"dock_beside: {e}")
+        return False      # never consume the host's own events
+
+    def _follow_up(self) -> None:
+        try:
+            if self._alive and self._helper.isVisible():
+                self._helper.show()
+                self._helper.raise_()
+        except RuntimeError:
+            pass
+
+    # ── geometry ────────────────────────────────────────────────────────────
+    def reposition(self) -> None:
+        """Put the helper flush against the host's edge, same height."""
+        try:
+            if not self._alive:
+                return
+            helper, host = self._helper, self._host
+            if not host.isVisible():
+                return
+            if helper.isHidden():
+                # Only un-hide what the dock itself hid. A helper the user
+                # closed stays closed.
+                if not self._hidden_by_dock:
+                    return
+                helper.show()
+                self._hidden_by_dock = False
+            hg = host.frameGeometry()
+            fw = helper.frameGeometry().width() - helper.width()    # window border
+            fh = helper.frameGeometry().height() - helper.height()  # + title bar
+            w = helper.width() + fw
+            side = self._side
+            try:
+                avail = host.screen().availableGeometry()
+            except Exception:
+                avail = None
+            if avail is not None:
+                fits_left  = hg.left() - avail.left() >= w
+                fits_right = avail.right() - hg.right() >= w
+                # Prefer the asked-for side, but never push the helper off-screen
+                # — a docked window you cannot see is worse than one on the
+                # other side.
+                if side == "left" and not fits_left and fits_right:
+                    side = "right"
+                elif side == "right" and not fits_right and fits_left:
+                    side = "left"
+                if not fits_left and not fits_right:
+                    # The host fills the screen — maximised, or a macOS
+                    # full-screen space. "Beside" would mean "off the edge",
+                    # which is exactly the case where the side-car silently
+                    # never appeared. Take the room out of the host instead.
+                    if self._make_room and self._take_room(w, side):
+                        return            # a Resize event brings us back here
+                    hg = host.frameGeometry()
+            x = hg.left() - w if side == "left" else hg.right()
+            if avail is not None:
+                # Last resort: clamp on screen. The helper then overlaps the
+                # host rather than hiding beside it.
+                x = max(avail.left(), min(x, avail.right() - w + 1))
+            helper.resize(helper.width(), max(self.MIN_H, hg.height() - fh))
+            helper.move(x, hg.top())
+        except RuntimeError:
+            pass
+        except Exception as e:
+            log.error(f"dock_beside reposition: {e}")
+
+    def _take_room(self, w: int, side: str) -> bool:
+        """Narrow the host by `w` so the helper has somewhere to live.
+
+        Returns True when it changed something and a fresh reposition is on its
+        way. Done once only: the remembered geometry is also what gets handed
+        back on detach, and shrinking twice would eat the window."""
+        host = self._host
+        try:
+            if (host.isFullScreen() or host.isMaximized()) \
+                    and not self._left_fullscreen:
+                # Leaving full screen is enough on its own — Qt puts the window
+                # back to its pre-full-screen size, which usually leaves room.
+                # No geometry is remembered here: showNormal already restored
+                # the one the user had, and macOS animates out of the space, so
+                # anything read right now is still the old rect. Come back for
+                # it once the animation has landed.
+                self._left_fullscreen = True
+                host.showNormal()
+                QTimer.singleShot(300, self.reposition)
+                return True
+            if self._host_geom is not None:
+                return False          # already narrowed once; don't eat it twice
+            cur = host.geometry()
+            new_w = max(self.MIN_HOST_W, cur.width() - w)
+            if new_w >= cur.width():
+                return False
+            new_x = cur.left() + (cur.width() - new_w) if side == "left" else cur.left()
+            self._host_geom = QRect(cur)
+            host.setGeometry(new_x, cur.top(), new_w, cur.height())
+            self._host_set = QRect(host.geometry())
+            return True
+        except Exception as e:
+            log.error(f"dock_beside: couldn't make room: {e}")
+            return False
+
+    def _restore_host(self) -> None:
+        """Hand back the width we borrowed — unless the user has since moved or
+        resized the host themselves, in which case their geometry wins."""
+        geom, self._host_geom = self._host_geom, None
+        set_to, self._host_set = self._host_set, None
+        if geom is None:
+            return
+        try:
+            if set_to is not None and self._host.geometry() != set_to:
+                return
+            if self._host.isVisible():
+                self._host.setGeometry(geom)
+        except RuntimeError:
+            pass
+        except Exception as e:
+            log.error(f"dock_beside: couldn't restore the host: {e}")
+
+
+def dock_beside(helper, host, side: str = "left", make_room: bool = True):
+    """Glue `helper` to the edge of `host` so the two behave as one window.
+
+    The helper follows every move, resize, minimise, raise, hide and close of
+    the host, and matches its height. It is NOT reparented — the host stays a
+    perfectly ordinary Anki window, with its own close/save behaviour and its
+    own saved geometry intact, which is the whole reason for doing it this way
+    rather than embedding one window inside the other.
+
+    Side is a preference, not a promise: a helper that would land off the edge
+    of the screen goes on the other side instead. With `make_room` (the
+    default) a host that fills the screen — maximised, or in a macOS
+    full-screen space, where there is no "beside" at all — is taken out of full
+    screen and narrowed by the helper's width, and gets that width back when
+    the helper closes. Without it, a helper with nowhere to go overlaps the
+    host rather than vanishing off the edge.
+
+    Returns the dock; keep it if you need to `detach()` early — and DO detach
+    when the helper closes, or the filter outlives it and re-shows it later.
+    """
+    dock = _EdgeDock(helper, host, side, make_room=make_room)
+    helper._ankisstant_dock = dock      # keep it alive with the helper
+    dock.reposition()
+    return dock
+
+
+class _HomeWaiter(QObject):
+    """Holds a finished, hidden window until Anki's main window is next active."""
+
+    def __init__(self, win):
+        super().__init__(mw)
+        self._win = win
+        mw.installEventFilter(self)
+
+    def eventFilter(self, obj, ev):
+        if obj is mw and ev.type() == QEvent.Type.WindowActivate:
+            # Next turn of the loop, not inside the activation itself: showing
+            # a window mid-activate can steal it straight back from mw.
+            QTimer.singleShot(0, self._release)
+        return False
+
+    def _release(self) -> None:
+        try:
+            mw.removeEventFilter(self)
+        except RuntimeError:
+            pass
+        _show_over_mw(self._win)
+        if getattr(self._win, "_ankisstant_home_waiter", None) is self:
+            self._win._ankisstant_home_waiter = None
+        self.deleteLater()
+
+
+def _show_over_mw(win) -> None:
+    try:
+        win.show()
+        win.raise_()
+        win.activateWindow()
+    except RuntimeError:        # closed for real while it waited
+        pass
+
+
+def resurface_at_home(win) -> None:
+    """Bring a backgrounded window back WITHOUT chasing the user.
+
+    On macOS a hidden window that's shown again lands on whatever desktop
+    (Space) you're on right now, and activateWindow drags Anki to the front
+    with it — so a run finishing while you were in another app or Space popped
+    up there, every stage. Instead: if Anki's main window is the one in front,
+    show it now; otherwise bounce the Dock icon and wait, and the window comes
+    back the next time you go to Anki's main window.
+    """
+    if mw.isActiveWindow():
+        _show_over_mw(win)
+        return
+    if getattr(win, "_ankisstant_home_waiter", None) is not None:
+        return                   # already waiting; one is plenty
+    win._ankisstant_home_waiter = _HomeWaiter(win)
+    try:
+        QApplication.alert(mw, 0)
+        tooltip("Ankisstant finished — it's waiting on Anki's main window.",
+                period=5000, parent=mw)
+    except Exception:
+        pass

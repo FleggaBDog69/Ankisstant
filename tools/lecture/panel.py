@@ -174,6 +174,16 @@ class _Heartbeat:
         self._thread.start()
         return self
 
+    def set_base(self, msg: str) -> None:
+        """Change the step being timed without restarting the clock.
+
+        A stage that used to be one opaque call can now report its own progress
+        ("Reading 33 gap(s)… 4/11") while still wanting the elapsed timer, so
+        the base line is mutable. Safe from a worker thread: the ticker only
+        ever reads it, and a torn read would cost one stale repaint.
+        """
+        self._base = msg
+
     def __exit__(self, *exc):
         self._stop.set()
         if self._thread:
@@ -215,13 +225,36 @@ def _on_main(fn):
     return box.get("value")
 
 
+def _on_col(fn):
+    """Run a collection READ on Anki's collection thread, not the main one, and
+    block the calling worker until it returns.
+
+    The deck sweep is hundreds of find_notes calls at 0.3–7s each. Hopping each
+    one onto the main thread kept the progress label ticking but left Anki
+    itself unusable — Browse couldn't open or search until the whole Find stage
+    was over. The collection executor is where Anki's own QueryOps run: off the
+    UI thread, serialised with every other background collection job, so the
+    Browser only ever waits on one query, never the sweep.
+
+    Only for pure reads — anything that touches a widget still goes _on_main.
+    """
+    ex = getattr(mw.taskman, "_collection_executor", None)
+    # Already ON that executor (it has one thread): submitting would wait on
+    # ourselves forever. Every current caller is uses_collection=False, so this
+    # is only a guard — and running inline there is correct anyway.
+    if ex is None or threading.current_thread() in getattr(ex, "_threads", ()):
+        return fn()
+    return ex.submit(fn).result(timeout=_MAIN_THREAD_TIMEOUT)
+
+
 # ── the pipeline (worker thread) ─────────────────────────────────────────────
 
 def search_all(points, *, index, notetype_filter, candidate_cap, on_main, report,
                check=lambda: None, cand_cap_for=None):
-    """Both search legs per point, one at a time on the main thread so the UI
-    keeps breathing. Shared by the automated worker and the file hand-off path so
-    a manual run searches the deck identically to a CLI run.
+    """Both search legs per point, one at a time through `on_main` (the
+    collection thread, from run_pipeline) so the UI keeps breathing. Shared by
+    the automated worker and the file hand-off path so a manual run searches
+    the deck identically to a CLI run.
 
     `cand_cap_for(point) -> int` narrows the pool for individual points. KG mode
     uses it: a gap allowed one card has no use for twenty candidates, and every
@@ -358,7 +391,7 @@ def finish_matches(matches, *, target_cards, depth=matcher.DEFAULT_DEPTH,
                  f"unfiltered: {_named}")
 
     # Dedupe BEFORE allocate so the budget is never spent on the AnKing/Malleus
-    # twins of one fact. Reads note text, so it goes through the main thread.
+    # twins of one fact. Reads note text, so it goes through on_main.
     report("Removing duplicate notes…", 92)
     on_main(lambda: matcher.dedupe(matches))
     report("Choosing the best notes…", 95)
@@ -416,7 +449,8 @@ def run_pipeline(path: str, cfg: dict, *, report, cancel_ev: threading.Event,
     """Ingest → extract → match → relevance → allocate → summarise.
 
     Runs entirely on a worker thread. Returns (lecture, matches, coverage).
-    Every collection touch goes through _on_main; every AI call stays here.
+    Every collection touch goes through _on_col (Anki's collection thread,
+    never the UI one); every AI call stays here.
 
     `points` short-circuits the whole read step. KG mode supplies them: the gaps
     were triaged (and edited by the user) BEFORE the run, so there is nothing
@@ -634,17 +668,17 @@ def run_pipeline(path: str, cfg: dict, *, report, cancel_ev: threading.Event,
         log.trace(f"LP {_i}: topic='{_p.topic}' sys='{_p.system}' | {_p.concept} | terms={_p.terms}")
     _check()
 
-    # 4 — match. Both legs per point, on the main thread one point at a time so
-    # the UI keeps breathing rather than freezing for the whole sweep.
+    # 4 — match. Both legs per point, one point at a time on the collection
+    # thread, so Anki (Browse included) stays usable for the whole sweep.
     report(f"{len(points)} learning points — searching your deck…", 35)
-    index = _on_main(lambda: matcher.TagIndex.build(search_scope))
+    index = _on_col(lambda: matcher.TagIndex.build(search_scope))
     matches = search_all(points, index=index, notetype_filter=notetype_filter,
-                         candidate_cap=candidate_cap, on_main=_on_main,
+                         candidate_cap=candidate_cap, on_main=_on_col,
                          report=report, check=_check, cand_cap_for=cand_cap_for)
 
-    # 5 — relevance. Card text is pulled on the main thread, then scored off it:
-    # score_batch never touches mw.col, which is what makes that split legal.
-    items = _on_main(lambda: [
+    # 5 — relevance. Card text is pulled on the collection thread, then scored
+    # off it: score_batch never touches mw.col, which is what makes that split legal.
+    items = _on_col(lambda: [
         (m.point, [(nid, matcher.note_text(nid)) for nid in m.nids])
         for m in matches if m.nids
     ])
@@ -694,7 +728,7 @@ def run_pipeline(path: str, cfg: dict, *, report, cancel_ev: threading.Event,
         target_cards = sized
 
     coverage = finish_matches(matches, target_cards=target_cards, depth=depth,
-                              on_main=_on_main, report=report, ai_dedupe_model=model_r,
+                              on_main=_on_col, report=report, ai_dedupe_model=model_r,
                               cap_for=cap_for)
 
     # 7 — card notes. Last, because it works on the FINAL selected set: which
@@ -707,7 +741,7 @@ def run_pipeline(path: str, cfg: dict, *, report, cancel_ev: threading.Event,
         segs: dict[int, str] = {}
         if lecture is not None:
             segs = {s.number: s.text for s in lecture.segments}
-        cn_cards, cn_owner = _on_main(lambda: matcher.selected_card_text(matches))
+        cn_cards, cn_owner = _on_col(lambda: matcher.selected_card_text(matches))
         try:
             notes, unplaced = matcher.pick_card_notes(
                 cn_cards, cn_owner, segs, companion=companion,

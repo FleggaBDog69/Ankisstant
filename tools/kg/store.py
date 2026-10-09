@@ -410,7 +410,7 @@ def _inbox_path() -> str:
     return os.path.join(_user_files(), "kg_inbox.json")
 
 
-def drain_inbox() -> int:
+def drain_inbox(*, groups_out: list | None = None) -> int:
     """Move anything captured outside Anki into the queue, then clear it.
 
     The dashboard daemon (lifed) and the `life` CLI can't write kg_queue.json
@@ -420,7 +420,12 @@ def drain_inbox() -> int:
     here, on profile load, when nothing else is touching the queue.
 
     Deduped on fields.things_uuid so a Things gap that was swept more than
-    once doesn't land twice. Returns the number added."""
+    once doesn't land twice. Returns the number added.
+
+    `groups_out`, if given, is filled with the group names the drained gaps
+    landed in. This module deliberately knows nothing about the add-on config,
+    so it can't un-archive a put-away group itself — it hands the caller the
+    names instead (see knowledge_gaps.wake_groups)."""
     path = _inbox_path()
     if not os.path.isfile(path):
         return 0
@@ -452,6 +457,9 @@ def drain_inbox() -> int:
 
     if fresh:
         add_many(fresh)
+        if groups_out is not None:
+            groups_out.extend(
+                str(it.get("group") or "").strip() for it in fresh)
     _clear_inbox(path)
     return len(fresh)
 

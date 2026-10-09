@@ -182,6 +182,33 @@ _SLOT_MIN_SCORE = 2
 # keeps everything. The floor bites only on a 1 the model chose to give.
 _KEEP_MIN_SCORE = 2
 
+# Minimum judge score for a card to COVER A KNOWLEDGE GAP. Three, not two.
+#
+# A lecture point is a heading and a 2 ("an adjacent aspect of the same
+# subject") is legitimately part of it. A gap is not a heading — it is one claim
+# the student wrote down because he didn't know it, and the only question is
+# whether a card teaches that claim. A 2 answers "no": same subject, tests
+# something else. Ticking it says his deck has the gap covered when it doesn't,
+# which is the one thing this screen must never say. Both cards in the mTBI run
+# he complained about were 2s and 3s of exactly this kind.
+#
+# Nothing is hidden by the higher bar. A dropped 2 stays in `nids`, so it is
+# still listed under the gap in the picker, unticked, one click from being
+# taken; what changes is that the gap stays OPEN and gets offered to the writing
+# half instead of being quietly closed by an adjacent card.
+#
+# Applied only on the MAIN run (see parse_scoring_reply): a user-driven
+# re-search asks for the lenient floor on purpose.
+#
+# THE FAIL-OPEN GUARANTEE SURVIVES IT, but not the way the ≥2 floor did. That
+# one was safe because _DEFAULT_KEEP_SCORE is also 2, so a card the model never
+# scored cleared the bar by arithmetic. Three is above the default, so an
+# unscored card would have been DROPPED — a judge failure manufacturing exactly
+# the false gap this module refuses to report. parse_scoring_reply therefore
+# keeps an UNSCORED card explicitly, whatever the floor: only a score the model
+# actually gave can drop one.
+_GAP_MIN_SCORE = 3
+
 # Re-search is a deliberately broader, more lenient second pass the user triggers
 # on a point the first run left unaddressed: a wider candidate net (below) and a
 # floor of 1 instead of 2, so a "closest match" tangential card (score 1) is
@@ -342,7 +369,31 @@ RELEVANCE_SYSTEM = (
     "antifungal mechanism, not the renal toxicity)\n\n"
     "DO NOT demand that a card restate the point's exact wording or mechanism. "
     "If the point says 'via renal vasoconstriction', a card about amphotericin "
-    "damaging the kidneys still scores 3 — it is the same subject.\n\n"
+    "damaging the kidneys still scores 3 — it is the same subject. (This "
+    "licence does NOT extend to an item headed GAP — see below.)\n\n"
+    "AN ITEM HEADED 'GAP' IS NOT A LECTURE HEADING. It is ONE claim the student "
+    "wrote down because they did not know it, and the verdict decides whether "
+    "their deck already tests that claim or whether they have to write a card "
+    "for it tonight. Judge a GAP strictly, and against the CLAIM:\n"
+    "    3 — the card ASSERTS the claim. You cannot answer the card without "
+    "knowing it.\n"
+    "    2 — the same subject, but the card tests something ELSE about it. A "
+    "card that merely MENTIONS the claim's threshold, number, timeframe or "
+    "finding while asking about something else — which patients need imaging, "
+    "how the injury is managed, what to do next — is a 2, never a 3: the "
+    "student could answer it having never learnt the claim. 'What are the "
+    "contexts for the Canadian CT Head Rules in a patient post-TBI with GCS "
+    "13-15?' is a 2 for the gap 'mTBI is typically defined by a GCS of 13-15'. "
+    "It quotes the number; it does not teach the definition.\n"
+    "    1 — right topic, different claim.\n"
+    "    0 — something else that shares a word.\n"
+    "A card whose scenario EXCLUDES the gap's condition is a 1 at most, however "
+    "many of the gap's words it contains: 'a player who was wobbly but DID NOT "
+    "lose consciousness' is not a card about loss of consciousness.\n"
+    "'Is defined by', 'criteria', 'definition', 'involves', 'typically', a "
+    "number or a cut-off — these mark a DEFINITIONAL claim, and the 3 is the "
+    "card that states the definition. Never promote a management, imaging or "
+    "next-step card to a 3 because it happens to quote the figure.\n\n"
     "WHEN GENUINELY UNSURE, score 1 rather than 0. The costs are not symmetric: "
     "an extra card is one the student unticks in a second, but a wrongly dropped "
     "card is invisible to them and makes the tool report a gap the deck does not "
@@ -2166,6 +2217,17 @@ def allocate(matches: list[PointMatch], budget: int,
     # Criticality requires a decent score. "There is no point keeping a candidate
     # if it is shit" — a slot filled by a card the judge barely tolerated is not
     # coverage, it's a worse card shown in a better card's place.
+    #
+    # BUT CRITICALITY CANNOT BEAT A STRICTLY HIGHER SCORE. It used to, and that
+    # is a false negative the user can see on his own screen: the mTBI run had
+    # one card ("LOC and retrograde amnesia following head injury") scored 3 by
+    # 'mTBI involves LOC of less than 30 minutes' and 2 by its neighbour
+    # 'post-traumatic amnesia of less than 24 hours'. It was the neighbour's only
+    # candidate, so criticality gave it away — and left the LOC point showing a
+    # card about a player who explicitly DID NOT lose consciousness. Score leads
+    # the key now, so need only decides between points that rate a card the
+    # SAME; the SSRI/TCA case that criticality was written for is a tie on 3s
+    # and is unaffected.
     critical: list[set[int]] = []
     for m, cover in zip(matches, covers):
         by_slot: dict[int, list[int]] = {}
@@ -2176,14 +2238,16 @@ def allocate(matches: list[PointMatch], budget: int,
                 by_slot.setdefault(slot, []).append(nid)
         critical.append({nids[0] for nids in by_slot.values() if len(nids) == 1})
 
-    best_point: dict[int, tuple[int, int, int]] = {}   # nid -> (-critical, rank, pi)
+    # nid -> (-score, 0 if critical else 1, rank, pi). Lowest key wins.
+    best_point: dict[int, tuple[int, int, int, int]] = {}
     for pi, pool in enumerate(pools):
         for rank, nid in enumerate(pool):
-            key = (0 if nid in critical[pi] else 1, rank, pi)
+            score = matches[pi].scores.get(nid, _DEFAULT_KEEP_SCORE)
+            key = (-score, 0 if nid in critical[pi] else 1, rank, pi)
             prev = best_point.get(nid)
             if prev is None or key < prev:
                 best_point[nid] = key
-    pools = [[nid for nid in pool if best_point[nid][2] == pi]
+    pools = [[nid for nid in pool if best_point[nid][3] == pi]
              for pi, pool in enumerate(pools)]
 
     # Each point's fair share, computed from what its candidates actually cover
@@ -2432,7 +2496,13 @@ def build_scoring_prompt(batch: list[ScoreItem]) -> str:
     lines: list[str] = []
     total = 0
     for n, (point, cards) in enumerate(batch, 1):
-        lines.append(f"POINT {n}: {point.concept}")
+        # "GAP" rather than "POINT" for an item that came from a knowledge gap
+        # (kg_id is set only by tools/kg/triage.py). The number is what the
+        # reply is keyed by and is unchanged; the WORD is what switches the
+        # judge onto the strict rubric, because a gap is one claim and a lecture
+        # point is a heading. See RELEVANCE_SYSTEM.
+        head = "GAP" if getattr(point, "kg_id", "") else "POINT"
+        lines.append(f"{head} {n}: {point.concept}")
         # The sub-facts ARE the point's search terms, numbered. Using the terms
         # rather than a fresh AI decomposition is deliberate: these same indices
         # are the slots the allocator fills, so a verdict of "sub-fact 2" lands
@@ -2449,8 +2519,9 @@ def build_scoring_prompt(batch: list[ScoreItem]) -> str:
         lines.append("")
         total += len(cards)
     lines.append(
-        f"Return verdicts for all {len(batch)} point(s) and all {total} id(s), "
-        "keyed by point number."
+        f"Return verdicts for all {len(batch)} item(s) and all {total} id(s), "
+        "keyed by the item number above (1, 2, 3 …), whether it is headed "
+        "POINT or GAP."
     )
     return "\n".join(lines)
 
@@ -2667,6 +2738,16 @@ def parse_scoring_reply(reply, batch: list[ScoreItem],
     a noisy one.
     """
     all_nids = [[nid for nid, _ in cards] for _, cards in batch]
+    # Per-item keep floor: _GAP_MIN_SCORE for an item that came from a knowledge
+    # gap, `min_score` for a lecture point. Raised only when `min_score` is the
+    # main run's default — a re-search passes RESEARCH_MIN_SCORE to be lenient
+    # and must not be overridden into being the strictest pass of all.
+    floors = [
+        _GAP_MIN_SCORE
+        if (min_score == _KEEP_MIN_SCORE and getattr(point, "kg_id", ""))
+        else min_score
+        for point, _cards in batch
+    ]
     if not isinstance(reply, dict):
         log.warn(f"lecture: relevance reply was {type(reply).__name__}, keeping all")
         return [Verdict(kept=list(nids), filtered=False, reason="unparseable reply")
@@ -2702,16 +2783,18 @@ def parse_scoring_reply(reply, batch: list[ScoreItem],
         missing = [x for x in nids if x not in scores]
         if missing:
             log.warn(f"lecture: point {n} reply omitted {len(missing)} id(s), keeping them")
-        # Keep score >= _KEEP_MIN_SCORE; sort by score desc, original index as a
-        # stable tiebreak. An unscored card defaults to _DEFAULT_KEEP_SCORE (a
-        # keep), so a judge FAILURE still fails open — only a deliberate low
-        # score is dropped here. See _KEEP_MIN_SCORE.
+        # Keep score >= this item's floor; sort by score desc, original index
+        # as a stable tiebreak. An unscored card is kept WHATEVER the floor (it
+        # ranks at _DEFAULT_KEEP_SCORE), so a judge FAILURE still fails open —
+        # only a score the model actually gave can drop a card. See
+        # _KEEP_MIN_SCORE and _GAP_MIN_SCORE.
         ranked = sorted(
             ((x, scores.get(x, _DEFAULT_KEEP_SCORE), i) for i, x in enumerate(nids)),
             key=lambda t: (-t[1], t[2]),
         )
         out.append(Verdict(
-            kept=[x for x, s, _ in ranked if s >= min_score],
+            kept=[x for x, s, _ in ranked
+                  if s >= floors[n - 1] or x not in scores],
             scores={x: scores.get(x, _DEFAULT_KEEP_SCORE) for x in nids},
             slots={x: s for x, s in slots.items() if x in set(nids)},
         ))

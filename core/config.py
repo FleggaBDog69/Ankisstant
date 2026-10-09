@@ -565,6 +565,38 @@ DEFAULTS: dict = {
             # each one is a separate `claude` process, and the win is mostly in
             # the first few. 1 restores the old serial behaviour.
             "relevance_workers": 4,
+            # How many DECOMPOSE calls run at once when reading a batch of
+            # knowledge gaps. The read used to be one call that both sized and
+            # decomposed the whole batch, so every gap's generation queued
+            # behind every other gap's: measured 2026-08-23 on 33 real gaps,
+            # 8 took 168s and the full 33 was still going at 9m47s against a
+            # 300s timeout. Sizing now happens once over the whole batch (it is
+            # the only part that needs the comparison) and decomposition fans
+            # out. Same modest default as relevance_workers, and it is MEMORY
+            # that caps it: a `claude` CLI process peaks at ~434MB resident, so
+            # four is already ~1.7GB alongside Anki on an 8GB machine. The
+            # chunks are balanced by expected cost instead, which is where the
+            # remaining wait actually was. 1 restores serial decomposition.
+            "read_workers": 4,
+            # Cache the READ stage per GAP, so re-running a batch only pays for
+            # what changed. Keyed on the exact prompt line a gap produces (its
+            # text, its notes, its locks and the brief itself), never on the
+            # batch — re-running 32 of yesterday's 33 gaps costs one read, not
+            # 33. A gap whose decomposition failed is deliberately NOT cached,
+            # so a session limit or a Stop leaves a miss rather than a permanent
+            # blank. tools/kg/read_cache.py holds it in user_files/.
+            "read_cache": True,
+            # How many readings to keep. Pruned by oldest USE, so the gaps you
+            # keep coming back to survive and the one-offs are what goes.
+            "read_cache_max": 2000,
+            # Have the sizing call rewrite each gap as a tidy sentence (the
+            # "concept" the plan table shows). OFF: it is the longest field that
+            # call writes and output tokens are what it costs in wall time —
+            # and on shorthand that was already clear the rewrite tended to
+            # formalise a note into something broader than was meant. With it
+            # off your own wording is what the table shows, still editable
+            # there. Turning it on restores the old reading exactly.
+            "read_restate_concept": False,
             # Send imagery-bearing slides to the model as images, not just their
             # text layer. OFF by default: text-first is the common path, and
             # local OCR (use_local_ocr) now recovers no-text pages without it.

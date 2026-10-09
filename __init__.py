@@ -138,11 +138,35 @@ def _on_profile_loaded() -> None:
     # No-op when none are waiting; never fatal if the inbox is malformed.
     try:
         from .tools.kg import store as _kg_store
-        drained = _kg_store.drain_inbox()
+        inbox_groups: list[str] = []
+        drained = _kg_store.drain_inbox(groups_out=inbox_groups)
         if drained:
             log.info(f"drained {drained} knowledge gap(s) from the inbox")
+            # A gap captured outside Anki can land in a batch you had archived
+            # or collapsed; bring it back so the gap isn't invisible on arrival.
+            from .tools.knowledge_gaps import wake_groups as _wake_groups
+            woken = _wake_groups(inbox_groups)
+            if woken:
+                log.info("un-archived group(s) with new gaps: "
+                         + ", ".join(woken))
     except Exception as e:
         log.error(f"kg inbox drain failed: {e}")
+
+    # Apply edits to gaps that already exist — ticking one off, attaching the
+    # tag a search landed on. Adds go through kg_inbox.json; those can only be
+    # replayed at profile load, but an edit to a live record can be applied any
+    # time, so this one also runs a watcher and picks up patches dropped while
+    # Anki is open (see tools/kg/patch_inbox.py for why the queue must never be
+    # written from outside).
+    try:
+        from .tools.kg import patch_inbox as _kg_patch
+        applied = _kg_patch.apply_pending()
+        if applied:
+            ok = sum(1 for r in applied if r.get("ok"))
+            log.info(f"applied {ok}/{len(applied)} knowledge gap patch(es)")
+        _kg_patch.start_watcher()
+    except Exception as e:
+        log.error(f"kg patch inbox failed: {e}")
 
     for key, module in TOOLS:
         if not tool_enabled(key):

@@ -18,10 +18,20 @@
 # The results page splits in two: what your deck already had on top, and — for
 # every point it turned out NOT to have — the cards written for it underneath,
 # generated automatically as soon as the search lands. Both halves are reviewed
-# side by side and committed by ONE button under ONE checkpoint, so a single
-# Ctrl+Z takes the entire pass back out. Generation runs while you read the
+# side by side and committed by ONE button. Generation runs while you read the
 # found cards, which is the real reason the two halves share a screen: in a
 # wizard that time is spent staring at a progress bar.
+#
+# WHERE THE WRITTEN CARDS GO, AND WHAT CTRL+Z THEN MEANS.
+# Apply sends them through Anki's own Add window, one at a time, the way AI
+# Create always has: the last look at a card belongs in the editor it will
+# live in, not in a tree row. "Add all now" beside it puts them straight in,
+# for when you already trust them. That choice decides the undo story, so it
+# is stated on the confirm rather than promised here — straight in keeps the
+# old guarantee that one Ctrl+Z takes the whole pass back out, while cards
+# added through Anki's window are Anki's own undo entries, one each. The found
+# half commits immediately either way, because tagging and unsuspending notes
+# you already have is not something the Add window can do.
 #
 # WHY THE RESULTS ARE GROUPED BY GAP, AND TAGGED PER GAP.
 # A lecture commits everything under one tag because everything came from one
@@ -33,15 +43,18 @@
 
 from __future__ import annotations
 
+import re
 import threading
 import uuid
 
 from aqt import mw
 from aqt.qt import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QHBoxLayout,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QEvent,
+    QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QMenu, QMessageBox, QPlainTextEdit,
     QProgressBar,
-    QPushButton, QSpinBox, QStackedWidget, Qt, QTableWidget, QTableWidgetItem,
+    QPushButton, QRect, QSpinBox, QStackedWidget, QStyledItemDelegate, Qt,
+    QTableWidget, QTableWidgetItem, QTextCursor,
     QTimer, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 from aqt.utils import askUser, showInfo, showWarning, tooltip
@@ -50,7 +63,8 @@ from aqt.webview import AnkiWebView
 from ...core import anki_utils, api as core_api, log
 from ...core.config import month_tag, tool_config
 from ...core.qt_utils import (
-    attach_tag_completer, is_manual_provider, provider_configured, theme_dialog,
+    attach_tag_completer, is_manual_provider, provider_configured,
+    resurface_at_home, theme_dialog, tips_on_checkbox_only,
 )
 from .. import autotag
 from . import store as kg_store, triage as kg_triage
@@ -126,6 +140,7 @@ def create_record_for(kg: dict, concept: str, points: list[dict]) -> dict:
         "stem_html":    kg_store.field(kg, "stem_html"),
         "explanation":  kg_store.field(kg, "explanation"),
         "images":       list((kg.get("fields") or {}).get("images") or []),
+        "resources":    list(kg.get("resources") or []),
         "concept":      str(concept or "").strip() or str(kg.get("title") or ""),
         "notes":        "\n\n".join(notes_bits),
         "points":       list(points),
@@ -133,6 +148,39 @@ def create_record_for(kg: dict, concept: str, points: list[dict]) -> dict:
         # thing the deck is missing.
         "target_cards": max(1, len(points)),
     }
+
+
+def reclassify_points(points, report=None) -> int:
+    """Re-derive the tag levels of every point whose wording the user rewrote.
+
+    Qt-free and safe off the main thread (autotag.classify reads the cached
+    vocab, not the collection) — it is called from inside the search's
+    background job, where the user is already waiting, rather than blocking the
+    approval dialog's OK button on one AI call per edit.
+
+    Best-effort: a point that can't be classified keeps empty levels, which
+    _suggest_tag already handles by falling through to another point. A wrong
+    tag is worse than no tag."""
+    todo = [p for p in (points or []) if getattr(p, "_reclassify", False)]
+    if not todo:
+        return 0
+    from ..lecture.extractor import _clean_level
+    done = 0
+    for i, pt in enumerate(todo, 1):
+        if report:
+            report(f"Re-reading {i} of {len(todo)} point(s) you rewrote…", 0)
+        try:
+            levels = autotag.classify(pt.concept) or {}
+        except Exception as e:
+            log.warn(f"bulk search: couldn't reclassify '{pt.concept[:40]}': {e}")
+            levels = {}
+        if levels:
+            pt.system = _clean_level(levels.get("system"))
+            pt.subsystem = _clean_level(levels.get("subsystem"))
+            pt.topic = _clean_level(levels.get("topic"))
+            done += 1
+        pt._reclassify = False
+    return done
 
 
 def _record_points(rec: dict) -> list:
@@ -182,9 +230,142 @@ def _card_back(card: dict) -> str:
     return str((card or {}).get("extra") or (card or {}).get("back") or "")
 
 
+def _image_seed(card: dict) -> str:
+    """A search phrase for one written card — its front, stripped of markup
+    and cloze scaffolding.
+
+    AI Create seeds the same box from the model's own `image_query`. A
+    work-through card has none, deliberately: nobody asked the model for
+    pictures, because fetching candidates for every card of a twelve-gap pass
+    is twenty web round trips for illustrations you mostly don't want. So the
+    question the card asks is the description of what would illustrate it."""
+    seed = re.sub(r"\{\{c\d+::|::[^}]*\}\}|\}\}", " ", str(card.get("front") or ""))
+    seed = re.sub(r"<[^>]+>", " ", seed)
+    seed = re.sub(r"\s+", " ", seed)
+    # The cloze braces leave a gap where the punctuation was, and a search box
+    # reading "sodium ." looks like a typo you made.
+    return re.sub(r"\s+([.,;:!?])", r"\1", seed).strip()[:80]
+
+
+def _pick_card_images(parent, how: str, seed: str) -> list:
+    """Image file paths for one card, by whichever of the three routes was
+    asked for. The same three the AI Create review row offers, running the
+    same functions underneath, so a picture chosen here is chosen the same
+    way."""
+    from aqt.qt import QFileDialog
+    try:
+        if how == "file":
+            paths, _f = QFileDialog.getOpenFileNames(
+                parent, "Attach images to this card", "",
+                "Images (*.png *.jpg *.jpeg *.gif *.webp *.bmp *.svg);;"
+                "All files (*)")
+            return [p for p in (paths or []) if p]
+        from .. import images
+        if how == "find":
+            return list(images.pick_images(parent, seed) or [])
+        return list(images.browse_for_images(parent, seed) or [])
+    except Exception as e:
+        log.error(f"work through: image {how} failed: {e}")
+        showWarning(f"That image step didn't work: {e}")
+        return []
+
+
+def _merged_images(existing, added) -> list:
+    """One card's image list with more added — deduped, order kept. Attaching
+    the same file twice is a slip, not an instruction to show it twice."""
+    seen, out = set(), []
+    for p in list(existing or []) + list(added or []):
+        p = str(p or "")
+        if p and p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
 def _short(text: str, n: int) -> str:
     text = " ".join((text or "").split())
     return text if len(text) <= n else text[:n - 1].rstrip() + "…"
+
+
+class _ProseDelegate(QStyledItemDelegate):
+    """A real text box for the two plan-table columns that hold prose.
+
+    THE EDITOR USED TO BE A QLineEdit — Qt’s default for a QTableWidgetItem —
+    and a one-line editor is not a small inconvenience for a multi-paragraph
+    note. A QLineEdit cannot hold a newline at all, so double-clicking a headed
+    differential folded it into one run-on line, and typing a single character
+    committed that back over the original. The structure was destroyed by
+    LOOKING at it, which is why the notes felt clanky and why headings kept
+    going missing from them.
+
+    So: a QPlainTextEdit. Return makes a new line (Qt’s own delegate filter
+    deliberately leaves Return alone for text editors), ⌘/Ctrl+Return commits,
+    Esc cancels. The editor opens at a usable height however short the row
+    beneath it is — the ROW is a preview, the EDITOR is where writing happens
+    — and it is nudged back up when it would open past the bottom of the view.
+
+    sizeHint caps the row, which is the other half of the complaint: a
+    1,300-character note was rendering as a 30-line row that pushed every other
+    gap off the screen. Four or five lines each, the rest on hover, all of it
+    in the editor.
+    """
+
+    #: about five wrapped lines. Rows are a preview, not the document.
+    MAX_ROW = 76
+    #: the editor always opens at least this tall, whatever the row is.
+    MIN_EDITOR = 150
+
+    def __init__(self, placeholder: str = "", parent=None):
+        super().__init__(parent)
+        self._placeholder = str(placeholder or "")
+
+    def sizeHint(self, option, index):
+        sz = super().sizeHint(option, index)
+        if sz.height() > self.MAX_ROW:
+            sz.setHeight(self.MAX_ROW)
+        return sz
+
+    def createEditor(self, parent, option, index):
+        ed = QPlainTextEdit(parent)
+        ed.setTabChangesFocus(True)
+        ed.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        if self._placeholder:
+            ed.setPlaceholderText(self._placeholder)
+        ed.setToolTip("Return for a new line · ⌘/Ctrl+Return to save · "
+                      "Esc to cancel")
+        return ed
+
+    def setEditorData(self, editor, index):
+        editor.setPlainText(str(index.data(Qt.ItemDataRole.EditRole) or ""))
+        editor.moveCursor(QTextCursor.MoveOperation.End)
+
+    def setModelData(self, editor, model, index):
+        model.setData(index, editor.toPlainText(), Qt.ItemDataRole.EditRole)
+
+    def updateEditorGeometry(self, editor, option, index):
+        rect = QRect(option.rect)
+        if rect.height() < self.MIN_EDITOR:
+            rect.setHeight(self.MIN_EDITOR)
+        view = editor.parentWidget()          # the table’s viewport
+        if view is not None:
+            over = rect.bottom() - view.height()
+            if over > 0:
+                rect.moveTop(max(0, rect.top() - over))
+        editor.setGeometry(rect)
+
+    def eventFilter(self, obj, ev):
+        # The view installs the delegate as the editor’s event filter, so this
+        # is the hook for the one key Qt does not already handle for a text
+        # edit. Everything else — Esc, Tab, focus-out — is the base class’s.
+        if (ev is not None and isinstance(obj, QPlainTextEdit)
+                and ev.type() == QEvent.Type.KeyPress
+                and ev.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                and (ev.modifiers() & (Qt.KeyboardModifier.ControlModifier
+                                       | Qt.KeyboardModifier.MetaModifier))):
+            self.commitData.emit(obj)
+            self.closeEditor.emit(obj)
+            return True
+        return super().eventFilter(obj, ev)
 
 
 class BulkSearchDialog(QDialog):
@@ -457,6 +638,24 @@ class BulkSearchDialog(QDialog):
         self._commit_btn.setVisible(False)
         self._commit_btn.clicked.connect(self._on_commit)
         btn_row.addWidget(self._commit_btn)
+
+        # The escape hatch from the default, not a rival to it. Apply now sends
+        # the written cards through Anki's Add window one at a time, which is
+        # right when you want a last look at each — and wrong when you have
+        # twenty you already trust. Only ever visible when there are written
+        # cards to skip the review OF; the found half is unaffected either way.
+        self._add_now_btn = QPushButton("Add all now")
+        self._add_now_btn.setMinimumHeight(32)
+        self._add_now_btn.setVisible(False)
+        self._add_now_btn.setToolTip(
+            "Add the written cards straight into your collection, without "
+            "opening Anki's Add window for each one.\n\n"
+            "Same cards, same tags, same deck as reviewing them — and one "
+            "Ctrl+Z takes the whole pass back out, which stops being true "
+            "once Anki's own Add window has done the adding.")
+        self._add_now_btn.clicked.connect(
+            lambda: self._on_apply_everything(review=False))
+        btn_row.addWidget(self._add_now_btn)
         root.addLayout(btn_row)
 
         if not provider_configured():
@@ -484,6 +683,31 @@ class BulkSearchDialog(QDialog):
             "Write cards for this gap. With Find on, only for the points the "
             "search turned up nothing for. With Find off, for every point — "
             "nothing measured them, so nothing can be assumed covered.")
+        # What a COLUMN means belongs on its header, not repeated down every
+        # row of it — see tips_on_checkbox_only, which is what makes the rows
+        # themselves quiet.
+        for col_i, tip in (
+            (C_NOTES, "This gap's notes, editable in place. Saved back onto the "
+                      "gap before the AI reads it, so what you type here shapes "
+                      "the run."),
+            (C_READ, "How the AI understood each gap — overwrite it to say "
+                     "what the gap is really asking for.\n\n"
+                     "Your wording is saved onto the gap and the AI reads it "
+                     "again from that, so the points, the search and the cards "
+                     "all come from what you typed. It sticks: every later run "
+                     "reads the gap your way, not the title's.\n\n"
+                     "Clear the cell to go back to reading it from the title. "
+                     "To change the SEARCH TERMS a point matches on rather than "
+                     "the subject itself, use “Review points…”."),
+            (C_CARDS, "How many existing cards each gap should pull. Changing "
+                      "the scope resets it to that scope's default."),
+            (C_PTS, "How many searchable points a gap was split into. A broad "
+                    "gap splits into several — that's what actually finds more "
+                    "cards, since one point only matches cards about one thing."),
+        ):
+            h = self._table.horizontalHeaderItem(col_i)
+            if h is not None:
+                h.setToolTip(tip)
         self._table.verticalHeader().setVisible(False)
         self._table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self._table.setWordWrap(True)
@@ -494,7 +718,19 @@ class BulkSearchDialog(QDialog):
         for c in (C_FIND, C_WRITE, C_SCOPE, C_CARDS, C_PTS):
             hh.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
         self._table.setColumnWidth(C_GAP, 220)
+        # The two columns that hold prose get a real text box to edit in, and a
+        # capped row height so one long note can't own the screen. See
+        # _ProseDelegate — both halves of "the text boxes are clanky".
+        self._notes_delegate = _ProseDelegate(
+            "What you already know, what keeps catching you out, what you want "
+            "cards on. Several lines are fine.", self._table)
+        self._table.setItemDelegateForColumn(C_NOTES, self._notes_delegate)
+        self._read_delegate = _ProseDelegate(
+            "Say what this gap is actually asking for, in your own words.",
+            self._table)
+        self._table.setItemDelegateForColumn(C_READ, self._read_delegate)
         self._table.itemChanged.connect(self._on_table_item_changed)
+        tips_on_checkbox_only(self._table)
         col.addWidget(self._table, 1)
 
         self._table_hint = QLabel(
@@ -502,7 +738,11 @@ class BulkSearchDialog(QDialog):
             "are saved back to the gap — they're the main thing the AI reads, so "
             "this is the place to fix a gap it's about to misunderstand. After "
             "reading, edit the reading or the card count on any row too. Rows "
-            "marked ⚠ are ones the AI wasn't sure it understood."
+            "marked ⚠ are ones the AI wasn't sure it understood.<br>"
+            "Double-click a note or a reading for a proper text box: "
+            "<b>Return</b> for a new line, <b>⌘/Ctrl+Return</b> to save, "
+            "<b>Esc</b> to cancel. Rows show the first few lines only — hover "
+            "for the whole thing."
         )
         self._table_hint.setTextFormat(Qt.TextFormat.RichText)
         self._table_hint.setStyleSheet("color: gray; font-size: 11px;")
@@ -635,27 +875,28 @@ class BulkSearchDialog(QDialog):
             "in AI Create's queue \u2014 nothing is generated yet.")
         self._send_create_btn.clicked.connect(self._on_send_to_create)
         send_row.addWidget(self._send_create_btn)
-        src_lbl = QLabel("Source:")
-        src_lbl.setStyleSheet("font-size: 11px; opacity: .8;")
-        send_row.addWidget(src_lbl)
-        self._source_input = QLineEdit()
-        self._source_input.setMaximumWidth(230)
-        self._source_input.setPlaceholderText("e.g. Placements::GP — optional")
-        self._source_input.setToolTip(
-            "Where this run's cards came from, tagged under "
-            "{base}::Sources::. Prefilled from the GROUP's own source when it "
-            "has one, then the gap type or the file; otherwise type it once "
-            "and it sticks for next time.\n\n"
-            "It carries NO body system — the content tag holds that, once.")
-        self._source_input.setText(
-            self._seed_source or self._group_source()
-            or autotag.sticky_source("knowledge_gaps"))
-        try:
-            from ...core.qt_utils import attach_source_completer
-            attach_source_completer(self._source_input)
-        except Exception:
-            pass
-        send_row.addWidget(self._source_input)
+        # THERE IS NO SOURCE BOX. It was an editable field here, prefilled and
+        # remembered per door — and that memory is precisely what put
+        # Sources::Murtaghs::other onto batches with nothing to do with
+        # Murtagh's: a path typed once for one loose batch silently became the
+        # default for every run afterwards, in a box nobody reads twice.
+        #
+        # Provenance for a work-through is DERIVED, never typed. A lecture
+        # brings its filename, a group carries its own source (said once, in
+        # the group, where it belongs), and a gap type maps to one. When none
+        # of those says anything the run has NO source, which is the right
+        # answer for course work — the course branch already records where it
+        # came from. Typing it here was asking the same question a third time.
+        #
+        # This label reports what will be applied, and hides when there is
+        # nothing to report. Read-only on purpose: a run is not the place to
+        # invent provenance, because whatever you invent here is gone the
+        # moment the window closes.
+        self._source_lbl = QLabel("")
+        self._source_lbl.setStyleSheet("font-size: 11px; opacity: .8;")
+        self._source_lbl.setVisible(False)
+        send_row.addWidget(self._source_lbl)
+        self._refresh_source_label()
         self._summary_btn = QPushButton("\U0001F4C4  Read as a summary")
         self._summary_btn.setAutoDefault(False)
         self._summary_btn.setCheckable(True)
@@ -684,6 +925,7 @@ class BulkSearchDialog(QDialog):
         # The tick boxes live in the tree, so acting on the run means going
         # back to it. Say so rather than leaving a dead Apply button.
         self._commit_btn.setEnabled(not on and not self._applied)
+        self._add_now_btn.setEnabled(not on and not self._applied)
 
     def _summary_html(self) -> str:
         """This run as a document. Reads the tree, so it always says what is
@@ -722,6 +964,13 @@ class BulkSearchDialog(QDialog):
         th.setStretchLastSection(False)
         self._tree.setColumnWidth(1, 210)
         self._tree.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self._tree.headerItem().setToolTip(1,
+            "Applied to every ticked card under a gap. Prefilled from the gap's "
+            "own system/subsystem/topic, in the same scheme AI Browse and AI "
+            "Create use. Edit or clear it freely.")
+        # A card's full text is still a hover away — over its checkbox. Double-
+        # click opens the note in the browser, which is the better read anyway.
+        tips_on_checkbox_only(self._tree)
         self._tree.itemChanged.connect(self._on_tree_item_changed)
         self._tree.itemDoubleClicked.connect(self._on_tree_double_clicked)
         self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -850,8 +1099,30 @@ class BulkSearchDialog(QDialog):
                 blank.setFlags(blank.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 self._table.setItem(row, c, blank)
         self._table.blockSignals(False)
-        self._table.resizeRowsToContents()
+        self._fit_rows()
         self._refresh_title()
+
+    def _fit_rows(self, row: int | None = None) -> None:
+        """Size the plan rows to their content, then CLAMP them.
+
+        resizeRowsToContents on its own takes the tallest cell in the row, and
+        with word wrap on a stretched column a long note is a thirty-line cell.
+        One gap then fills the screen and the rest of the batch is below the
+        fold — on the screen whose entire job is comparing the batch. The
+        delegate caps its own two columns; this caps the row, so nothing else
+        can quietly reintroduce the problem.
+
+        The text is not lost: the hover carries all of it and the editor opens
+        on all of it. A row is a preview."""
+        cap = _ProseDelegate.MAX_ROW
+        rows = ([row] if row is not None else range(self._table.rowCount()))
+        if row is None:
+            self._table.resizeRowsToContents()
+        else:
+            self._table.resizeRowToContents(row)
+        for r in rows:
+            if self._table.rowHeight(r) > cap:
+                self._table.setRowHeight(r, cap)
 
     def _notes_cell(self, kg: dict) -> QTableWidgetItem:
         """This gap's notes, editable in place.
@@ -860,11 +1131,16 @@ class BulkSearchDialog(QDialog):
         two-word title plus "the vascular ones keep tripping me up" is a
         completely different search from the title alone. They were readable
         only as a hover tooltip, on the one screen where you are deciding what
-        to run, which is exactly where you notice they're wrong."""
-        cell = QTableWidgetItem(kg_store.field(kg, "notes") or "")
-        cell.setToolTip("Editable. Saved back onto the gap before the AI reads "
-                        "it, so what you type here shapes the run.")
-        return cell
+        to run, which is exactly where you notice they're wrong.
+
+        The row shows the first few lines (the delegate caps it) and the
+        tooltip carries the rest, so a long note is readable without being
+        allowed to push every other gap off the screen."""
+        text = kg_store.field(kg, "notes") or ""
+        it = QTableWidgetItem(text)
+        it.setToolTip(text or "No notes on this gap yet — double-click to add "
+                              "some. They are the main thing the AI reads.")
+        return it
 
     def _refresh_title(self) -> None:
         n = len(self._kgs)
@@ -891,9 +1167,18 @@ class BulkSearchDialog(QDialog):
     def _on_table_item_changed(self, item) -> None:
         if item is None:
             return
-        if item.column() == C_NOTES:
-            self._table.resizeRowToContents(item.row())
-            return
+        if item.column() in (C_NOTES, C_READ):
+            # The row only ever shows the first few lines, so the hover has to
+            # carry what was just typed or the rest of it is invisible until
+            # the box is opened again.
+            self._table.blockSignals(True)
+            try:
+                item.setToolTip(item.text())
+            finally:
+                self._table.blockSignals(False)
+            self._fit_rows(item.row())
+            if item.column() == C_NOTES:
+                return
         if item.column() not in (C_GAP, C_FIND, C_WRITE):
             return
         row = item.row()
@@ -966,6 +1251,56 @@ class BulkSearchDialog(QDialog):
                 pass
         return changed
 
+    def _sync_reading(self) -> list:
+        """Persist a rewritten reading onto its gap. Returns the rows changed.
+
+        The reading cell is the student saying "no, this gap is asking THIS".
+        It used to be folded into the plan's `concept` and nothing else, and
+        `concept` is only ever a heading on the generation prompt — so the edit
+        changed the label on the work and not the work. Saved here as the gap's
+        `read_as`, it goes into the decompose prompt as the subject
+        (triage._kg_prompt_line), which re-reads the gap from the student's
+        wording, invalidates that gap's cached reading by construction, and
+        survives to every later run.
+        """
+        rewritten: list = []
+        for row, p in enumerate(self._plans):
+            if row >= len(self._kgs):
+                continue
+            cell = self._table.item(row, C_READ)
+            if cell is None:
+                continue
+            typed = cell.text().strip()
+            if typed == "— not read —":
+                typed = ""
+            if typed == str(getattr(p, "_read_shown", "") or "").strip():
+                continue                      # untouched
+            kg = self._kgs[row]
+            if typed == str(kg_store.field(kg, "read_as") or "").strip():
+                continue                      # already saved, nothing new
+            fields = dict(kg.get("fields") or {})
+            if typed:
+                fields["read_as"] = typed
+            else:
+                fields.pop("read_as", None)   # cleared: back to the title
+            kg["fields"] = fields
+            try:
+                updated = kg_store.update(str(kg.get("id") or ""), fields=fields)
+                if updated:
+                    self._kgs[row] = updated
+            except Exception as e:
+                log.warn(f"bulk search: couldn't save the reading for "
+                         f"{kg.get('id')}: {e}")
+            p._read_shown = typed
+            rewritten.append(row)
+        if rewritten:
+            try:
+                from .. import knowledge_gaps
+                knowledge_gaps._refresh_open_panel()
+            except Exception:
+                pass
+        return rewritten
+
     def _active_plans(self) -> list:
         """Every plan in the run at all — findable or writable."""
         return [p for p in self._plans if p.ok and p.included]
@@ -996,37 +1331,49 @@ class BulkSearchDialog(QDialog):
 
     # ── stage 1: the read ────────────────────────────────────────────────────
 
-    def _on_read(self) -> None:
+    def _on_read(self, *_a, then=None) -> None:
         rows = self._checked_rows()
         if not rows:
             tooltip("Tick at least one gap first.")
             return
-        # Notes first: they are the biggest input to how each gap is read, and
-        # an edit sitting in a cell that hasn't been committed yet would be
-        # invisible to the call that's about to run.
+        # Notes and rewritten readings first: they are the two biggest inputs to
+        # how each gap is read, and an edit sitting in a cell that hasn't been
+        # committed yet would be invisible to the call that's about to run.
         saved = self._sync_notes()
+        reworded = self._sync_reading()
+        # What runs when the read lands. Used by Find, which re-reads any gap
+        # whose reading was rewritten before it searches — the rewrite is a new
+        # subject, and searching the old points would search the wrong thing.
+        self._after_read = then
         kgs = [self._kgs[r] for r in rows]
         self._set_busy(True, (f"Saved notes on {saved} gap(s). " if saved else "")
+                       + (f"Re-reading {len(reworded)} gap(s) from your wording. "
+                          if reworded else "")
                        + f"Reading {len(kgs)} gap(s) with AI…")
         model = pipeline.dial_for(pipeline.READ)
         self._stage(pipeline.READ, pipeline.RUNNING)
 
-        # A batch of gaps is one big reasoning call — measured at several minutes
-        # for 17 gaps. Without a running clock a static label reads as a hang.
+        # Minutes, still: the read is one batch-wide sizing call plus a fan of
+        # parallel decompose calls (triage._read_split), and it reports its own
+        # progress into the heartbeat's base line. Without a running clock even
+        # a progressing label reads as a hang.
         from ..lecture.panel import _Heartbeat
 
         def _report(msg, _pct=0):
             mw.taskman.run_on_main(lambda m=msg: self._set_status(m))
 
         def _bg():
-            with _Heartbeat(_report, f"Reading {len(kgs)} gap(s) with AI…", 0):
-                return kg_triage.triage(kgs, model=model)
+            with _Heartbeat(_report, f"Reading {len(kgs)} gap(s) with AI…", 0) as hb:
+                return kg_triage.triage(kgs, model=model, report=hb.set_base)
 
         mw.taskman.run_in_background(_bg, self._on_read_done, uses_collection=False)
 
     def _on_read_done(self, fut) -> None:
         if self._closed:
             return
+        # Taken now, not at the end: a read that fails or is stopped must not
+        # leave a continuation armed for whatever runs next.
+        then, self._after_read = getattr(self, "_after_read", None), None
         self._set_busy(False)
         self._resurface()
         try:
@@ -1061,6 +1408,9 @@ class BulkSearchDialog(QDialog):
         self._stage(pipeline.READ, pipeline.DONE,
                     f"{sum(len(p.points) for p in self._plans)} point(s)")
         self._render_plan_table()
+        if then is not None:
+            then()
+            return
         if self._lp_gate_cb.isChecked():
             self._open_lp_gate()
 
@@ -1129,24 +1479,39 @@ class BulkSearchDialog(QDialog):
             # happens after _sync_notes, so the cell is already authoritative
             # and re-reading the record would undo an edit made mid-run.
             keep = self._table.item(row, C_NOTES)
-            self._table.setItem(row, C_NOTES, QTableWidgetItem(
-                keep.text() if keep is not None else
-                (kg_store.field(self._kgs[row], "notes")
-                 if row < len(self._kgs) else "")))
+            kept = (keep.text() if keep is not None else
+                    (kg_store.field(self._kgs[row], "notes")
+                     if row < len(self._kgs) else ""))
+            note_cell = QTableWidgetItem(kept)
+            # Same as _notes_cell: the row is capped at a few lines, so the
+            # whole note has to be on the hover or it is invisible here.
+            note_cell.setToolTip(kept or "No notes on this gap yet — "
+                                         "double-click to add some.")
+            self._table.setItem(row, C_NOTES, note_cell)
 
-            reading = QTableWidgetItem(
-                "— not read —" if unread else p.concept)
+            shown = "— not read —" if unread else (p.concept or "")
+            reading = QTableWidgetItem(shown)
+            reading.setToolTip(shown)
             if unread:
                 reading.setFlags(reading.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            else:
+            # A gap you have already reworded says so, in words: the cell shows
+            # the AI's reading of YOUR wording, which looks identical to its
+            # reading of the title. Without this there is no way to tell that
+            # the gap is pinned, or to know there is something to clear.
+            own = (str(kg_store.field(self._kgs[row], "read_as") or "").strip()
+                   if row < len(self._kgs) else "")
+            if own:
                 reading.setToolTip(
-                    "How the AI understood this gap.\n\n"
-                    "Editing it does NOT change the search. The search runs on "
-                    "the learning points below it and, specifically, on their "
-                    "SEARCH TERMS — use “Review points…” to change those.\n\n"
-                    "What this text does affect: it becomes the topic any cards "
-                    "written for this gap are generated from.")
+                    "Read from YOUR wording, not the title:\n\n  " + own
+                    + "\n\nOverwrite this cell to change it, or clear it to go "
+                      "back to the title.")
             self._table.setItem(row, C_READ, reading)
+            # What the AI put here, kept so an EDIT can be told from the
+            # untouched cell. Without it the only way to spot a rewrite was to
+            # compare against the stored one, which meant re-reading a gap
+            # pinned the model's own words as though the student had typed
+            # them.
+            p._read_shown = shown
 
             if unread:
                 for c in (C_SCOPE, C_CARDS, C_PTS):
@@ -1170,20 +1535,14 @@ class BulkSearchDialog(QDialog):
             cards = QSpinBox()
             cards.setRange(kg_triage.MIN_CARDS, kg_triage.MAX_CARDS)
             cards.setValue(kg_triage.clamp_cards(p.cards))
-            cards.setToolTip("How many existing cards this gap should pull. "
-                             "Changing the scope resets it to that scope's default.")
             cards.valueChanged.connect(lambda _v, r=row: self._on_cards_changed(r))
             self._table.setCellWidget(row, C_CARDS, cards)
 
             pts = QTableWidgetItem(str(len(p.points)))
             pts.setFlags(pts.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            pts.setToolTip(
-                "How many searchable points this gap was split into. A broad gap "
-                "splits into several — that's what actually finds more cards, "
-                "since one point only matches cards about one thing.")
             self._table.setItem(row, C_PTS, pts)
         self._table.blockSignals(False)
-        self._table.resizeRowsToContents()
+        self._fit_rows()
 
         n_ok = sum(1 for p in self._plans if p.ok)
         n_shaky = sum(1 for p in self._plans if p.ok and p.confidence == "low")
@@ -1222,6 +1581,9 @@ class BulkSearchDialog(QDialog):
             it0 = self._table.item(row, C_GAP)
             if it0 is not None:
                 p.included = it0.checkState() == Qt.CheckState.Checked
+            # The reading, as the run's heading. The SUBSTANCE of an edit here
+            # is handled by _sync_reading, which saves it onto the gap and has
+            # it read again — this only keeps the label on screen matching.
             it1 = self._table.item(row, C_READ)
             if it1 is not None and p.ok:
                 txt = it1.text().strip()
@@ -1240,6 +1602,16 @@ class BulkSearchDialog(QDialog):
         if not anki_utils.require_col() or self._busy:
             return
         self._sync_notes()
+        # A rewritten reading is a different subject, and the points hanging off
+        # the row were decomposed from the old one. Searching them would search
+        # what the student just said this gap ISN'T about, so the gap is read
+        # again first and the search runs on what comes back. Every untouched
+        # gap in the batch is a cache hit, so the extra leg costs one call.
+        if self._sync_reading():
+            self._set_status("Your wording changed — re-reading those gaps "
+                             "before searching.")
+            self._on_read(then=self._on_search)
+            return
         self._sync_plans()
         # Remembered now, before the run: the table is re-rendered as results
         # land, and the write half needs to know what was asked for.
@@ -1254,6 +1626,7 @@ class BulkSearchDialog(QDialog):
             # Every gap is Write-only. Nothing to search, so go straight to
             # writing rather than reporting an empty search as a failure.
             self._run_plans = list(write_only)
+            self._refresh_source_label()
             self._skip_to_writing(write_only)
             return
         points = kg_triage.points_of(plans)
@@ -1292,6 +1665,10 @@ class BulkSearchDialog(QDialog):
         def _bg():
             core_api.set_cancel_event(cancel_ev)
             try:
+                # Points you rewrote in the approval dialog are reclassified
+                # first, so the cards this search finds file under what the
+                # point now says rather than what it used to.
+                reclassify_points(points, report=_report)
                 return run_pipeline(None, cfg, report=_report, cancel_ev=cancel_ev,
                                     points=points, cap_for=cap_for,
                                     cand_cap_for=cand_cap_for)
@@ -1496,10 +1873,6 @@ class BulkSearchDialog(QDialog):
             tag_edit = QLineEdit()
             tag_edit.setPlaceholderText("no tag — this gap's cards won't be tagged")
             tag_edit.setText(self._suggest_tag(plan, group))
-            tag_edit.setToolTip(
-                "Applied to every ticked card under this gap. Prefilled from the "
-                "gap's own system/subsystem/topic, in the same scheme AI Browse "
-                "and AI Create use. Edit or clear it freely.")
             attach_tag_completer(tag_edit, multi=False)
             self._tree.setItemWidget(top, 1, tag_edit)
             self._tag_edits[plan.kg_id] = tag_edit
@@ -1599,6 +1972,7 @@ class BulkSearchDialog(QDialog):
         self._title.setText(
             f"<b>{len(self._run_plans)} gap(s) searched</b> · {total_notes} card(s) found")
         self._update_selection_count()
+        self._refresh_source_label()
         # Start writing straight away, on this same screen. Deferred one tick so
         # the found cards paint first: they are readable for the whole time the
         # rest is being generated, which is the point of not making this a page.
@@ -1606,25 +1980,35 @@ class BulkSearchDialog(QDialog):
                 and self._write_cb.isChecked() and not self._gen_batch_id):
             QTimer.singleShot(0, self._start_generation)
 
-    def _course_tag(self) -> str:
-        """The group's own branch, when it has an absolute one.
+    def _course_tag(self, group: str | None = None) -> str:
+        """The branch shared by every card in a gap's group, or "".
 
         An absolute group ("SRS 5" -> !!Curtanki::Year_3::SRS::05) is a COURSE
         tag, not a content tag. It used to be returned in place of the content
         tag, so a gap worked inside a case ended up with no !!Fleg::KG:: tag at
         all and the content tree had a hole exactly where the course work was.
-        Both are applied now: the content tag per gap, this once for the run.
+        Both are applied now: the content tag per gap, the branch beside it.
+
+        PER GAP, not once for the run, and via group_branch() rather than
+        `absolute`. Three things were wrong with asking the run: a relative
+        group has a branch too and got none, so the cards WRITTEN for a gap
+        landed under its group and the cards FOUND for that same gap on the
+        same screen didn't; a group told not to tag as one still got its branch;
+        and a selection spanning two groups filed all of it under whichever
+        group happened to come first.
         """
-        for plan in self._run_plans:
-            group = getattr(plan, "group", "")
-            if not group:
+        names = ([group] if group is not None
+                 else [getattr(p, "group", "") for p in self._run_plans])
+        for name in names:
+            if not name:
                 continue
             try:
-                gp = autotag.group_tag_plan(group)
-                if gp.get("absolute") and gp.get("path"):
-                    return str(gp["path"])
+                branch = autotag.group_branch(str(name))
             except Exception as e:
                 log.warn(f"run view: couldn't resolve the group branch: {e}")
+                continue
+            if branch:
+                return branch
         return ""
 
     def _run_group(self) -> str:
@@ -1639,41 +2023,64 @@ class BulkSearchDialog(QDialog):
                 return str(g)
         return ""
 
-    def _group_source(self) -> str:
-        try:
-            return autotag.group_source(self._run_group())
-        except Exception as e:
-            log.warn(f"run view: couldn't read the group's source: {e}")
-            return ""
+    def _source_path(self) -> str:
+        """The provenance path for this run — most specific first, or "".
 
-    def _source_tag(self) -> str:
-        """The provenance tag for this run — {base}::Sources::….
+        A door that already knows (a lecture's filename, the topic AI Create
+        was told about) wins; then the GROUP's own source; then the gap type
+        (a missed question is Sources::MQ). Nothing else. `tool` is left out
+        of the call deliberately: that argument is what reaches for the last
+        path this door was given, and a remembered path is exactly the bug —
+        it cannot know whether this batch has anything to do with the last one.
 
-        Derived where it can be (a missed question is Sources::MQ, a lecture is
-        Sources::Lecture::<file>, and a group carries its own source once the
-        group was told) and typed where it can't. What you type STICKS for this door: a placement runs
-        for weeks, and re-typing the same source on every card is how a source
-        axis stops being filled in.
+        "" is a real answer, not a hole. Course work carries its provenance in
+        the course branch, and guessing at a second one only makes it wrong.
         """
-        box = getattr(self, "_source_input", None)
-        typed = box.text().strip() if box is not None else None
+        if self._seed_source:
+            return self._seed_source
         kind = ""
         for p in self._run_plans:
             kind = getattr(p, "kg_type", "") or kind
             if kind:
                 break
-        path = autotag.source_path_for(
-            tool="knowledge_gaps", kg_type_key=kind, group=self._run_group(),
-            override=typed if typed is not None else None)
-        # Only remember a source the USER typed. A derived one (a lecture's
-        # filename) is specific to that run and would otherwise become the
-        # default for every gap batch afterwards.
-        if (typed is not None and typed != self._seed_source
-                and typed != self._group_source()
-                and typed != autotag.sticky_source("knowledge_gaps")):
-            autotag.set_sticky_source("knowledge_gaps", typed)
+        try:
+            return autotag.source_path_for(kg_type_key=kind,
+                                           group=self._run_group())
+        except Exception as e:
+            log.warn(f"run view: couldn't work out the source: {e}")
+            return ""
+
+    def _source_tag(self) -> str:
+        """The provenance tag for this run — {base}::Sources::…, or ""."""
         from ...core.config import source_tag
-        return source_tag(path)
+        return source_tag(self._source_path())
+
+    def _refresh_source_label(self) -> None:
+        """Show the derived source beside the buttons, or show nothing.
+
+        Called again once the run has plans, because the group and the gap type
+        both come from them and neither exists when the page is built."""
+        lbl = getattr(self, "_source_lbl", None)
+        if lbl is None:
+            return
+        path = self._source_path()
+        if not path:
+            lbl.setVisible(False)
+            lbl.setToolTip("")
+            return
+        lbl.setText(f"Source: {path}")
+        lbl.setVisible(True)
+        group = self._run_group()
+        lbl.setToolTip(
+            "Everything this run commits is tagged under "
+            f"{{base}}::Sources::{path}.\n\n"
+            + ("It comes from the group — change it in the group's own "
+               f"settings and every run for “{group}” follows."
+               if group and not self._seed_source else
+               "It was derived from what this run is: the file it came from, "
+               "or the gap type.")
+            + "\n\nIt carries NO body system — the content tag holds that, "
+              "once.")
 
     def _found_flaw(self, nid: int) -> str:
         """One line of quality opinion on a card the deck already has, or "".
@@ -1709,10 +2116,11 @@ class BulkSearchDialog(QDialog):
         ordered = [m for m in group if m.final] + [m for m in group if not m.final]
         for m in ordered:
             try:
-                # The CONTENT tag. The course branch (an absolute group) and
-                # the source both ride separately as shared tags at commit
-                # time — putting either in this box would leave the card with
-                # no content tag at all.
+                # Where this gap's cards file: the content tag under the
+                # shared base, or the group's own course branch when it has
+                # one (autotag.content_tag_from_levels picks). The SOURCE never
+                # comes through here — it rides as a shared tag at commit time,
+                # because a run has one source and forty content tags.
                 tag = autotag.content_tag_from_levels(m.point.tag_levels,
                                                       group=plan.group)
             except Exception as e:
@@ -1834,6 +2242,8 @@ class BulkSearchDialog(QDialog):
             menu.addAction("1\ufe0f\u20e3  One-by-one",
                            lambda: self._card_action(item, "obo"))
             menu.addSeparator()
+            self._image_menu(menu, item)
+            menu.addSeparator()
             menu.addAction("Don\u2019t add this card" if ticked else "Add this card",
                            lambda: item.setCheckState(
                                0, Qt.CheckState.Unchecked if ticked
@@ -1921,7 +2331,15 @@ class BulkSearchDialog(QDialog):
                 kg_id = str(leaf.data(0, self.ROLE_KG) or "")
                 row = parent.indexOfChild(leaf)
                 parent.removeChild(leaf)
+                # An image attached to the card being split was attached to
+                # the SUBJECT, not to one sentence of it, so every piece keeps
+                # it. Untick it off the ones it doesn't suit; that is quicker
+                # than finding it again.
+                inherited = list(card.get("_image_paths") or [])
                 for i, c in enumerate(out):
+                    c = dict(c)
+                    if inherited and not c.get("_image_paths"):
+                        c["_image_paths"] = list(inherited)
                     new_leaf = QTreeWidgetItem()
                     new_leaf.setData(0, self.ROLE_KIND, "newcard")
                     new_leaf.setData(0, self.ROLE_KEY, i)
@@ -1947,6 +2365,112 @@ class BulkSearchDialog(QDialog):
         finally:
             self._tree.blockSignals(False)
         self._refresh_gen_head()
+
+    # -- images on a written card --------------------------------------------
+
+    def _image_menu(self, menu, leaf) -> None:
+        """One written card's image actions.
+
+        ON REQUEST ONLY, and behind a submenu rather than a strip of buttons.
+        Most written cards want no picture, and AI Create's habit of fetching
+        candidates for every card it wrote costs a web round trip each -- fine
+        for one topic's worth, wrong for a pass covering twelve gaps at once.
+        So nothing happens until you ask, and then it is the same three routes
+        AI Create offers, running the same functions underneath."""
+        card = leaf.data(0, self.ROLE_CARD)
+        paths = list((card or {}).get("_image_paths") or [])
+        sub = menu.addMenu(f"\U0001f5bc  Images ({len(paths)})" if paths
+                           else "\U0001f5bc  Images")
+        sub.addAction("Attach from a file\u2026",
+                      lambda: self._add_card_images(leaf, "file"))
+        sub.addAction("\U0001f50d  Find one online\u2026",
+                      lambda: self._add_card_images(leaf, "find"))
+        sub.addAction("\U0001f310  Browse for one in Anki\u2026",
+                      lambda: self._add_card_images(leaf, "browse"))
+        sub.addSeparator()
+        spread = sub.addAction("Put these on other cards too\u2026",
+                               lambda: self._spread_images(leaf))
+        spread.setEnabled(bool(paths))
+        spread.setToolTip(
+            "One diagram often answers several of these cards. This copies "
+            "the attachment, not the file \u2014 it is imported into your "
+            "media once, when the cards are actually added.")
+        if paths:
+            off = sub.addAction(f"Take {len(paths)} image(s) off this card")
+            off.triggered.connect(lambda: self._set_card_images(leaf, []))
+
+    def _add_card_images(self, leaf, how: str) -> None:
+        card = leaf.data(0, self.ROLE_CARD)
+        if not isinstance(card, dict):
+            return
+        got = _pick_card_images(self, how, _image_seed(card))
+        if got:
+            self._set_card_images(
+                leaf, _merged_images(card.get("_image_paths"), got))
+
+    def _set_card_images(self, leaf, paths: list, *, quiet: bool = False) -> None:
+        """Replace one written card's attached images and redraw its row.
+
+        Nothing is copied into Anki's media folder here. cc.set_fields does
+        that at add time, so an image attached to a card you then untick never
+        enters your collection at all -- the same promise the rest of this
+        screen makes about everything on it."""
+        card = leaf.data(0, self.ROLE_CARD)
+        if not isinstance(card, dict):
+            return
+        keep = _merged_images(paths, [])
+        if keep:
+            card["_image_paths"] = keep
+        else:
+            card.pop("_image_paths", None)
+        leaf.setData(0, self.ROLE_CARD, card)
+        self._label_written(leaf, card, None, [], 0)
+        if quiet:
+            return
+        self._set_status(
+            f"{len(keep)} image(s) on that card \u2014 nothing is added to "
+            "your collection until you apply." if keep
+            else "Images taken off that card.")
+
+    def _spread_images(self, leaf) -> None:
+        """Copy one card's images onto others in the same pass.
+
+        The case this is for: you go looking for a diagram of the loop of
+        Henle and it answers four of the cards written for that gap, not one.
+        Finding it four times is the same search four times."""
+        card = leaf.data(0, self.ROLE_CARD)
+        paths = list((card or {}).get("_image_paths") or [])
+        if not paths:
+            return
+        rows = []
+        for other, ocard in self._written_items():
+            if other is leaf or not isinstance(ocard, dict):
+                continue
+            kg_id = str(other.data(0, self.ROLE_KG) or "")
+            title = str((self._job_for_kg(kg_id) or {}).get("title") or "").strip()
+            rows.append((other, ocard, kg_id, title or "(untitled gap)"))
+        if not rows:
+            tooltip("There is only one written card in this pass.")
+            return
+        dlg = _ApplyImagesDialog(paths, rows,
+                                 str(leaf.data(0, self.ROLE_KG) or ""),
+                                 parent=self)
+        if not dlg.exec():
+            return
+        targets = dlg.chosen()
+        if not targets:
+            return
+        self._tree.blockSignals(True)
+        try:
+            for other, ocard, _kg, _t in targets:
+                self._set_card_images(
+                    other, _merged_images(ocard.get("_image_paths"), paths),
+                    quiet=True)
+        finally:
+            self._tree.blockSignals(False)
+        self._set_status(
+            f"{len(paths)} image(s) put on {len(targets)} more card(s) \u2014 "
+            "still nothing added until you apply.")
 
     def _ticked(self) -> dict[str, dict]:
         """{kg_id: {"nids": [...], "covered_points": n, "total_points": n}} from
@@ -2060,14 +2584,23 @@ class BulkSearchDialog(QDialog):
                 # ONE screen, ONE button: the found cards and the written cards
                 # go in together, under one checkpoint.
                 approved = sum(len(c) for _k, c in self._approved_written())
+                # "Add all now" only exists while there is something written to
+                # add; with none, Apply is just the found half and there is no
+                # second way of doing it.
+                self._add_now_btn.setVisible(approved > 0)
                 if self._gen_active:
                     self._commit_btn.setEnabled(False)
+                    self._add_now_btn.setEnabled(False)
                     self._commit_btn.setText("Writing the missing cards…")
                 else:
-                    self._commit_btn.setEnabled(n > 0 or approved > 0)
+                    self._commit_btn.setEnabled(
+                        not self._applied and (n > 0 or approved > 0))
+                    self._add_now_btn.setEnabled(
+                        not self._applied and approved > 0)
                     self._commit_btn.setText(
-                        f"Apply everything — {n} found + {approved} written  ▶"
+                        f"Apply — {n} found + review {approved} in Add  ▶"
                         if approved else f"Apply — {n} found card(s)")
+                    self._add_now_btn.setText(f"Add {approved} now")
                 return
             # Writing switched off (or unavailable): this is the old two-step —
             # commit what the deck had, then offer the rest to AI Create. It
@@ -2163,7 +2696,7 @@ class BulkSearchDialog(QDialog):
             QTimer.singleShot(0, self._continue_to_create)
 
     def _apply_found(self, ticked: dict, all_nids: list[int],
-                     do_unsuspend: bool) -> tuple[int, int]:
+                     do_unsuspend: bool, source: str = "") -> tuple[int, int]:
         """Tag (and optionally unsuspend) the ticked cards. Returns
         (notes tagged, cards unsuspended).
 
@@ -2182,6 +2715,22 @@ class BulkSearchDialog(QDialog):
             plan = plans_by_id.get(kg_id)
             if plan:
                 tags.extend(x for x in plan.tags if x and x not in tags)
+            # This gap's GROUP branch, alongside its content tag. Per gap
+            # rather than once for the run, because a run can span groups —
+            # see _course_tag. The head node only: the classification under it
+            # is what the content tag already says, and on this screen that tag
+            # is the box the user can see and edit.
+            branch = self._course_tag(getattr(plan, "group", "") if plan else "")
+            # Skipped when a tag already on the card sits UNDER that branch,
+            # which is the ordinary case for a course group now that its branch
+            # carries the classification (autotag.content_tag_from_levels).
+            # Anki's sidebar shows the parent node for a child tag, so adding
+            # the head as well is a tag that says nothing new.
+            if branch and any(t == branch or t.startswith(branch + "::")
+                              for t in tags):
+                branch = ""
+            if branch and branch not in tags:
+                tags.append(branch)
             for tag in tags:
                 per_item.append((tag, list(rec["nids"])))
 
@@ -2192,8 +2741,10 @@ class BulkSearchDialog(QDialog):
                 per_item=per_item,
                 audit=(cfg.get("audit_tag") or "").strip(),
                 month=month_tag(),
-                course=self._course_tag(),
-                source=self._source_tag(),
+                # No shared `course`: the group branch rides per gap now, in
+                # per_item, so a two-group run can't file one group's cards
+                # under the other's branch.
+                source=source or self._source_tag(),
                 # EVERY ticked note, not just the tagged ones: a gap with an
                 # empty tag box still took part in this run and still gets the
                 # audit trail, exactly as it did before.
@@ -3099,6 +3650,15 @@ class BulkSearchDialog(QDialog):
         verdict = str(v.get("verdict") or "").upper()
         if verdict in ("FAIL", "FLAG"):
             bits.append("quality: " + verdict.lower())
+        n_img = len(card.get("_image_paths") or [])
+        if n_img:
+            bits.append(f"{n_img} image(s)")
+        if card.get("_no_emphasis"):
+            # The model left the front unmarked AND the deterministic repair
+            # couldn't find a known anchor in it (see card_creator's
+            # ensure_front_emphasis). Said in words, because the fix is a
+            # double-click and five seconds — but only if you notice.
+            bits.append("no bold anchor")
         if dup:
             bits.append(dup)
         suffix = ("   \u2014 " + "  \u00b7  ".join(bits)) if bits else ""
@@ -3224,12 +3784,24 @@ class BulkSearchDialog(QDialog):
 
     # ── the single commit ────────────────────────────────────────────────────
 
-    def _on_apply_everything(self) -> None:
+    def _on_apply_everything(self, review: bool = True) -> None:
         """Tag and unsuspend what your deck already had, AND add the cards
-        written for what it didn't \u2014 inside ONE checkpoint.
+        written for what it didn't.
 
         This is the whole reason the two halves share a screen: one decision,
-        one confirm, and one Ctrl+Z that takes the entire pass back out."""
+        one confirm, and — for the found half — one Ctrl+Z that takes it back
+        out.
+
+        `review` is the difference between the two buttons. Ticked (the
+        default), the written cards load into Anki's own Add window one at a
+        time and you press Add on each, the way AI Create has always worked:
+        the last look at a card belongs in the editor it will live in, not in a
+        tree row. Off ("Add all now"), they go straight in, which is what this
+        screen used to do without asking.
+
+        The found half commits immediately EITHER WAY. Tagging and unsuspending
+        notes you already have is not something the Add window can do, and it
+        is the half you just spent the screen ticking."""
         # `_coverage is None` is a write-only run (Find unticked everywhere),
         # which has cards to commit even though nothing was searched.
         if not anki_utils.require_col():
@@ -3248,8 +3820,11 @@ class BulkSearchDialog(QDialog):
         batches = self._approved_written()
         n_new = sum(len(c) for _k, c in batches)
         if not all_nids and not n_new:
-            tooltip("Nothing ticked and nothing approved \u2014 nothing to apply.")
+            tooltip("Nothing ticked and nothing approved — nothing to apply.")
             return
+        # With nothing written there is no second route to choose between, so
+        # the question of reviewing doesn't arise.
+        review = bool(review and n_new)
 
         full, _partial, _empty = self._outcome_split()
         do_unsuspend = self._unsuspend_cb.isChecked()
@@ -3261,18 +3836,33 @@ class BulkSearchDialog(QDialog):
         lines = ["Apply this whole pass?", ""]
         if all_nids:
             lines.append(
-                f"\u2022 Tag {len(all_nids)} note(s) you already had, each under "
+                f"• Tag {len(all_nids)} note(s) you already had, each under "
                 "its own gap's tag"
                 + (", and unsuspend them." if do_unsuspend else "."))
-        if n_new:
-            lines.append(f"\u2022 Add {n_new} newly written card(s) to "
-                         f"\u201c{deck}\u201d across {len(batches)} gap(s).")
+        if n_new and review:
+            lines.append(
+                f"• Open Anki's Add window on the {n_new} newly written "
+                f"card(s) from {len(batches)} gap(s) — one at a time, you "
+                "press Add on each.")
+        elif n_new:
+            lines.append(f"• Add {n_new} newly written card(s) to "
+                         f"“{deck}” across {len(batches)} gap(s).")
         if untagged:
-            lines.append(f"\u2022 {len(untagged)} gap(s) have an empty tag box \u2014 "
+            lines.append(f"• {len(untagged)} gap(s) have an empty tag box — "
                          "their found cards are unsuspended but not tagged.")
         lines.append("")
-        lines.append("Existing card content is never modified, and one Ctrl+Z "
-                     "takes the whole thing back out.")
+        if review:
+            # Said plainly rather than repeating the old promise. Cards added
+            # through Anki's own Add window are Anki's own undo entries, one
+            # per card; the checkpoint below only covers the found half.
+            lines.append("Existing card content is never modified. One Ctrl+Z "
+                         "takes the tagging back out; each card you add in the "
+                         "Add window undoes separately, as usual. Close that "
+                         "window early and the cards you hadn't reached are "
+                         "dropped — their gaps stay open.")
+        else:
+            lines.append("Existing card content is never modified, and one "
+                         "Ctrl+Z takes the whole thing back out.")
         if not askUser("\n".join(lines), title="Work through gaps"):
             return
 
@@ -3283,18 +3873,74 @@ class BulkSearchDialog(QDialog):
         self._stage(pipeline.REVIEW, pipeline.DONE,
                     f"{len(all_nids) + n_new} kept")
         self._stage(pipeline.COMMIT, pipeline.RUNNING)
+        # Derived ONCE, after the confirm (it has a side effect: a source you
+        # typed sticks for this door) and used by both halves, so the found and
+        # the written cards for a gap can't end up under different sources.
+        source = self._source_tag()
         tagged = unsuspended = 0
         if all_nids:
-            tagged, unsuspended = self._apply_found(ticked, all_nids, do_unsuspend)
-        created_by_kg = self._apply_created(batches, deck)
+            tagged, unsuspended = self._apply_found(
+                ticked, all_nids, do_unsuspend, source)
 
-        # The door's own commit step, INSIDE this checkpoint so one Ctrl+Z
-        # still takes the whole pass back out. AI Lecture attaches slide
-        # images here; a door with nothing extra to do passes nothing.
+        # Pressed once. The Add window may be open for minutes, and a second
+        # Apply behind it would re-tag everything and re-queue every card.
+        self._applied = True
+        self._commit_btn.setEnabled(False)
+        self._commit_btn.setText("Applied")
+        if getattr(self, "_add_now_btn", None) is not None:
+            self._add_now_btn.setEnabled(False)
+
+        found = {"all_nids": all_nids, "tagged": tagged,
+                 "unsuspended": unsuspended, "do_unsuspend": do_unsuspend,
+                 "full": full}
+
+        if not review:
+            created_by_kg = self._apply_created(batches, deck, source)
+            self._finish_apply(found, created_by_kg,
+                               getattr(self, "_created_pairs", {}) or {})
+            return
+
+        def _added_up(added: dict, pairs: dict, discarded: int) -> None:
+            self._created_pairs = pairs
+            # Logged here rather than at hand-off, and per gap, because the
+            # session log records what was CREATED. A card you scrolled past
+            # in the Add window was never created.
+            for kg_id, ids in added.items():
+                self._log_session(self._job_for_kg(kg_id) or {}, ids)
+            self._clear_job_batch()
+            self._finish_apply(found, added, pairs, discarded=discarded)
+
+        queued = self._hand_to_add_window(batches, deck, source, _added_up)
+        if not queued:
+            # Nothing could be turned into a note — usually a notetype profile
+            # pointing at something that no longer exists, which resolve_notetype
+            # has already said out loud.
+            self._finish_apply(found, {}, {})
+
+    def _finish_apply(self, found: dict, created_by_kg: dict, pairs: dict,
+                      discarded: int = 0) -> None:
+        """Close the gaps, tell the door, and say what happened.
+
+        Reached either straight after a silent commit or minutes later, when
+        the Add window is finally closed. Everything in it is deliberately
+        late-bound to what ACTUALLY got added: `created_by_kg` is the cards
+        that reached the collection, so a pass abandoned halfway closes the
+        gaps it finished and leaves the rest open, which is exactly what the
+        work queue then lets you pick back up.
+
+        Fully Qt-guarded: the results window can be gone by the time the Add
+        window closes, and a gap that got its cards must still be closed."""
+        all_nids = list(found.get("all_nids") or [])
+        full = list(found.get("full") or [])
+        do_unsuspend = bool(found.get("do_unsuspend"))
+        tagged = int(found.get("tagged") or 0)
+        unsuspended = int(found.get("unsuspended") or 0)
+
+        # The door's own commit step. AI Lecture attaches slide images here; a
+        # door with nothing extra to do passes nothing.
         if self._on_committed is not None:
             try:
-                self._on_committed(getattr(self, "_created_pairs", {}),
-                                   all_nids)
+                self._on_committed(pairs or {}, all_nids)
             except Exception as e:
                 # Never let a door's extra step undo a commit that worked.
                 log.error(f"run view: the {self._door} door's commit step "
@@ -3303,14 +3949,9 @@ class BulkSearchDialog(QDialog):
         # A gap closes if your deck turned out to cover it, or if cards were
         # just written for it. Everything else stays open on purpose.
         closed = self._close_gaps(sorted(set(
-            list(full) + [k for k, ids in created_by_kg.items() if ids])))
+            list(full) + [k for k, ids in (created_by_kg or {}).items() if ids])))
 
-        n_created = sum(len(v) for v in created_by_kg.values())
-        self._stage(pipeline.COMMIT, pipeline.DONE,
-                    f"{len(all_nids)} tagged · {n_created} added")
-        self._applied = True
-        self._commit_btn.setEnabled(False)
-        self._commit_btn.setText("Applied")
+        n_created = sum(len(v) for v in (created_by_kg or {}).values())
         bits = []
         if all_nids:
             bits.append(f"{len(all_nids)} found note(s) committed"
@@ -3318,10 +3959,19 @@ class BulkSearchDialog(QDialog):
                         + (f", {unsuspended} card(s) unsuspended"
                            if do_unsuspend else ""))
         if n_created:
-            bits.append(f"{n_created} card(s) written into \u201c{deck}\u201d")
+            bits.append(f"{n_created} card(s) added")
+        if discarded:
+            bits.append(f"{discarded} not added — you closed the Add window")
         bits.append(f"{closed} gap(s) closed")
-        msg = "Done \u2014 " + ", ".join(bits) + "."
-        self._set_status(msg)
+        msg = "Done — " + ", ".join(bits) + "."
+        try:
+            self._stage(pipeline.COMMIT, pipeline.DONE,
+                        f"{len(all_nids)} tagged · {n_created} added")
+            self._set_status(msg)
+        except RuntimeError:
+            # The results window went away while the Add window was open. The
+            # gaps are closed and the cards are in; there is nothing to redraw.
+            pass
         tooltip(msg, period=5000)
         try:
             mw.col.reset()
@@ -3339,26 +3989,32 @@ class BulkSearchDialog(QDialog):
             by_kg.setdefault(kg_id, []).append(card)
         return [(k, v) for k, v in by_kg.items() if v]
 
-    def _apply_created(self, batches, deck: str) -> dict:
-        """Commit the ticked written cards. No checkpoint of its own — the
-        caller opened one around this and the found cards together."""
+    def _commit_units(self, batches, deck: str, source: str = ""):
+        """(kg_id, job, cards, notetype, ctx, deck_name) for each gap, ready to
+        turn into notes.
+
+        Lifted out of _apply_created because there are now two ways a written
+        card reaches the collection — straight in, or one at a time through
+        Anki's Add window — and a card you reviewed has to be filed exactly as
+        a card you didn't. Everything that decides what the note IS lives here;
+        the two routes differ only in how they put it there.
+
+        `source` is this run's provenance tag, re-read from the box at commit
+        time for the same reason the tag box is: the box sits on the results
+        page, generation has already started by the time you can type in it,
+        and the cards written for a gap must move with the cards found for it.
+        Retyping it moved the found half and left the written half behind."""
         from .. import card_creator as cc
         from .mass_create import commit_ctx_for
-        created_by_kg: dict[str, list] = {}
-        # kg_id -> [(nid, card), ...]. commit_cards adds one note per card in
-        # order, so the zip is exact — and it is the only way a door can act on
-        # the cards it just wrote (AI Lecture staples each card's source slide
-        # onto it, and needs to know WHICH card got which slide).
-        self._created_pairs = {}
         if not batches:
-            return created_by_kg
+            return
         profile = self._gen_profile or cc._resolved_profile(
             tool_config("card_creator"),
             self._notetype.currentText().strip()
             if self._notetype is not None else "")
         nt = cc.resolve_notetype(profile)
         if nt is None:
-            return created_by_kg
+            return
         for kg_id, cards in batches:
             job = self._job_for_kg(kg_id)
             # The gap's tag box governs BOTH halves. Re-read it now rather than
@@ -3369,12 +4025,55 @@ class BulkSearchDialog(QDialog):
             box = self._tag_text(kg_id)
             if box and box not in tags:
                 tags.append(box)
+            # Whatever the job was enqueued with is the source the box was
+            # PREFILLED from; if it still says that, this is a no-op. If it
+            # doesn't, the box wins — it's the one on screen.
+            if source:
+                # Drop any OTHER source tag the job was enqueued with rather
+                # than adding a second one: a card has one provenance, and the
+                # box is the one on screen. Matched on the "…::Sources::" root
+                # so a source at a different depth can't slip past.
+                root = source.split("::Sources::", 1)[0] + "::Sources::"
+                tags = [t for t in tags
+                        if not (t.startswith(root) and t != source)]
+                if source not in tags:
+                    tags.append(source)
+            yield (kg_id, job, list(cards), nt,
+                   commit_ctx_for(job, profile, tags),
+                   (job.get("deck_name") or "").strip() or deck)
+
+    def _clear_job_batch(self) -> None:
+        """Drop this pass's generation batch from the job store.
+
+        Only once the writing has actually finished: clearing a batch that
+        still has jobs running would delete work in flight."""
+        if self._gen_active:
+            return
+        try:
+            from .. import create_jobs
+            create_jobs.remove_batch(self._gen_batch_id)
+        except Exception as e:
+            log.warn(f"work through: couldn't clear the job batch: {e}")
+
+    def _apply_created(self, batches, deck: str, source: str = "") -> dict:
+        """Commit the ticked written cards straight in. No checkpoint of its
+        own — the caller opened one around this and the found cards together.
+
+        This is the "Add all now" route. The other one hands the same notes to
+        Anki's Add window instead; see _hand_to_add_window."""
+        created_by_kg: dict[str, list] = {}
+        # kg_id -> [(nid, card), ...]. commit_cards adds one note per card in
+        # order, so the zip is exact — and it is the only way a door can act on
+        # the cards it just wrote (AI Lecture staples each card's source slide
+        # onto it, and needs to know WHICH card got which slide).
+        self._created_pairs = {}
+        for kg_id, job, cards, nt, cctx, deck_name in self._commit_units(
+                batches, deck, source):
             # checkpoint=False: _on_apply_everything already opened one around
             # both halves of this screen.
             cplan = pipeline.CommitPlan(
                 label="Ankisstant: work through gaps", new_cards=list(cards),
-                deck_name=(job.get("deck_name") or "").strip() or deck,
-                commit_ctx=commit_ctx_for(job, profile, tags), notetype=nt)
+                deck_name=deck_name, commit_ctx=cctx, notetype=nt)
             res = commit.run(cplan, checkpoint=False)
             if res.errors:
                 log.error("work through: committing "
@@ -3383,23 +4082,106 @@ class BulkSearchDialog(QDialog):
             ids = list(cplan.created_ids)
             created_by_kg[kg_id] = ids
             self._created_pairs[kg_id] = list(zip(ids, cards))
-            try:
-                cc._append_session(
-                    mode="topic", source=f"work-through:{self._gen_batch_id}",
-                    topic=str(job.get("title") or ""),
-                    cards_proposed=len(job.get("cards") or []),
-                    cards_created=len(ids), card_ids=ids)
-            except Exception as e:
-                log.warn(f"work through: session log failed: {e}")
-        # Only once the writing has actually finished: clearing a batch that
-        # still has jobs running would delete work in flight.
-        if not self._gen_active:
-            try:
-                from .. import create_jobs
-                create_jobs.remove_batch(self._gen_batch_id)
-            except Exception as e:
-                log.warn(f"work through: couldn't clear the job batch: {e}")
+            self._log_session(job, ids)
+        self._clear_job_batch()
         return created_by_kg
+
+    def _log_session(self, job: dict, ids: list) -> None:
+        try:
+            from .. import card_creator as cc
+            cc._append_session(
+                mode="topic", source=f"work-through:{self._gen_batch_id}",
+                topic=str(job.get("title") or ""),
+                cards_proposed=len(job.get("cards") or []),
+                cards_created=len(ids), card_ids=list(ids))
+        except Exception as e:
+            log.warn(f"work through: session log failed: {e}")
+
+    # ── the Add-window route ─────────────────────────────────────────────────
+
+    def _filler_for(self, nt, card: dict, cctx, deck_id: int):
+        """One card's filler for Anki's Add window.
+
+        A closure rather than a prepared note, because the note has to be built
+        at the moment the window asks for it: Anki's editor takes ownership of
+        the note it is handed, so a batch of notes built up front and held
+        would be a batch of notes the editor has already had its way with."""
+        from .. import card_creator as cc
+
+        def _fill(ac) -> None:
+            note = mw.col.new_note(nt)
+            cc.set_fields(note, card, cctx)
+            try:
+                ac.set_note(note, deck_id=deck_id)
+            except Exception as e:
+                log.warn(f"work through: set_note fell back to the editor: {e}")
+                ac.editor.set_note(note)
+            # Anki's sticky tags can overwrite what set_fields put on the note,
+            # and the tag WIDGET is what the Add button actually reads.
+            try:
+                if hasattr(ac.editor, "tags") and hasattr(ac.editor.tags, "setText"):
+                    ac.editor.tags.setText(" ".join(note.tags))
+            except Exception as e:
+                log.warn(f"work through: couldn't refresh the tag box: {e}")
+
+        return _fill
+
+    def _hand_to_add_window(self, batches, deck: str, source: str,
+                            then) -> int:
+        """Load the written cards into Anki's Add window, one at a time.
+
+        The same notes _apply_created would have committed — same notetype,
+        same per-gap tags, same deck, same attached images — built by the same
+        cc.set_fields. The only difference is that you see each one in the
+        editor and press Add yourself, which is what AI Create has always done
+        and what this screen was quietly skipping.
+
+        NOTHING IS CLOSED UP FRONT. A gap closes on a card reaching the
+        collection, not on one being offered, and closing the window early is a
+        normal way to stop — so `then(added, pairs, discarded)` is called once
+        the run is over, with what actually got added."""
+        from .. import card_creator as cc
+        units = list(self._commit_units(batches, deck, source))
+        if not units:
+            return 0
+        nt = units[0][3]
+        fillers, owners, in_order = [], [], []
+        for kg_id, _job, cards, unit_nt, cctx, deck_name in units:
+            try:
+                deck_id = mw.col.decks.id(deck_name or "Default")
+            except Exception as e:
+                log.error(f"work through: couldn't resolve deck "
+                          f"'{deck_name}': {e}")
+                continue
+            for card in cards:
+                fillers.append(self._filler_for(unit_nt, card, cctx, deck_id))
+                owners.append(kg_id)
+                in_order.append(card)
+        if not fillers:
+            return 0
+
+        added: dict[str, list] = {}
+        pairs: dict[str, list] = {}
+
+        def _on_added(idx: int, note) -> None:
+            if not (0 <= idx < len(owners)):
+                return
+            added.setdefault(owners[idx], []).append(note.id)
+            pairs.setdefault(owners[idx], []).append((note.id, in_order[idx]))
+
+        def _on_done(discarded: int) -> None:
+            try:
+                then(added, pairs, discarded)
+            except Exception as e:
+                log.error(f"work through: finishing the add run failed: {e}")
+
+        try:
+            start_deck = mw.col.decks.id(deck or "Default")
+        except Exception:
+            start_deck = mw.col.decks.selected()
+        cc._start_add_queue(fillers, {"nt": nt, "deck_id": start_deck},
+                            on_added=_on_added, on_done=_on_done)
+        return len(fillers)
 
     def _continue_to_create(self) -> None:
         """The old two-window hand-off. Only reached when the writing half is
@@ -3561,6 +4343,7 @@ class BulkSearchDialog(QDialog):
                 "kg_type":     (kg.get("type") or "").lower(),
                 "group":       str(kg.get("group") or "").strip(),
                 "tags":        [t for t in (kg.get("tags") or []) if t],
+                "resources":   list(kg.get("resources") or []),
                 # Structured copy of the same thing, for when Create learns to
                 # generate one card per uncovered point.
                 "points":      [
@@ -3614,6 +4397,7 @@ class BulkSearchDialog(QDialog):
         self._read_btn.setVisible(True)
         self._search_btn.setVisible(True)
         self._commit_btn.setVisible(False)
+        self._add_now_btn.setVisible(False)
         self._refresh_buttons()
         self._refresh_title()
 
@@ -3652,9 +4436,7 @@ class BulkSearchDialog(QDialog):
         if not self._backgrounded:
             return
         self._backgrounded = False
-        self.show()
-        self.raise_()
-        self.activateWindow()
+        resurface_at_home(self)
 
     def closeEvent(self, ev) -> None:
         """Closing mid-run offers to keep searching. Anki's own long jobs are
@@ -3737,6 +4519,18 @@ class BulkSearchDialog(QDialog):
         except RuntimeError:
             pass
         ev.accept()
+        # EMIT finished. Overriding closeEvent without calling up means Qt's own
+        # QDialog::closeEvent — the thing that calls reject() and so emits
+        # finished — never runs, and reject() here routes back into close(), so
+        # the signal could not fire by any route. open_unified's docstring has
+        # been promising callers they can watch this window finish; for the
+        # work-through queue that promise was silently false, and the queue it
+        # was supposed to empty grew to sixteen. done() only hides and emits,
+        # so it cannot re-enter the close path we are already in.
+        try:
+            self.done(QDialog.DialogCode.Rejected)
+        except Exception as e:
+            log.warn(f"run view: couldn't signal the close: {e}")
         self.deleteLater()
 
     def reject(self) -> None:
@@ -3782,6 +4576,11 @@ class _PointApprovalDialog(QDialog):
         th.setStretchLastSection(False)
         self._tree.setColumnWidth(1, 260)
         self._tree.setAlternatingRowColors(True)
+        self._tree.headerItem().setToolTip(1,
+                         "The words looked up in your deck, comma-separated. "
+                         "Edit freely — a term that returns nothing is the "
+                         "single biggest cause of a false gap.")
+        tips_on_checkbox_only(self._tree)
         self._tree.setEditTriggers(
             QAbstractItemView.EditTrigger.DoubleClicked
             | QAbstractItemView.EditTrigger.SelectedClicked
@@ -3806,10 +4605,6 @@ class _PointApprovalDialog(QDialog):
                 leaf.setCheckState(0, Qt.CheckState.Checked)
                 levels = " › ".join(x for x in (pt.system, pt.subsystem, pt.topic) if x)
                 leaf.setToolTip(0, "\n".join([pt.concept] + ([levels] if levels else [])))
-                leaf.setToolTip(1, "The words looked up in your deck, comma-"
-                                   "separated. Edit freely — a term that returns "
-                                   "nothing is the single biggest cause of a "
-                                   "false gap.")
                 self._items.append((plan, pt, leaf))
             top.setExpanded(True)
 
@@ -3843,7 +4638,15 @@ class _PointApprovalDialog(QDialog):
         out with none — the caller unticks it rather than searching a gap with
         nothing to search for. A point with no terms is kept, not corrected:
         it can still be reached by the tag leg, and silently reinstating the
-        terms the user just deleted would be worse than saying so."""
+        terms the user just deleted would be worse than saying so.
+
+        A point whose WORDING changed is flagged for reclassification and its
+        levels are cleared. {system, subsystem, topic} came from the AI's read
+        of the old wording and drive the tag the found cards are filed under —
+        so rewriting a point to be about something else used to search the new
+        terms and file the results under the old topic. The re-derivation
+        happens off the main thread in _reclassify_points, not here: this
+        dialog closes instantly and must go on doing so."""
         keep: dict[int, list] = {}
         termless = 0
         for plan, pt, item in self._items:
@@ -3852,6 +4655,9 @@ class _PointApprovalDialog(QDialog):
             text = " ".join(item.text(0).split())
             if not text:
                 continue           # edited down to nothing = dropped
+            if text != pt.concept:
+                pt.system = pt.subsystem = pt.topic = ""
+                pt._reclassify = True
             pt.concept = text
             pt.terms = _parse_terms(item.text(1))
             if not pt.terms:
@@ -3870,8 +4676,9 @@ class _WrittenCardDialog(QDialog):
     Not the full Create review row. The judgement being made on this screen is
     "is this the right replacement for what my deck didn't have", and the found
     cards it is being compared against are two rows away — so this is the front,
-    the back, and the one action that changes the card wholesale. Re-rolling a
-    card repeatedly belongs in AI Create, where the whole batch is the subject."""
+    the back, the actions that change the card wholesale, and a picture if you
+    want one. Re-rolling a card repeatedly belongs in AI Create, where the
+    whole batch is the subject."""
 
     SPLIT = 2      # a third exec() outcome, beside accept (1) and reject (0)
 
@@ -3903,6 +4710,34 @@ class _WrittenCardDialog(QDialog):
         self._back = QPlainTextEdit(_card_back(card))
         self._back.setMinimumHeight(90)
         col.addWidget(self._back, 1)
+
+        # Images, on request. Nothing is fetched for a card nobody asked about
+        # \u2014 see _image_menu on the results tree, which offers the same three
+        # routes on the row itself for when you don\u2019t want the dialog at all.
+        img_row = QHBoxLayout()
+        for text, tip, how in (
+                ("\U0001f4f7  Attach\u2026", "Attach an image file to just this card.",
+                 "file"),
+                ("\U0001f50d  Find online\u2026",
+                 "Search the medical image sources and attach a result to just "
+                 "this card.", "find"),
+                ("\U0001f310  Browse\u2026",
+                 "Browse for an image inside Anki and attach it to just this "
+                 "card.", "browse")):
+            b = QPushButton(text)
+            b.setAutoDefault(False)
+            b.setToolTip(tip)
+            b.clicked.connect(lambda _c=False, h=how: self._on_image(h))
+            img_row.addWidget(b)
+        self._img_clear = QPushButton("Clear")
+        self._img_clear.setAutoDefault(False)
+        self._img_clear.setToolTip("Take every image back off this card.")
+        self._img_clear.clicked.connect(lambda: self._set_images([]))
+        img_row.addWidget(self._img_clear)
+        self._img_lbl = QLabel("")
+        self._img_lbl.setStyleSheet("color: gray; font-size: 11px;")
+        img_row.addWidget(self._img_lbl, 1)
+        col.addLayout(img_row)
 
         self._status = QLabel("")
         self._status.setStyleSheet("color: gray; font-size: 11px;")
@@ -3937,7 +4772,33 @@ class _WrittenCardDialog(QDialog):
         ok.clicked.connect(self.accept)
         row.addWidget(ok)
         col.addLayout(row)
+        self._refresh_images()
         theme_dialog(self)
+
+    # -- images -------------------------------------------------------------
+
+    def _on_image(self, how: str) -> None:
+        got = _pick_card_images(self, how, _image_seed(self._card))
+        if got:
+            self._set_images(_merged_images(self._card.get("_image_paths"), got))
+
+    def _set_images(self, paths: list) -> None:
+        keep = _merged_images(paths, [])
+        if keep:
+            self._card["_image_paths"] = keep
+        else:
+            self._card.pop("_image_paths", None)
+        self._refresh_images()
+
+    def _refresh_images(self) -> None:
+        """The count in words, not thumbnails. This dialog is for reading the
+        card; a row of previews would push the text it exists to show off the
+        bottom, and the results tree says the same thing on the row."""
+        n = len(self._card.get("_image_paths") or [])
+        self._img_lbl.setText(
+            f"{n} image(s) attached \u2014 added when the card is."
+            if n else "No images on this card.")
+        self._img_clear.setEnabled(bool(n))
 
     def _on_regen(self) -> None:
         from aqt.qt import QInputDialog
@@ -3994,6 +4855,105 @@ class _WrittenCardDialog(QDialog):
         out["front"] = self._front.toPlainText().strip()
         out["extra"] = self._back.toPlainText().strip()
         out.pop("back", None)
+        return out
+
+
+class _ApplyImagesDialog(QDialog):
+    """Pick which other written cards get this card's images.
+
+    A picker rather than a blanket "apply to this gap", because the case that
+    prompted it cuts both ways: one diagram answers several cards of a gap,
+    and sometimes it answers a card of the gap next door. So the siblings
+    start ticked \u2014 that is the common half \u2014 and everything else in the
+    pass is listed under its own gap, one click away."""
+
+    ROLE_ROW = int(Qt.ItemDataRole.UserRole) + 1
+
+    def __init__(self, paths, rows, same_kg, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Put these images on other cards")
+        self.setMinimumSize(640, 480)
+        self._rows = list(rows)
+
+        col = QVBoxLayout(self)
+        col.setContentsMargins(14, 12, 14, 12)
+        col.setSpacing(6)
+        head = QLabel(
+            f"The {len(paths)} image(s) on that card will be added to every "
+            "card you tick below. Nothing is copied into your media folder "
+            "until the cards themselves are added.")
+        head.setWordWrap(True)
+        head.setStyleSheet("color: gray; font-size: 11px;")
+        col.addWidget(head)
+
+        self._tree = QTreeWidget()
+        self._tree.setHeaderHidden(True)
+        self._tree.setUniformRowHeights(True)
+        col.addWidget(self._tree, 1)
+
+        groups: dict = {}
+        for idx, (_leaf, card, kg_id, title) in enumerate(self._rows):
+            g = groups.get(kg_id)
+            if g is None:
+                g = QTreeWidgetItem(self._tree)
+                g.setText(0, title + ("    (this gap)" if kg_id == same_kg else ""))
+                # Not checkable: ticking a gap would read as "and its future
+                # cards too", which this cannot honour \u2014 the pass is written.
+                g.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                groups[kg_id] = g
+            it = QTreeWidgetItem(g)
+            try:
+                front = anki_utils.strip_html(str(card.get("front") or ""))
+            except Exception:
+                front = str(card.get("front") or "")
+            it.setText(0, _short(front, 200))
+            it.setData(0, self.ROLE_ROW, idx)
+            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            it.setCheckState(0, Qt.CheckState.Checked if kg_id == same_kg
+                             else Qt.CheckState.Unchecked)
+            n_has = len(card.get("_image_paths") or [])
+            if n_has:
+                it.setToolTip(0, f"This card already has {n_has} image(s); "
+                                 "these are added alongside them.")
+        self._tree.expandAll()
+
+        row = QHBoxLayout()
+        for text, state in (("Tick all", Qt.CheckState.Checked),
+                            ("Tick none", Qt.CheckState.Unchecked)):
+            b = QPushButton(text)
+            b.setAutoDefault(False)
+            b.clicked.connect(lambda _c=False, st=state: self._set_all(st))
+            row.addWidget(b)
+        row.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.setAutoDefault(False)
+        cancel.clicked.connect(self.reject)
+        row.addWidget(cancel)
+        ok = QPushButton("Apply to the ticked cards")
+        ok.setDefault(True)
+        ok.clicked.connect(self.accept)
+        row.addWidget(ok)
+        col.addLayout(row)
+        theme_dialog(self)
+
+    def _set_all(self, state) -> None:
+        for g in range(self._tree.topLevelItemCount()):
+            top = self._tree.topLevelItem(g)
+            for i in range(top.childCount()):
+                top.child(i).setCheckState(0, state)
+
+    def chosen(self) -> list:
+        """The ticked rows, as (leaf, card, kg_id, title) tuples."""
+        out = []
+        for g in range(self._tree.topLevelItemCount()):
+            top = self._tree.topLevelItem(g)
+            for i in range(top.childCount()):
+                it = top.child(i)
+                if it.checkState(0) != Qt.CheckState.Checked:
+                    continue
+                idx = it.data(0, self.ROLE_ROW)
+                if isinstance(idx, int) and 0 <= idx < len(self._rows):
+                    out.append(self._rows[idx])
         return out
 
 
@@ -4079,21 +5039,29 @@ class _SendToCreateDialog(QDialog):
         return out
 
 
-def open_unified(kgs: list[dict], parent=None) -> None:
+def open_unified(kgs: list[dict], parent=None):
     """Search AND create, on ONE screen: the deck is searched for every gap, the
     points it can't cover are written as cards into the bottom of the same
     results page, and one button commits both under one checkpoint. See
-    BulkSearchDialog._build_results_page."""
-    open_bulk_search(kgs, parent=parent, unified=True)
+    BulkSearchDialog._build_results_page.
+
+    Returns the dialog, or None if it couldn't open. The caller needs it to
+    know when the pass is OVER — the window is modeless, so returning from
+    this function means it has appeared, not that anything has been done with
+    it. The work-through queue hangs its emptying off dialog.finished."""
+    return open_bulk_search(kgs, parent=parent, unified=True)
 
 
-def open_bulk_search(kgs: list[dict], parent=None, *, unified: bool = False) -> None:
-    """Entry point. `kgs` are full KG records from tools/kg/store.py."""
+def open_bulk_search(kgs: list[dict], parent=None, *, unified: bool = False):
+    """Entry point. `kgs` are full KG records from tools/kg/store.py.
+
+    Returns the dialog so a caller can watch it finish; None if there was
+    nothing to open."""
     kgs = [k for k in (kgs or []) if isinstance(k, dict)
            and str(k.get("title") or "").strip()]
     if not kgs:
         tooltip("No knowledge gaps to search.")
-        return
+        return None
     dlg = BulkSearchDialog(kgs, parent=parent, unified=unified)
     dlg.show()
     dlg.raise_()
@@ -4103,3 +5071,4 @@ def open_bulk_search(kgs: list[dict], parent=None, *, unified: bool = False) -> 
     # the moment the window appears, and it skips straight past the one screen
     # where the notes and the tick boxes can still be corrected. Opening a
     # window is not consent to spend tokens. Press "Read gaps with AI".
+    return dlg

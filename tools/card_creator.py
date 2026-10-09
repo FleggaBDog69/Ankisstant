@@ -80,6 +80,39 @@ NAME = "AI Create"
 
 # ── prompts ───────────────────────────────────────────────────────────────────
 
+# The front-emphasis + allowed-HTML rules, hoisted out of CARD_GEN_SYSTEM so the
+# prompts that REWRITE a card (split, one-by-one) carry the identical text. A
+# rewritten card is still a card he has to read at 6am, and a rewrite prompt that
+# says nothing about markup gets back plain prose — measured, see the emphasis
+# repair in ensure_front_emphasis(). One definition, three prompts.
+FRONT_EMPHASIS_RULES = """- FRONT EMPHASIS — do this on EVERY card, for fast visual recognition. Mark up key words
+  INLINE with HTML so the eye lands on the anchor and the target instantly:
+    • <b>Bold</b> the topic/disease anchor and any augmenting qualifier ('first-line',
+      'most common', 'initial', 'acute', 'irreversible').
+    • <u>Underline</u> the words in the cue that are ALREADY doing the retrieval
+      work — the mechanism, the finding, the contrast the student must think
+      through. Mark up what is there. NEVER add a phrase to the front just so
+      there is something to underline.
+      A SHAPE WORD (the <u>investigation</u>, the <u>vessel</u>, the <u>protozoa</u>)
+      earns its place ONLY when the cue would otherwise admit more than one
+      answer — it is a disambiguator, not decoration. If the cue already pins
+      exactly one answer, adding the answer's category back in is the LABEL CUE
+      banned above: it makes the card longer AND easier at the same time.
+      NECESSITY TEST — before writing a shape word, delete it and re-read the
+      cue. Does more than one answer now fit? If no, leave it out.
+        BAD:  "…carry a markedly elevated rate of <u>self-inflicted death</u>,
+               i.e. {{c1::suicide}}."   (the underlined phrase IS the answer, said twice)
+        GOOD: "…are at markedly elevated risk of {{c1::suicide}}."
+      If nothing in the cue needs marking, underline NOTHING. A front with only
+      a bold anchor is finished — an underline is not a quota.
+      Underline the cue, never the {{c1::...}} itself.
+    • <i>Italicise</i> genus/species names (e.g. <i>Cryptosporidium</i>).
+  Purposeful and SPARING — a few words per card, never a whole clause, never the obvious
+  filler words. Allowed in the front: inline <b>, <u>, <i> ONLY. NO bullets, lists,
+  headers, or <br> in the front.
+"""
+
+
 CARD_GEN_SYSTEM = """You generate high-yield Anki cloze cards for a Year 3 Australian medical student.
 
 
@@ -130,6 +163,25 @@ hard one never matures.
 - Coupled-but-separable facts (a disease name AND its vessel) are TWO cards, each cued
   from a different angle — not one card with two clozes.
 
+ONE FACT IN THE FRONT. Atomicity is about the WHOLE front, not just how many
+clozes you used. A one-cloze card is still non-atomic if the visible text
+smuggles a second fact in — an em-dash tail, a parenthetical aside, an "and it
+also…" clause. Every word in the front must be there to make the ONE hidden
+fact retrievable. A clause that TEACHES rather than CUES belongs in the EXTRA
+field, which exists for precisely that.
+  BAD:  "In newly diagnosed <b>heart failure</b>, {{c1::transthoracic echocardiography}}
+         is the <u>initial</u> test — it quantifies ventricular function and detects
+         stenotic or regurgitant lesions that may be a surgically correctable cause."
+         (everything after the em-dash is teaching, and it is a second fact)
+  GOOD: "In newly diagnosed <b>heart failure</b>, the test that shows whether a valve
+         lesion is driving it is {{c1::transthoracic echocardiography}}."
+         …with the ventricular-function detail moved to EXTRA.
+DELETION TEST (run on every card, clause by clause — position doesn't matter, a
+cue may sit before or after its cloze): take out one clause and re-read. If the
+cue still forces the SAME answer without it, that clause was teaching, not
+cueing — move it to EXTRA. Keep only what the recall depends on. Do not lengthen
+the front to be thorough; the back is where thorough goes.
+
 LIST-SHAPED CONTENT ("the N X are A, B, C…", or enumeration words three/four/several):
 STOP and pick a format deliberately —
   A) SPLIT into N cards, each cued from that item's own mechanism/presentation. Default
@@ -160,18 +212,7 @@ CLOZE FORMAT & STYLE
 - LEVEL: Year 3 Australian med student; Australian drugs/guidelines (eTG, RACGP, PBS,
   ANZCOR) where relevant.
 - Ruthless concision — cut filler ("important to know that…", "remember that…").
-- FRONT EMPHASIS — do this on EVERY card, for fast visual recognition. Mark up key words
-  INLINE with HTML so the eye lands on the anchor and the target instantly:
-    • <b>Bold</b> the topic/disease anchor and any augmenting qualifier ('first-line',
-      'most common', 'initial', 'acute', 'irreversible').
-    • <u>Underline</u> the word(s) that signal WHAT the cloze is asking for — the
-      category or role of the hidden answer (e.g. the <u>investigation</u>, the
-      <u>vessel</u>, the <u>protozoa</u>). Underline the cue, never the {{c1::...}} itself.
-    • <i>Italicise</i> genus/species names (e.g. <i>Cryptosporidium</i>).
-  Purposeful and SPARING — a few words per card, never a whole clause, never the obvious
-  filler words. Allowed in the front: inline <b>, <u>, <i> ONLY. NO bullets, lists,
-  headers, or <br> in the front.
-- Cloze the YIELD (the high-value fact), not background framing. If a fact only makes
+""" + FRONT_EMPHASIS_RULES + """- Cloze the YIELD (the high-value fact), not background framing. If a fact only makes
   sense with framing, put the framing UNCLOZED in the front and cloze the testable part.
 
 EXTRA FIELD (the back): concise and SCANNABLE — never a wall of text. The clinical "so
@@ -220,7 +261,8 @@ SPLIT_SYSTEM = (
     "Split the supplied Anki card into multiple ATOMIC single-cloze cards. Each output card "
     "must test ONE fact, contain exactly ONE cloze deletion ({{c1::...}}), and stand on its own. "
     "Keep cloze answers short (1–4 words). Preserve the clinical meaning of the original. "
-    "Return ONLY a JSON array of {front, extra} objects — no prose, no markdown fences."
+    "Return ONLY a JSON array of {front, extra} objects — no prose, no markdown fences.\n\n"
+    + FRONT_EMPHASIS_RULES
 )
 
 def _augment_system(base: str, profile: dict | None) -> str:
@@ -279,7 +321,8 @@ ONE_BY_ONE_SYSTEM = (
     "- Order the clozes in the sequence the student should reveal them.\n"
     "- Keep each cloze answer short (1–4 words).\n"
     "- Preserve the original clinical meaning; don't add new facts.\n"
-    "- No prose outside the JSON object. No markdown fences."
+    "- No prose outside the JSON object. No markdown fences.\n\n"
+    + FRONT_EMPHASIS_RULES
 )
 
 
@@ -329,26 +372,91 @@ def _apply_tag_levels(gap: dict, type_meta: dict, levels: dict) -> str:
     KG store. Whether to tag at all is the caller's call (the Auto-tag
     checkbox); this only needs the type's name segment. Returns '' if unusable
     (no base/levels)."""
-    # The tag BOX is the content axis. It used to show the group's own absolute
-    # branch instead, which meant a gap in a course case never got a content tag
-    # at all — see autotag.content_tag_from_levels. The course branch is still
-    # applied, as a shared tag at commit time.
+    # The tag BOX is where this gap's cards file: the content tag under the
+    # shared base, or — for a group that owns an absolute course branch — that
+    # branch, with the classification under it. One or the other, never both;
+    # autotag.content_tag_from_levels decides which and is the only thing that
+    # should.
     tag = autotag.content_tag_from_levels(levels, group=_gap_group(gap))
     if not tag:
         return ""
-    gap["auto_tag"] = tag
-    kg_id = gap.get("kg_id")
-    if kg_id:
-        try:
-            from .kg import store as kg_store
-            existing = kg_store.get(kg_id)
-            if existing:
-                fields = dict(existing.get("fields") or {})
-                fields["auto_tag"] = tag
-                kg_store.update(kg_id, fields=fields)
-        except Exception as e:
-            print(f"[ankisstant] auto-tag persist failed: {e}")
+    cache_auto_tag(gap, tag)
     return tag
+
+
+def cache_auto_tag(gap: dict, tag: str) -> None:
+    """Remember the content tag this gap's cards actually carry, on the gap and
+    in the KG store.
+
+    It has to be the tag that WENT ON, not the one this module would have
+    computed: it is what "Retag group" searches by to find a gap's cards when it
+    repairs their missing group and source tags. Cached wrong, that repair looks
+    for cards under a tag nothing carries and reports that there is nothing to
+    fix."""
+    tag = str(tag or "").strip()
+    if not tag:
+        return
+    gap["auto_tag"] = tag
+    kg_id = gap.get("kg_id") or gap.get("id")
+    if not kg_id:
+        return
+    try:
+        from .kg import store as kg_store
+        existing = kg_store.get(str(kg_id))
+        if existing:
+            fields = dict(existing.get("fields") or {})
+            fields["auto_tag"] = tag
+            kg_store.update(str(kg_id), fields=fields)
+    except Exception as e:
+        print(f"[ankisstant] auto-tag persist failed: {e}")
+
+
+def scheme_tags_for_gap(gap: dict | None, levels: dict | None,
+                        *, content_tag: str = "") -> list:
+    """EVERY tag a card WRITTEN for this gap earns, on all three axes.
+
+    The counterpart of commit.tag_ops_for, which is what a card FOUND for a gap
+    goes through. They were never counterparts: the found half applied content +
+    course + source + audit + month, and the written half applied the content
+    tag and nothing else. So a card the tool wrote for a Curtanki case landed
+    outside the case, a card written on a placement had no provenance, and no
+    written card anywhere could be found by the month it was made — while the
+    card found for the very same gap, in the very same run, on the very same
+    screen, got all four.
+
+    autotag.tags_for() has stated the correct policy the whole time and had no
+    callers. This is the call site it was missing.
+
+    `content_tag` is the tag already resolved and cached by _apply_tag_levels.
+    Passed in rather than recomputed because a gap whose levels came back on an
+    earlier run has a cached tag and no levels to rebuild it from.
+    """
+    from ..core.config import month_tag
+    out: list = []
+    seen: set = set()
+
+    def add(t) -> None:
+        t = str(t or "").strip()
+        if t and t.lower() not in seen:
+            seen.add(t.lower())
+            out.append(t)
+
+    add(content_tag)
+    if isinstance(gap, dict):
+        try:
+            for t in autotag.tags_for(
+                    levels, group=_gap_group(gap), tool="knowledge_gaps",
+                    kg_type_key=str(gap.get("kg_type") or gap.get("type")
+                                    or "").strip().lower()):
+                add(t)
+        except Exception as e:
+            print(f"[ankisstant] scheme tags skipped: {e}")
+    # Audit trail. Deduped, so the doors that already put it on lose nothing.
+    try:
+        add(month_tag())
+    except Exception:
+        pass
+    return out
 
 
 def _topic_tag_from_levels(levels: dict, type_meta: dict | None,
@@ -1026,6 +1134,15 @@ def _regenerate_one(old_card: dict, hint: str, profile: dict | None,
             "Rewrite this card as a single, better card on the same fact — a "
             "stronger cue or wording while keeping the same retrieval target."
         )
+    # A rewrite prompt hands the model a finished card and one thing to fix, and
+    # the reply comes back tuned to that one thing — in practice, as plain text.
+    # The FRONT EMPHASIS rules are in the system prompt, but a local instruction
+    # out-pulls them, so the local instruction has to carry the rule too.
+    instruction += (
+        "\nThe rewrite is a NEW card and must be formatted like one: bold the "
+        "topic/disease anchor in the front, underline only what already earns it. "
+        "Coming back as plain text is a failed rewrite, however good the wording."
+    )
     prompt = (
         "Existing card to improve.\n"
         "Front:\n" + old_card.get("front", "") + "\n\n"
@@ -1047,6 +1164,9 @@ def _regenerate_one(old_card: dict, hint: str, profile: dict | None,
         new = next((c for c in new if isinstance(c, dict)), None)
     if not isinstance(new, dict) or "front" not in new or "extra" not in new:
         return None
+    # A rewrite inherits the anchor the original already chose; if the original
+    # had none either, the focus text is the only topic this call knows about.
+    ensure_front_emphasis([new], *bolded_terms(old_card.get("front", "")), focus)
     if old_card.get("_image_paths"):
         new["_image_paths"] = list(old_card["_image_paths"])
     # Carry the slide attachment across a regeneration — the rewritten card is
@@ -1055,6 +1175,248 @@ def _regenerate_one(old_card: dict, hint: str, profile: dict | None,
         if old_card.get(k) is not None:
             new[k] = list(old_card[k]) if isinstance(old_card[k], list) else old_card[k]
     return new
+
+
+# ── front emphasis: the deterministic net ────────────────────────────────────
+#
+# The prompt says to bold the topic anchor on EVERY card and the model complies
+# most of the time — measured over 165 generated notes, roughly one front in
+# seven came through with no <b> at all, and the misses are scattered inside
+# single batches rather than clustered on one broken path. So it is model
+# non-compliance, not a route that lost the rule, and no amount of extra
+# prompting closes the last stretch.
+#
+# What closes it is that we already KNOW the anchor. Every generation carries
+# the thing it was written about — the topic label, the learning point, the
+# gap's title — so when a front comes back unmarked we can put the bold where
+# it belongs without asking anyone. Deterministic, free, off the main thread:
+# the same shape as the slide-matching pass above.
+#
+# Conservative by construction. It bolds ONE run of text, only on an exact
+# whole-word match against a known anchor, never inside a cloze and never
+# inside markup. When nothing matches it changes nothing and says so, and the
+# review row labels the card in words — a card is never silently mangled to
+# satisfy a style rule.
+
+_ANCHOR_STOPWORDS = frozenset(
+    "the a an an the and or of to in is are be with for on as by from that this these those "
+    "it its which who what when where why how than then thus can may will would should "
+    "could into out over under more most less least also such not no any all both each "
+    "per via due between within without".split()
+)
+# Fine as PART of an anchor ("Down syndrome", "coeliac disease"), useless on
+# their own — a front bolding the bare word "condition" has learned nothing.
+# Applied only to single-word candidates, so the phrases keep working.
+_ANCHOR_GENERIC = frozenset(
+    "condition conditions disease diseases disorder disorders syndrome syndromes "
+    "patient patients therapy therapies treatment treatments management diagnosis "
+    "screening symptom symptoms sign signs feature features risk score scoring "
+    "test tests testing drug drugs agent agents cause causes effect effects "
+    "presentation investigation investigations complication complications "
+    "mechanism mechanisms indication indications".split()
+)
+_ANCHOR_MIN_WORD = 5      # a shorter word is too likely to be incidental
+_ANCHOR_MAX_PHRASE = 4    # a longer phrase is a sentence, not an anchor
+
+
+def _anchor_candidates(*sources: str) -> list[str]:
+    """Phrases worth bolding as a card's anchor, best first.
+
+    Sources are ranked in the order given — the first is the most authoritative
+    thing the card is about (the learning point, then the topic label, then the
+    gap's title), and a weak match on a strong source beats a strong match on a
+    weak one. Within one source: every run of 2–4 adjacent content words
+    (longest first), then the acronym, then the bare words.
+
+    Phrases lead because a card about heart failure should bold "heart
+    failure", not whichever single word happens to be longest — and a phrase
+    can only match if those words are adjacent in the front, so a nonsense
+    n-gram costs nothing. The acronym comes next because a front that says "AF"
+    almost never also says "atrial". Single words are last and are held to a
+    length floor and a generic-noun ban, since that is where a bad bold comes
+    from."""
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def take(c: str) -> None:
+        if c and c.lower() not in seen:
+            seen.add(c.lower())
+            out.append(c)
+
+    for raw in sources:
+        text = anki_utils.strip_html(str(raw or "")).strip()
+        if not text:
+            continue
+        phrases: list[str] = []
+        acronyms: list[str] = []
+        words: list[str] = []
+        # Clause by clause, so an n-gram never straddles a comma and invents a
+        # phrase ("sex called") that was never in the source.
+        for clause in re.split(r"[,;:.()\[\]/\u2014\u2013]+", text):
+            toks = [t for t in re.split(r"[^A-Za-z0-9\-]+", clause) if t]
+            content = [t for t in toks if t.lower() not in _ANCHOR_STOPWORDS]
+            if not content:
+                continue
+            for n in range(min(_ANCHOR_MAX_PHRASE, len(content)), 1, -1):
+                for i in range(len(content) - n + 1):
+                    phrases.append(" ".join(content[i:i + n]))
+            if len(content) >= 2:
+                ac = "".join(t[0] for t in content).upper()
+                if 2 <= len(ac) <= 5:
+                    acronyms.append(ac)
+            for t in content:
+                if t.lower() in _ANCHOR_GENERIC:
+                    continue
+                if len(t) >= _ANCHOR_MIN_WORD or t.isupper():
+                    words.append(t)
+        phrases.sort(key=len, reverse=True)
+        words.sort(key=len, reverse=True)
+        for c in phrases + acronyms + words:
+            take(c)
+    return out
+
+
+def _plain_spans(text: str) -> list[tuple[int, int]]:
+    """The (start, end) ranges of `text` that are ordinary readable words —
+    everything outside an HTML tag and outside a {{c1::…}} cloze.
+
+    Both exclusions matter for different reasons: bolding inside a tag would
+    corrupt the HTML, and bolding inside a cloze would mark the answer, which
+    is the one thing FRONT EMPHASIS explicitly forbids."""
+    blocked: list[tuple[int, int]] = []
+    for m in re.finditer(r"<[^>]*>", text):
+        blocked.append(m.span())
+    depth, start = 0, None
+    i = 0
+    while i < len(text) - 1:
+        if text[i:i + 2] == "{{":
+            if depth == 0:
+                start = i
+            depth += 1
+            i += 2
+            continue
+        if text[i:i + 2] == "}}" and depth:
+            depth -= 1
+            if depth == 0 and start is not None:
+                blocked.append((start, i + 2))
+                start = None
+            i += 2
+            continue
+        i += 1
+    if depth and start is not None:          # unclosed cloze: treat the tail as blocked
+        blocked.append((start, len(text)))
+    blocked.sort()
+    spans: list[tuple[int, int]] = []
+    cur = 0
+    for b0, b1 in blocked:
+        if b0 > cur:
+            spans.append((cur, b0))
+        cur = max(cur, b1)
+    if cur < len(text):
+        spans.append((cur, len(text)))
+    return spans
+
+
+def bold_anchor(front: str, anchors: list[str]) -> str | None:
+    """Bold the first anchor that appears as plain text in `front`.
+
+    Returns the repaired front, or None when the front already has a bold or no
+    anchor could be found — in both cases the caller leaves the card alone."""
+    if not front or "<b>" in front.lower():
+        return None
+    spans = _plain_spans(front)
+    for anchor in anchors:
+        # An acronym must match case ("AF"), a word or phrase need not
+        # ("heart failure" / "Heart failure"). Otherwise every "It" in a front
+        # is a candidate anchor for a gap whose title starts "Intracranial…".
+        flags = 0 if (anchor.isupper() and len(anchor) <= 5) else re.IGNORECASE
+        pat = re.compile(r"\b" + r"\s+".join(re.escape(w) for w in anchor.split())
+                         + r"\b", flags)
+        for s0, s1 in spans:
+            m = pat.search(front, s0, s1)
+            if m is None:
+                continue
+            return front[:m.start()] + "<b>" + m.group(0) + "</b>" + front[m.end():]
+    return None
+
+
+def bolded_terms(front: str) -> list[str]:
+    """The text already bolded in a front — the anchor its author chose.
+
+    The best anchor source for a REWRITE: split, one-by-one and regenerate all
+    start from a card that usually got its emphasis right, so the rewrite can
+    inherit the same anchor instead of guessing at one."""
+    return [anki_utils.strip_html(m).strip()
+            for m in re.findall(r"<b>(.*?)</b>", str(front or ""), re.S | re.I)
+            if anki_utils.strip_html(m).strip()]
+
+
+def ensure_front_emphasis(cards: list, *sources: str, per_card=None) -> int:
+    """Give every unbolded front in `cards` its anchor back. Returns how many
+    were repaired; the ones that couldn't be are marked `_no_emphasis` so the
+    review row can say so in words rather than letting them through unnoticed.
+
+    `per_card(card) -> iterable[str]` supplies sources that outrank the shared
+    ones for that card alone — a batch covering eight learning points should
+    bold each card's OWN point, not whichever point happened to come first.
+
+    Qt-free and collection-free, so it runs on the worker thread beside the
+    generation it is cleaning up after. Never raises: an unformatted card is a
+    small annoyance, a create that dies on the way to the review screen is not.
+    """
+    if not isinstance(cards, list):
+        return 0
+    fixed = 0
+    try:
+        base = _anchor_candidates(*sources)
+        for card in cards:
+            if not isinstance(card, dict):
+                continue
+            front = str(card.get("front") or "")
+            if not front or "<b>" in front.lower():
+                card.pop("_no_emphasis", None)
+                continue
+            anchors = base
+            if per_card is not None:
+                try:
+                    own = _anchor_candidates(*(per_card(card) or ()))
+                except Exception:
+                    own = []
+                if own:
+                    seen = {a.lower() for a in own}
+                    anchors = own + [a for a in base if a.lower() not in seen]
+            repaired = bold_anchor(front, anchors) if anchors else None
+            if repaired is not None:
+                card["front"] = repaired
+                card.pop("_no_emphasis", None)
+                fixed += 1
+            else:
+                card["_no_emphasis"] = True
+        if fixed:
+            log.info(f"front emphasis: bolded the anchor on {fixed} card(s) "
+                     f"the model left unmarked")
+    except Exception as e:
+        log.error(f"front emphasis repair skipped: {e}")
+    return fixed
+
+
+def ensure_front_emphasis_for_job(cards: list, rec: dict) -> int:
+    """`ensure_front_emphasis` for a create_jobs record, which is where the
+    anchors actually live: each card's own attributed learning point first
+    (card["point"] is a 1-based index into the job's mass_points), then the
+    job's topic label and title as the shared fallback."""
+    points = [str(c or "") for c in ((rec or {}).get("mass_points") or [])]
+
+    def own(card: dict):
+        try:
+            n = int(card.get("point"))
+        except (TypeError, ValueError):
+            return ()
+        return (points[n - 1],) if 1 <= n <= len(points) else ()
+
+    return ensure_front_emphasis(
+        cards, str((rec or {}).get("topic_label") or ""),
+        str((rec or {}).get("title") or ""), *points, per_card=own)
 
 
 def resolve_card_validity(cards) -> bool:
@@ -3170,6 +3532,12 @@ class CreatorPanel(QWidget):
         if reply is None:
             return  # cancelled, or a parse failure already surfaced
 
+        # FRONT EMPHASIS repair — the modal twin of the one in create_jobs._worker.
+        # The topic and the gap's own title are the anchors this path knows.
+        ensure_front_emphasis(cards if isinstance(cards, list) else [],
+                              topic_label, str((gap or {}).get("title") or ""),
+                              focus)
+
         # Text-first lecture: attach each card's source slide by matching the card
         # back to the per-page text (deterministic, no AI). _finalize_review gets
         # slide_pages below, so _sync_slide_images then pulls in the slide image.
@@ -3465,6 +3833,7 @@ class CreatorPanel(QWidget):
         kg_notes = ""
         kg_concept = ""
         kg_explanation = ""
+        kg_resources: list = []
         if gap is not None:
             kg_image_filenames = list(gap.get("images") or [])
             kg_type_for_image = (gap.get("kg_type") or "").lower()
@@ -3473,6 +3842,8 @@ class CreatorPanel(QWidget):
             # source of confusion, not just the image.
             kg_stem_html = str(gap.get("stem_html") or "")
             kg_notes = str(gap.get("notes") or "")
+            # Where the answer lives. Every card from this gap carries it.
+            kg_resources = list(gap.get("resources") or [])
             # MQ-type gaps lead the Missed Questions field with the specific
             # concept missed (the knowledge gap) plus an AI-written explanation,
             # above the screenshot. Both were resolved by the caller (folded
@@ -3494,8 +3865,16 @@ class CreatorPanel(QWidget):
                         )
             except Exception as e:
                 print(f"[ankisstant] auto-tag generation skipped: {e}")
-            if auto_tag and auto_tag not in tags_raw:
-                tags_raw.append(auto_tag)
+            # The content tag, then the rest of the scheme — the group's
+            # shared branch and the batch's source. See scheme_tags_for_gap:
+            # the found half of every run has applied these all along and the
+            # written half applied none of them.
+            have = {t.lower() for t in tags_raw}
+            for t in scheme_tags_for_gap(gap, merged_tag_levels,
+                                         content_tag=auto_tag or ""):
+                if t.lower() not in have:
+                    have.add(t.lower())
+                    tags_raw.append(t)
         elif auto_tag_base() and (merged_tag_levels or topic_autotag):
             # No loaded KG (pasted cards, or topic/source auto-tag). Use the
             # levels the model folded into the reply; if a skill forced a bare
@@ -3528,6 +3907,7 @@ class CreatorPanel(QWidget):
             kg_notes=kg_notes,
             kg_concept=kg_concept,
             kg_explanation=kg_explanation,
+            kg_resources=kg_resources,
             type_meta=type_meta,
             kg_field_values=_gap_field_values(gap),
             slide_pages=slide_pages,
@@ -3607,6 +3987,7 @@ class CreatorPanel(QWidget):
             "kg_notes": str(gap.get("notes") or "") if gap else "",
             "kg_concept": str(gap.get("concept") or "").strip() if is_mq else "",
             "kg_explanation": str(gap.get("explanation") or "").strip() if is_mq else "",
+            "kg_resources": list(gap.get("resources") or []) if gap else [],
             "panel_image_filenames": panel_fns,
             "attachment_paths": attach_copied,
             "slide_pages": slide_copied,
@@ -3720,6 +4101,7 @@ class CreatorPanel(QWidget):
             kg_notes=rec.get("kg_notes", ""),
             kg_concept=rec.get("kg_concept", ""),
             kg_explanation=rec.get("kg_explanation", ""),
+            kg_resources=list(rec.get("kg_resources") or []),
             type_meta=rec.get("type_meta") if isinstance(rec.get("type_meta"), dict) else None,
             kg_field_values=_gap_field_values(rec.get("gap") if isinstance(rec.get("gap"), dict) else None),
             slide_pages=slide_pages,
@@ -4238,6 +4620,9 @@ class CommitCtx:
     kg_notes: str = ""
     kg_concept: str = ""
     kg_explanation: str = ""
+    # The gap's own reading list — [{"label", "url"}]. Rendered onto Extra so a
+    # card knows where its answer came from and where to go back to.
+    kg_resources: list = field(default_factory=list)
     # The KG type definition + this gap's per-note field values, for user-defined
     # fields whose declarative target is a literal Anki field (kind="field").
     type_meta: dict | None = None
@@ -4284,6 +4669,35 @@ def kg_content_html(ctx: CommitCtx) -> str:
     if img_html:
         parts.append(img_html)
     return "<br>".join(parts)
+
+
+def kg_resources_html(ctx: CommitCtx) -> str:
+    """The gap's resources as a small labelled block of links, for Extra.
+
+    A resource on a gap is the thing that closed it — the chapter, the video,
+    the guideline. It belongs on the card for the same reason the gap's notes
+    do: months later the card is the only surviving trace of where the answer
+    came from, and "where did I read this" is the question you actually ask.
+
+    Bare labels (no URL) are kept as plain text; a URL with no label shows the
+    URL. Off with card_creator.attach_resources = false."""
+    if not bool(tool_config("card_creator").get("attach_resources", True)):
+        return ""
+    rows: list[str] = []
+    for r in (ctx.kg_resources or []):
+        if not isinstance(r, dict):
+            continue
+        label = str(r.get("label") or "").strip()
+        url   = str(r.get("url") or "").strip()
+        if url:
+            safe = html.escape(url, quote=True)
+            rows.append(f'<a href="{safe}">{html.escape(label or url)}</a>')
+        elif label:
+            rows.append(html.escape(label))
+    if not rows:
+        return ""
+    return ("<div class='ankisstant-resources'><b>Resources:</b> "
+            + " · ".join(rows) + "</div>")
 
 
 def kg_image_target_field(ctx: CommitCtx) -> str:
@@ -4374,6 +4788,10 @@ def set_fields(note, card: dict, ctx: CommitCtx) -> None:
                     note[fname] = (existing + "<br>" if existing else "") + val
         except Exception as e:
             log.warn(f"custom field routing skipped: {e}")
+    # The gap's reading list, last, on Extra — regardless of KG type. An MQ
+    # gap's captured question belongs in Missed Questions, but a link to the
+    # chapter that answers it belongs with the answer.
+    _append_field(note, extra_field, kg_resources_html(ctx))
     for t in ctx.tags:
         note.add_tag(t)
 
@@ -4399,6 +4817,7 @@ def one_by_one_rewrite(old_card: dict, profile: dict) -> dict | None:
     front = new["front"]
     if re.search(r"\{\{c[2-9]\d*::", front):
         new["front"] = re.sub(r"\{\{c\d+::", "{{c1::", front)
+    ensure_front_emphasis([new], *bolded_terms(old_card.get("front", "")))
     if old_card.get("_image_paths"):
         new["_image_paths"] = list(old_card["_image_paths"])
     return new
@@ -4425,6 +4844,9 @@ def split_card(card: dict, profile: dict) -> list | None:
             or not all(isinstance(c, dict) and "front" in c and "extra" in c
                        for c in new_cards)):
         return None
+    # Every piece of a split is about the same thing the original was, so they
+    # all inherit its anchor.
+    ensure_front_emphasis(new_cards, *bolded_terms(card.get("front", "")))
     return new_cards
 
 
@@ -4496,7 +4918,7 @@ class ReviewDialog(QDialog):
                  deck_name, tags, profile=None, panel_image_paths=None,
                  kg_image_filenames=None, kg_type_for_image="",
                  kg_stem_html="", kg_notes="",
-                 kg_concept="", kg_explanation="",
+                 kg_concept="", kg_explanation="", kg_resources=None,
                  type_meta=None, kg_field_values=None,
                  slide_pages=None,
                  parent=None):
@@ -4533,6 +4955,9 @@ class ReviewDialog(QDialog):
         # screenshot in the Missed Questions field (see _kg_content_html).
         self.kg_concept: str = str(kg_concept or "").strip()
         self.kg_explanation: str = str(kg_explanation or "").strip()
+        # The gap's resources ([{"label", "url"}]), appended to Extra on every
+        # card this gap produces — see kg_resources_html.
+        self.kg_resources: list = list(kg_resources or [])
         # The KG type definition + this gap's per-note field values, used to route
         # any USER-DEFINED fields that target a literal Anki field (kind="field")
         # into that field. Built-in role composition (the Missed Questions field)
@@ -4713,6 +5138,7 @@ class ReviewDialog(QDialog):
             kg_notes=self.kg_notes,
             kg_concept=self.kg_concept,
             kg_explanation=self.kg_explanation,
+            kg_resources=self.kg_resources,
             type_meta=self.type_meta,
             kg_field_values=self.kg_field_values,
         )
@@ -4812,13 +5238,36 @@ class ReviewDialog(QDialog):
 
 # ── persistent Add-Screen queue (survives ReviewDialog dismissal) ────────────
 
-_add_queue: list[dict] = []
+_add_queue: list = []
 _add_queue_ctx: dict | None = None
 _add_dialog = None  # the AddCards instance we're driving
 _hook_attached = False
+# Who is being driven, and what they want told back. The queue predates having
+# a second caller: AI Create starts a run and never asks what came of it,
+# because the panel it started from is the only place the answer would show.
+# The work-through pass does ask — it has gaps to close, and a gap closes on a
+# card reaching the collection, not on one being offered. So the run now
+# reports each add as it happens and says when it is over.
+_add_on_added = None    # callable(index, note) — which queued entry was added
+_add_on_done = None     # callable(discarded) — the run ended, however it ended
+_add_idx = 0            # index of the entry currently loaded in the editor
+# Whether that loaded entry is still unsent. Needed because _add_queue holds
+# what is WAITING, not what is on screen: with one card in the editor and
+# three behind it the queue is three long, so closing the window there was
+# reported as discarding three cards when it discarded four.
+_add_pending = False
 
 
-def _fill_addcards(ac, card: dict, ctx: dict) -> None:
+def _fill_addcards(ac, card, ctx: dict) -> None:
+    # A FILLER, not a card dict: a callable that builds and sets its own note.
+    # Everything below reads one shared `ctx` — one notetype, one deck, one set
+    # of tags, one gap's content — which is true of a Create panel batch and
+    # false of a work-through pass, where each card belongs to a different gap.
+    # Rather than teach ctx to vary per card, a caller in that position hands
+    # over the filling.
+    if callable(card):
+        card(ac)
+        return
     nt = ctx["nt"]
     new_note = mw.col.new_note(nt)
     front_field = ctx["front_field"]
@@ -4871,10 +5320,32 @@ def _fill_addcards(ac, card: dict, ctx: dict) -> None:
         print(f"[ankisstant] couldn't refresh editor tag widget: {e}")
 
 
-def _start_add_queue(cards: list[dict], ctx: dict) -> None:
+def _start_add_queue(cards: list, ctx: dict, *, on_added=None,
+                     on_done=None) -> None:
+    """Drive Anki's Add window through a list of cards, one at a time.
+
+    `cards` is normally card dicts, described by `ctx`. It may instead be
+    fillers — callables that set the window's note themselves — for a caller
+    whose cards can't share one ctx; `ctx` then only needs "nt" and "deck_id"
+    for the initial selection.
+
+    `on_added(index, note)` fires each time the user presses Add, naming which
+    queued entry it was. `on_done(discarded)` fires once when the run ends, by
+    the last card or by the window being closed. Between them a caller can tell
+    what actually reached the collection, which is not the same as what was
+    offered — closing the window early is a normal way to stop."""
     global _add_queue, _add_queue_ctx, _add_dialog
+    global _add_on_added, _add_on_done, _add_idx, _add_pending
     if not cards:
         return
+    # A run already in flight is ended first, and told so. Two queues sharing
+    # one Add window would interleave their cards and each credit the other's
+    # adds to itself.
+    if _add_queue or _add_on_done is not None:
+        _stop_add_queue()
+    _add_on_added = on_added
+    _add_on_done = on_done
+    _add_idx = 0
     mw.col.models.set_current(ctx["nt"])
     mw.col.decks.select(ctx["deck_id"])
 
@@ -4885,6 +5356,7 @@ def _start_add_queue(cards: list[dict], ctx: dict) -> None:
     _add_queue_ctx = ctx
 
     _fill_addcards(ac, cards[0], ctx)
+    _add_pending = True
 
     # Float AddCards over the Ankisstant window so it isn't buried under
     # the Create panel after opening. WindowStaysOnTopHint is sticky — we
@@ -4898,7 +5370,9 @@ def _start_add_queue(cards: list[dict], ctx: dict) -> None:
     except Exception as e:
         print(f"[ankisstant] couldn't raise AddCards: {e}")
 
-    if _add_queue:
+    # Hooked whenever anyone is listening, not only when more cards follow: a
+    # single-card run still has to report that its one card was added.
+    if _add_queue or on_added is not None or on_done is not None:
         _attach_add_hook()
         try:
             if not getattr(ac, "_ankisstant_finished_hooked", False):
@@ -4906,6 +5380,7 @@ def _start_add_queue(cards: list[dict], ctx: dict) -> None:
                 ac._ankisstant_finished_hooked = True
         except Exception as e:
             print(f"[ankisstant] couldn't hook AddCards.finished: {e}")
+    if _add_queue:
         tooltip(
             f"{len(_add_queue) + 1} card(s) queued. Click Anki's Add button — "
             f"the next will load automatically. Close the window to discard the rest."
@@ -4915,13 +5390,15 @@ def _start_add_queue(cards: list[dict], ctx: dict) -> None:
 
 
 def _advance_add_queue():
-    global _add_queue, _add_queue_ctx, _add_dialog
+    global _add_queue, _add_queue_ctx, _add_dialog, _add_idx, _add_pending
     if not _add_queue or _add_queue_ctx is None or _add_dialog is None:
         _stop_add_queue()
         return
     ac = _add_dialog
     next_card = _add_queue.pop(0)
+    _add_idx += 1
     _fill_addcards(ac, next_card, _add_queue_ctx)
+    _add_pending = True
     remaining = len(_add_queue)
     if remaining:
         tooltip(f"{remaining} card(s) left in queue.")
@@ -4930,6 +5407,15 @@ def _advance_add_queue():
 
 
 def _on_add_did_add_note(note):
+    global _add_pending
+    _add_pending = False
+    # Say WHICH entry that was before the queue moves on — after the advance,
+    # _add_idx already names the next one.
+    if _add_on_added is not None:
+        try:
+            _add_on_added(_add_idx, note)
+        except Exception as e:
+            print(f"[ankisstant] add-queue listener failed: {e}")
     # Defer so Anki's own post-Add reset (which blanks the editor) finishes first.
     QTimer.singleShot(0, _advance_add_queue)
 
@@ -4948,17 +5434,33 @@ def _attach_add_hook():
 
 def _stop_add_queue():
     global _add_queue, _add_queue_ctx, _add_dialog, _hook_attached
-    if _add_queue:
-        tooltip(f"Discarded {len(_add_queue)} unsent card(s) from the queue.")
+    global _add_on_added, _add_on_done, _add_idx, _add_pending
+    # The one in the editor counts: it was offered and never added.
+    discarded = len(_add_queue) + (1 if _add_pending else 0)
+    if discarded:
+        tooltip(f"Discarded {discarded} unsent card(s) from the queue.")
+    done = _add_on_done
     _add_queue = []
     _add_queue_ctx = None
     _add_dialog = None
+    _add_on_added = None
+    _add_on_done = None
+    _add_idx = 0
+    _add_pending = False
     if _hook_attached:
         try:
             gui_hooks.add_cards_did_add_note.remove(_on_add_did_add_note)
         except ValueError:
             pass
         _hook_attached = False
+    # Last, and after the globals are already clear: the listener is entitled
+    # to start a run of its own from in here, and would otherwise have it torn
+    # down by the tail of the one it was told about.
+    if done is not None:
+        try:
+            done(discarded)
+        except Exception as e:
+            print(f"[ankisstant] add-queue completion listener failed: {e}")
 
 
 # ── Tool contract ────────────────────────────────────────────────────────────
