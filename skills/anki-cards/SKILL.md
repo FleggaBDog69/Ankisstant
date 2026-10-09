@@ -61,29 +61,38 @@ the cue still forces the same answer, delete that clause.
 - **Synonym set-up:** the cue restates the answer in other words, or a second cloze names the first.
 - **Grammar:** `an {{c1::…}}` cues a vowel — write "a(n)" or restructure.
 
-## List-shaped content — STOP and choose a format
+## Cloze mechanics — what the numbers do
 
-When the content is "the N X are A, B, C…" (or uses three / four / several):
+Anki makes **one card per cloze number**. `{{c1::…}} {{c1::…}}` is one card with both
+blanks hidden together; `{{c1::…}} {{c2::…}}` is two cards, each hiding one blank while
+the other stays visible as part of the cue.
 
-- **A — Split into N cards**, one per item. Default for lists of ≥5 or items with
-  independent meaning.
-- **B — One card with hint syntax** `{{c1::answer::hint}}` — short lists (≤4) where the
-  gestalt "what are the X" recall matters.
-- **C — One card without hints, accepting desync** — only fixed sequences / mnemonics.
+- **Same number (c1 + c1)** — the bits only make sense *together*: a pair, a range, both
+  halves of a ratio. `<b>Clomiphene</b> raises both {{c1::FSH}} and {{c1::LH}}.`
+- **Different numbers (c1 + c2)** — each bit is worth recalling on its own, and the other
+  is a fair cue for it: `{{c1::Carbimazole}} inhibits {{c2::thyroid peroxidase}}.` Check
+  each sibling: with one blank hidden and the other shown, is it still a clean question?
+- **Separate notes** — related facts where neither is a fair cue for the other.
+- Split a multi-part fact into parts: `prevents {{c1::anterior shear}} of {{c2::L5}} on {{c3::S1}}`.
+- At most 2–3 numbers on one note (one-by-one lists are the exception).
 
-Never default to a multi-cloze enumeration without choosing A/B/C.
+## Lists — one-by-one or split
 
-## Cloze numbering (commonly done wrong)
-
-- Separate facts each hidden on their own sibling card → `c1`, `c2`, `c3`.
-- Deletions revealed together as one card → the same number.
-- Split a multi-component fact into separate clozes rather than clozing a whole phrase:
-  `prevents {{c1::anterior shear}} of {{c2::L5}} on {{c3::S1}}`, not `{{c1::anterior shear of L5 on S1}}`.
+- **3 to 8 items learnt as a set → one one-by-one card.** Every item `{{c1::…}}` (same
+  number), in recall order, each 1–4 words; set the note's **One by one** field to `y`
+  (in JSON: `"one_by_one": true`). Items are revealed one at a time, so the set lives on
+  one card without sibling desync.
+  `Causes of <b>pancreatitis</b>: {{c1::gallstones}}, {{c1::alcohol}}, {{c1::hypertriglyceridaemia}}, {{c1::ERCP}}, {{c1::hypercalcaemia}}.`
+  The 25-word limit counts only the text **outside** the clozes on a one-by-one card.
+- **Split into separate cards** when each item carries its own fact worth testing, or
+  the list is longer than 8.
+- **2 items** → a pair: use the same-number / different-numbers rule.
+- Never number list items `c1, c2, c3…` — a card per item, with the rest of the list
+  visible as a give-away.
 
 ## Format & style
 
-- Cloze only — no Q&A. Usually one cloze; at most 2–3 when they're parts of one fact.
-  Short answers (1–4 words).
+- Cloze only — no Q&A. Usually one cloze. Short answers (1–4 words).
 - `<b>Bold</b>` the topic anchor and qualifiers ("first-line", "most common");
   `<u>underline</u>` only words already doing the retrieval work; `<i>italicise</i>`
   genus/species. Inline `<b>`/`<u>`/`<i>` only in the front — no bullets, lists or `<br>`.
@@ -105,7 +114,7 @@ In chat, give each card as the front, then the Extra (if any) in italics on its 
 ```
 
 When a caller asks for JSON (the Ankisstant add-on does), return ONLY a JSON array of
-`{"front": ..., "extra": ..., "style": "fact" | "story"}` objects — no prose, no fences.
+`{"front": ..., "extra": ..., "style": "fact" | "story"}` objects (plus `"one_by_one": true` on a one-by-one list card) — no prose, no fences.
 
 ## Card quantity
 

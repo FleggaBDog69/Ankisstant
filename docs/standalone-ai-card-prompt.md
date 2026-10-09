@@ -81,7 +81,12 @@ CARD RULES (Wozniak's 20 Rules / Med School Insiders best practice)
   when they are parts of one fact; otherwise split into sibling cards.
 - NO GIVE-AWAYS: the cloze answer (or a shared word-stem) must not appear in the
   visible text; no definition → term cards; no "an {{c1::…}}".
-- NO ENUMERATIONS on one card; split, or use hint syntax for a short list.
+- CLOZE NUMBERS: c1+c1 = one card, both hidden (a pair/range); c1+c2 = two cards,
+  each cued by the other (only when both siblings are clean questions).
+- LISTS of 3–8 items: ONE card, every item {{c1::…}}, plus "one_by_one": true (sets
+  AnKing's One by one field). Longer lists, or items with their own facts: split.
+  Never number list items c1, c2, c3….
+- HINTS sparingly — only where the blank would otherwise be unclear.
 - FORMATTING: only `<b>` and `<u>` in fields. No other HTML.
 - EXTRA: optional, at most ~20 words; "" for most cards. Never repeat the front.
 - LEVEL: Year 3 Australian medical student. Prefer Australian drug names and
@@ -159,7 +164,7 @@ first character is `{`, the last is `}`. Shape:
 
     {"tags": {"system": "...", "subsystem": "...", "topic": "..."},
      "mq_explanation": "...",
-     "cards": [{"front": "...", "extra": "..."}, ...]}
+     "cards": [{"front": "...", "extra": "...", "one_by_one": false}, ...]}
 
 - `mq_explanation`: only for a missed question — 1–3 plain sentences on the
   mechanism/principle missed (the WHY/HOW), not a restatement. Use "" otherwise.

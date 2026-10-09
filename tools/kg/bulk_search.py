@@ -4871,6 +4871,10 @@ class _WrittenCardDialog(QDialog):
         self._apply_new(new, "Rewritten \u2014 read it before you keep it.")
 
     def _apply_new(self, new: dict, msg: str) -> None:
+        # Keep the rewrite's flags (one_by_one, style…) — values() rebuilds the
+        # card from self._card, so a flag left only on `new` never commits.
+        self._card.update({k: v for k, v in new.items()
+                           if k not in ("front", "extra", "back")})
         self._front.setPlainText(str(new.get("front") or ""))
         self._back.setPlainText(_card_back(new))
         self._status.setText(msg)

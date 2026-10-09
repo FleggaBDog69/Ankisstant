@@ -113,6 +113,31 @@ def front_word_count(front: str) -> int:
         return 0
 
 
+def _is_one_by_one(card) -> bool:
+    return isinstance(card, dict) and bool(card.get("one_by_one"))
+
+
+# The most items a one-by-one list card should hold before it wants splitting.
+# Fletcher's call (2026-10-10): one-by-one is for sets of 3-8.
+MAX_ONE_BY_ONE_ITEMS = 8
+
+
+def card_word_count(card) -> int:
+    """The number the length limit is applied to. For an ordinary card, every
+    visible word (front_word_count). For a ONE-BY-ONE list card, only the STEM —
+    the text outside the clozes — because the items are revealed one at a time
+    and each is held to 1-4 words separately; counting them would push every
+    honest five-item list over the limit."""
+    front = card.get("front", "") if isinstance(card, dict) else str(card or "")
+    if not _is_one_by_one(card):
+        return front_word_count(front)
+    try:
+        return sum(1 for t in visible_front(front).split()
+                   if re.search(r"[A-Za-z0-9]", t))
+    except Exception:  # pragma: no cover - defensive
+        return 0
+
+
 _WORD_RE = re.compile(r"[a-z0-9]+")
 
 
@@ -179,13 +204,23 @@ def prefilter_card(card: dict, max_clozes: int = 1,
             cap = int(max_words)
         except (TypeError, ValueError):
             cap = MAX_FRONT_WORDS
-        n_words = front_word_count(front)
+        n_words = card_word_count(card)
         if cap > 0 and n_words > cap:
+            what = ("the text outside the clozes" if _is_one_by_one(card)
+                    else "the front")
             return Verdict(
                 FAIL, "D4",
-                f"the front is {n_words} words (limit {cap}) — cut it to the one "
+                f"{what} is {n_words} words (limit {cap}) — cut it to the one "
                 "fact being tested; move any teaching to Extra or split it into "
                 "two cards.",
+                source="prefilter",
+            )
+        if _is_one_by_one(card) and len(specs) > MAX_ONE_BY_ONE_ITEMS:
+            return Verdict(
+                FLAG, "D2",
+                f"a one-by-one list of {len(specs)} items — over "
+                f"{MAX_ONE_BY_ONE_ITEMS}, split it into separate cards or "
+                "smaller sets.",
                 source="prefilter",
             )
 
@@ -243,8 +278,13 @@ D2 — Atomicity (weight x2)
   0 = several independent facts on one note (an enumerated list), which desync under \
 spaced repetition.
   1 = two coupled but separable facts.
-  2 = one atomic idea, even if split across clozes that share the same core. Informative \
-hints on a list can rescue atomicity (treat the list as one retrieval).
+  2 = one atomic idea, even if split across clozes that share the same core.
+  CLOZE NUMBERS: {{c1}}+{{c1}} is ONE card with both blanks hidden (a pair, a range) — \
+one idea. {{c1}}+{{c2}} is TWO sibling cards; fine when each sibling, with the other \
+blank visible, is still a clean question. A list numbered c1, c2, c3… is a D2 0 (one \
+card per item, the rest of the list visible).
+  A card marked [ONE-BY-ONE] is a list whose items (all c1) are revealed one at a \
+time: score it 2 for a coherent set of 3-8 short items, 1 for a loose or over-long set.
 
 D3 — Answer precision / unambiguity (weight x2)
   0 = multiple defensible answers, or the expected shape is unclear.
@@ -258,6 +298,7 @@ fact of its own; a mechanism chain (X → so Y → so Z); a vignette the fact do
 Length under the limit does NOT rescue a two-fact front.
   1 = 18-""" + str(MAX_FRONT_WORDS) + """ words, or one clause that could be deleted without changing the answer.
   2 = about 17 words or fewer and nothing removable.
+  On a [ONE-BY-ONE] card count only the text OUTSIDE the clozes.
 
 D5 — Factual accuracy & clinical realism (HARD GATE, weight x3, binary)
   0 = inaccurate, hallucinated, implausible, or contradicts guidelines → fail regardless.
@@ -342,7 +383,8 @@ def batch_prompt(cards: list[dict]) -> str:
     blocks = []
     for i, c in enumerate(cards or []):
         front = (c.get("front") or "").strip() if isinstance(c, dict) else str(c)
-        blocks.append(f"Card {i}:\n{front}")
+        tag = " [ONE-BY-ONE]" if _is_one_by_one(c) else ""
+        blocks.append(f"Card {i}{tag}:\n{front}")
     return (
         "Grade the following cloze cards. Reply with the JSON array described.\n\n"
         + "\n\n".join(blocks)

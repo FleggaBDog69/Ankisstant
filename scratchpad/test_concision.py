@@ -178,5 +178,34 @@ check("style block lists the examples", "- A {{c1::b}}" in blk and "- C {{c1::d}
 check("style block says not to repeat them", "Do NOT repeat" in blk)
 check("no examples, no block", gen_prompt._style_block([]) == "")
 
+# ── cloze mechanics & one-by-one ────────────────────────────────────────────
+OBO = ("Causes of <b>pancreatitis</b>: {{c1::gallstones}}, {{c1::alcohol}}, "
+       "{{c1::hypertriglyceridaemia}}, {{c1::ERCP}}, {{c1::hypercalcaemia}}, "
+       "{{c1::scorpion venom}}, {{c1::mumps}}, {{c1::autoimmune disease}}, {{c1::steroids}}")
+check("one-by-one counts only the stem",
+      qp.card_word_count({"front": OBO, "one_by_one": True}) == 3)
+check("an ordinary card counts every word", qp.card_word_count({"front": OBO}) > 10)
+v = qp.prefilter_card({"front": OBO, "one_by_one": True}, 2)
+check("9-item one-by-one is flagged to split", v is not None and v.worst_dim == "D2"
+      and v.verdict == qp.FLAG)
+five = OBO.split(", {{c1::scorpion")[0]
+check("5-item one-by-one passes", qp.prefilter_card({"front": five, "one_by_one": True}, 2) is None)
+check("a long one-by-one STEM still fails",
+      qp.prefilter_card({"front": "word " * 30 + five, "one_by_one": True}, 2).worst_dim == "D4")
+check("grader is told which cards are one-by-one",
+      "Card 0 [ONE-BY-ONE]" in qp.batch_prompt([{"front": five, "one_by_one": True}]))
+check("rubric explains c1+c1 vs c1+c2", "{{c1}}+{{c1}} is ONE card" in qp.RUBRIC_TEXT)
+check("prompt explains cloze numbers", "SAME NUMBER (c1 + c1)" in cc.CARD_GEN_SYSTEM
+      and "DIFFERENT NUMBERS (c1 + c2)" in cc.CARD_GEN_SYSTEM)
+check("prompt asks for the one_by_one flag", '"one_by_one": true' in cc.CARD_GEN_SYSTEM)
+check("hints are sparing", "SPARINGLY" in cc.CARD_GEN_SYSTEM)
+check("tighten leaves a short-stem one-by-one alone",
+      cc.cards_needing_tighten([{"front": five, "one_by_one": True}]) == {})
+cc.core_api.ask_claude_json = lambda **k: {"front": "X: {{c2::a}}, {{c1::b}}", "extra": ""}
+new = cc.one_by_one_rewrite({"front": "X a b", "extra": "", "point": 2}, {})
+check("1b1 rewrite sets the flag itself", new is not None and new.get("one_by_one") is True)
+check("1b1 rewrite renumbers to c1", "{{c2::" not in new["front"])
+check("1b1 rewrite keeps the point", new.get("point") == 2)
+
 print("\nall green" if not FAILS else f"\n{len(FAILS)} FAILED")
 sys.exit(1 if FAILS else 0)

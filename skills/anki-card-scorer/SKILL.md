@@ -27,8 +27,13 @@ direction* is fine). Ignore the Extra field.
 
 - **0** — several independent facts on one note (an enumerated list).
 - **1** — two coupled but separable facts.
-- **2** — one atomic idea, even if split across clozes sharing one core. Hint syntax on a
-  list can rescue atomicity.
+- **2** — one atomic idea, even if split across clozes sharing one core.
+- **Cloze numbers:** `c1`+`c1` is one card (a pair, a range) — one idea. `c1`+`c2` is two
+  sibling cards — fine when each sibling is still a clean question with the other blank
+  visible. A list numbered `c1, c2, c3…` is D2 = 0.
+- A **one-by-one** card (all `c1`, One by one = y) is a list revealed item by item: 2 for a
+  coherent set of 3–8 short items, 1 for a loose or over-long set. For D4, count only
+  the text outside the clozes.
 
 ### D3 — Answer precision / unambiguity (×2)
 

@@ -140,6 +140,7 @@ Return ONLY a JSON array. Each element:
   {"front": "<cloze text with {{c1::...}} / {{c2::...}} etc>",
    "extra": "<optional short note, or empty string>",
    "style": "fact" | "story"}
+  …plus "one_by_one": true on a one-by-one list card (see LISTS below).
 No prose outside the JSON array. No markdown fences.
 
 THE DEFAULT CARD: ONE FACT, THE SHORTEST CUE THAT PINS IT
@@ -198,26 +199,46 @@ GIVE-AWAYS (banned — these let the answer be read off the card)
   the first.
 - GRAMMAR: "an {{c1::…}}" cues a vowel; write "a(n)" or restructure.
 
-LIST-SHAPED CONTENT ("the N X are A, B, C…", or enumeration words three/four/several):
-STOP and pick a format deliberately —
-  A) SPLIT into N cards, one per item. DEFAULT for lists of ≥5 or items with
-     independent meaning.
-  B) ONE card with HINT SYNTAX {{c1::answer::hint}} — for short lists (≤4) where the
-     gestalt "what are the X" recall matters.
-  C) ONE card without hints, accepting desync — only for fixed sequences / mnemonics.
-Never default to a multi-cloze enumeration without choosing A/B/C.
-
-CLOZE NUMBERING (commonly done wrong):
-- Separate facts each meant to be hidden on their OWN sibling card → c1, c2, c3.
-- Deletions meant to be revealed TOGETHER as one card → the SAME number.
-- When in doubt, number c1, c2, c3.
-- Split a multi-component fact into separate clozes rather than clozing a whole phrase:
+CLOZE MECHANICS — what the numbers do
+Anki makes ONE card per cloze NUMBER. {{c1::…}} {{c1::…}} is one card with both blanks
+hidden together; {{c1::…}} {{c2::…}} is two cards, each hiding one blank while the
+other stays visible as part of the cue. Choose deliberately:
+- SAME NUMBER (c1 + c1) — the bits only make sense TOGETHER: a pair, a range, both
+  halves of a ratio, a direction-plus-thing.
+    "<b>Clomiphene</b> raises both {{c1::FSH}} and {{c1::LH}}."
+    "Normal adult serum sodium is {{c1::135}}–{{c1::145}} mmol/L."
+- DIFFERENT NUMBERS (c1 + c2) — each bit is worth recalling ON ITS OWN, and the other
+  bit is a fair cue for it (it doesn't give it away):
+    "{{c1::Carbimazole}} inhibits {{c2::thyroid peroxidase}}."  (drug → target, and target → drug)
+  Check each sibling: with c1 hidden and c2 shown, is the card still a clean question?
+  Then the reverse. If either sibling leaks its answer or makes no sense, don't number
+  them separately.
+- SEPARATE NOTES — two facts that are related but neither is a fair cue for the other.
+  Write two cards.
+- Split a multi-part fact into its parts rather than clozing a whole phrase:
     CORRECT: prevents {{c1::anterior shear}} of {{c2::L5}} on {{c3::S1}}
     WRONG:   prevents {{c1::anterior shear of L5 on S1}}
+- At most 2–3 numbers on one note (one-by-one lists below are the exception).
+
+LISTS — ONE-BY-ONE OR SPLIT
+For list-shaped content ("the causes of X", criteria, features, steps, a sequence):
+- 3 TO 8 ITEMS learnt as a SET → ONE ONE-BY-ONE card. Every item is {{c1::…}} (all the
+  same number), items in the order they should be recalled, each item 1–4 words. Add
+  "one_by_one": true to the card object. The student reveals the items one at a time,
+  so one card holds the whole set without the sibling desync.
+    "Causes of <b>pancreatitis</b>: {{c1::gallstones}}, {{c1::alcohol}},
+     {{c1::hypertriglyceridaemia}}, {{c1::ERCP}}, {{c1::hypercalcaemia}}."
+  The 25-word limit counts only the STEM (the text outside the clozes) on a one-by-one
+  card; the stem should be short — a label for the set.
+- SPLIT INTO SEPARATE CARDS instead when each item carries its own fact worth testing
+  (its own mechanism, its own treatment), or the list is longer than 8.
+- 2 items → it is a pair: use the SAME-NUMBER or DIFFERENT-NUMBERS rule above.
+- Never number list items c1, c2, c3… — that makes a card per item, each with the rest
+  of the list visible as a give-away.
+A one-by-one card counts as a "fact" card for the story allowance.
 
 CLOZE FORMAT & STYLE
-- Cloze only (no Q&A). Usually ONE cloze; at most 2–3 when they are parts of one fact.
-  Short answers (1–4 words).
+- Cloze only (no Q&A). Usually ONE cloze. Short answers (1–4 words).
 - LEVEL: Year 3 Australian med student; Australian drugs/guidelines (eTG, RACGP, PBS,
   ANZCOR) and spelling.
 - Ruthless concision — no filler ("important to know that…", "remember that…"), no
@@ -295,6 +316,8 @@ TIGHTEN_SYSTEM = (
     "clinical vignette.\n"
     "- Never put the cloze answer, or a word sharing its stem, in the visible text.\n"
     "- Extra is optional: at most ~20 words, or an empty string.\n"
+    "- A card marked ONE-BY-ONE stays one card and a one-by-one list: every item "
+    "stays {{c1::…}}; shorten only the text outside the clozes.\n"
     "- Every returned card carries \"style\": \"fact\".\n\n"
     + FRONT_EMPHASIS_RULES
     + "\nOUTPUT: ONLY a JSON array, one object per input card, in order:\n"
@@ -328,9 +351,11 @@ def cards_needing_tighten(cards: list, max_words: int = MAX_FRONT_WORDS) -> dict
     for i, c in enumerate(cards):
         if not isinstance(c, dict):
             continue
-        n = qp.front_word_count(c.get("front", ""))
+        n = qp.card_word_count(c)
         if n > max_words:
-            out[i] = f"TOO LONG ({n} words, limit {max_words})"
+            out[i] = (f"TOO LONG ({n} words outside the clozes, limit {max_words})"
+                      if c.get("one_by_one") else
+                      f"TOO LONG ({n} words, limit {max_words})")
     stories = [i for i, c in enumerate(cards) if isinstance(c, dict) and _is_story(c)]
     allowance = story_allowance(len(cards))
     if len(stories) > allowance:
@@ -369,8 +394,9 @@ def tighten_cards(cards: list, profile: dict | None, model: str | None, *,
         blocks = []
         for i in sorted(todo):
             c = cards[i]
+            obo = " — ONE-BY-ONE" if c.get("one_by_one") else ""
             blocks.append(
-                f"Card {i} — {todo[i]}\nFront:\n{c.get('front', '')}\n"
+                f"Card {i}{obo} — {todo[i]}\nFront:\n{c.get('front', '')}\n"
                 f"Extra:\n{c.get('extra', '')}")
         prompt = ("Rewrite these cards. Reply with the JSON array described.\n\n"
                   + "\n\n".join(blocks))
@@ -467,7 +493,8 @@ ONE_BY_ONE_SYSTEM = (
     "- Output ONE JSON object: {\"front\": ..., \"extra\": ...}.\n"
     "- ALL cloze deletions in front must be {{c1::...}} (no c2, c3, …).\n"
     "- Order the clozes in the sequence the student should reveal them.\n"
-    "- Keep each cloze answer short (1–4 words).\n"
+    "- Keep each cloze answer short (1–4 words), and the text outside the clozes "
+    "a short label for the set (at most " + str(MAX_FRONT_WORDS) + " words).\n"
     "- Preserve the original clinical meaning; don't add new facts.\n"
     "- No prose outside the JSON object. No markdown fences.\n\n"
     + FRONT_EMPHASIS_RULES
@@ -916,9 +943,8 @@ def _gen_atomicity_note(max_clozes: int) -> str:
     return (
         f"\n\nATOMICITY BUDGET: you may place up to {n} cloze deletion(s) on one "
         f"note when the facts are genuinely coupled (e.g. one multi-component fact "
-        f"split across clozes that share a core). Prefer fewer. Only exceed {n} "
-        f"for fixed sequences or mnemonics that lose meaning if split — never for "
-        f"an enumeration of independent facts (split those into separate cards)."
+        f"split across clozes that share a core). Prefer fewer. A list is never "
+        f"c1, c2, c3… — it is a one-by-one card (all c1) or separate cards."
     )
 
 
@@ -1325,7 +1351,7 @@ def _regenerate_one(old_card: dict, hint: str, profile: dict | None,
     # Carry the slide attachment across a regeneration — the rewritten card is
     # the same fact from the same slide. Likewise the learning point it was
     # written for, so a regenerated card stays filed under its point.
-    for k in ("slide", "_slide_indices", "_slide_paths", "point"):
+    for k in ("slide", "_slide_indices", "_slide_paths", "point", "one_by_one"):
         if old_card.get(k) is not None:
             new[k] = list(old_card[k]) if isinstance(old_card[k], list) else old_card[k]
     return new
@@ -4989,6 +5015,14 @@ def one_by_one_rewrite(old_card: dict, profile: dict) -> dict | None:
     ensure_front_emphasis([new], *bolded_terms(old_card.get("front", "")))
     if old_card.get("_image_paths"):
         new["_image_paths"] = list(old_card["_image_paths"])
+    # The flag that makes set_fields write 'y' to the One by one field. Set
+    # HERE, not by the caller: AI Create's row used to add it after the call,
+    # but Work through and Mass Create call this too and never did — their
+    # rewritten card committed as plain sibling clozes with the field empty.
+    new["one_by_one"] = True
+    for k in ("slide", "_slide_indices", "_slide_paths", "point"):
+        if old_card.get(k) is not None:
+            new[k] = old_card[k]
     return new
 
 
