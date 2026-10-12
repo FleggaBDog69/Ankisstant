@@ -463,7 +463,7 @@ class GapAnalyserPanel(QWidget):
         if not added:
             return
         if not askUser(
-            f"Work through the {len(added)} new gap(s) now?\n\n"
+            f"Find & write the {len(added)} new gap(s) now?\n\n"
             "This searches your deck for each one and writes cards only for "
             "what nothing covers. You review everything before it commits.\n\n"
             "Say no and they just sit on the Knowledge Gaps page.",

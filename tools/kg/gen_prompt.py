@@ -136,14 +136,28 @@ def _style_block(examples: list) -> str:
     )
 
 
+SOURCE_KEY_INSTRUCTION = (
+    "\n\nSOURCE CITATION\n"
+    "Add a \"source\" key to every card object: the guideline from the "
+    "allow-list below that the card's fact comes from, in the citation format "
+    "given there (name – URL). Use \"\" when none of them covers the card. "
+    "Never invent a URL, and never put the citation in the front or extra."
+)
+
+
 def build_generation_request(*, kg: dict, plan, profile: dict, cfg: dict,
-                             focus: str = "", n_cards: int | None = None):
+                             focus: str = "", n_cards: int | None = None,
+                             grounding: bool | None = None,
+                             auto_image: bool | None = None):
     """Assemble one gap's generation request.
 
     Returns a dict of everything the job record needs — the two prompts plus the
     merge/want flags that tell the worker how to route the reply. Mirrors
     CreatorPanel._on_generate's topic-mode branch (card_creator.py:2669-2827);
     see the module docstring for what's deliberately absent.
+
+    `grounding` / `auto_image` are the run's own toggles (the work-through's
+    plan page). None means "follow Settings", as before.
     """
     from .. import card_creator as cc
 
@@ -170,6 +184,11 @@ def build_generation_request(*, kg: dict, plan, profile: dict, cfg: dict,
     system_prompt = cc._augment_system(base_system, profile)
     if not is_qa:
         system_prompt += cc._gen_atomicity_note(cc._atomicity_max(cfg))
+    # Auto-image: the model flags the cards a real picture would help with an
+    # `image_query`, and the review screen fetches suggestions for exactly
+    # those. The same instruction AI Create appends.
+    if auto_image:
+        system_prompt += cc.IMAGE_QUERY_INSTRUCTION
 
     # ── source grounding ────────────────────────────────────────────────────
     # The same gate AI Create uses: the global toggle, overridden per notetype.
@@ -180,7 +199,16 @@ def build_generation_request(*, kg: dict, plan, profile: dict, cfg: dict,
     # ungrounded card, not a gap that doesn't get written at all.
     grounding_live = None
     try:
-        if cc._grounding_active(cfg, profile, "topic") and topic_label:
+        ground = (cc._grounding_active(cfg, profile, "topic")
+                  if grounding is None else bool(grounding))
+        if ground and topic_label and not is_qa:
+            # The cloze schema has no citation slot (the Q&A one does), so a
+            # grounded cloze card used to be held to the allow-list and then
+            # had nowhere to SAY which guideline it used. card_creator.set_fields
+            # already files a card's "source" into the notetype's sources
+            # field, and the work-through's card panel shows it.
+            system_prompt += SOURCE_KEY_INSTRUCTION
+        if ground and topic_label:
             # The gap's own tags are the specialty signal — the same list the
             # panel passes from its tag box.
             match_tags = [str(t) for t in (kg.get("tags") or []) if str(t).strip()]
@@ -374,7 +402,8 @@ def build_job_record(*, req: dict, kg: dict, plan, batch_id: str,
 def build_batch(*, plans, gaps_by_id: dict, deck_name: str, notetype_name: str,
                 base_tags: list[str], tags_by_kg: dict, model: str | None,
                 focus: str = "", origin: str = "mass-create",
-                batch_id: str = "") -> list[dict]:
+                batch_id: str = "", grounding: bool | None = None,
+                auto_image: bool | None = None) -> list[dict]:
     """Every included, runnable plan turned into a job record.
 
     Fail-soft per gap: one gap whose prompt can't be built (a broken KG type, a
@@ -398,7 +427,9 @@ def build_batch(*, plans, gaps_by_id: dict, deck_name: str, notetype_name: str,
             continue
         try:
             req = build_generation_request(kg=kg, plan=plan, profile=profile,
-                                           cfg=cfg, focus=focus)
+                                           cfg=cfg, focus=focus,
+                                           grounding=grounding,
+                                           auto_image=auto_image)
             tags = _merge_tags(base_tags, tags_by_kg.get(plan.kg_id), kg)
             rec = build_job_record(
                 req=req, kg=kg, plan=plan, batch_id=batch_id,

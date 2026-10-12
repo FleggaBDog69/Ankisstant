@@ -923,6 +923,14 @@ def _plan_from_obj(obj: dict, kg: dict, *,
     # facts. A budget the USER set (a lock) is theirs and is left alone.
     if creating and plan.points and not lock.get("cards"):
         plan.cards = clamp_cards(max(plan.cards, len(plan.points)))
+    # ...and ONE CARD PER POINT is the ceiling when searching. A point is a
+    # single fact, so a second card for it is a second card testing the same
+    # fact — which is where the "always cut it by a third" overshoot came from:
+    # the model sized a focused gap at 5 cards and then decomposed it into 3
+    # points. The decomposition is the better-grounded number of the two, so
+    # it wins. A budget the user set is still theirs.
+    if not creating and plan.points and not lock.get("cards"):
+        plan.cards = clamp_cards(min(plan.cards, len(plan.points)))
     if not plan.points:
         plan.confidence = "low"
         plan.note = plan.note or (

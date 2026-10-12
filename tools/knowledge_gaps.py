@@ -1872,20 +1872,18 @@ class KGDetailPane(QWidget):
         # one on screen.
         # One button, one verb.
         #
-        # Work through already IS search-and-create: it looks for the gap in
-        # your deck and writes cards for whatever nothing covered. Standing AI
-        # Browse and AI Create beside it as equal buttons made three ways to
-        # start the same job and invited you to pick a half by accident. They
-        # are still here — under the ▾, named "only", where picking one is a
-        # deliberate narrowing rather than the default.
-        self._work_btn = QPushButton("⚡ Work through")
+        # The queue IS search-and-create: Find & write looks for the gap in
+        # your deck and writes cards for whatever nothing covered. Find-only or
+        # write-only is a per-gap tick on the Find & write plan page, so there
+        # is no separate AI Browse / AI Create door any more.
+        self._work_btn = QPushButton("Send to queue")
         self._work_btn.setAutoDefault(False)
         self._work_btn.setToolTip(
-            "Park this on the work-through queue. It waits there — send as "
-            "many as you like, from either page — until you press the "
-            "bottom-right button, which works through the lot in one pass, "
-            "then empties.\n\nRight-click a gap to take it back off the "
-            "queue.")
+            "Park this on the queue. It waits there — send as many as you "
+            "like, from either page — until you press ▶ Run queue in the "
+            "bottom right, which finds and writes cards for the lot in one "
+            "pass, then empties.\n\nRight-click a gap to take it back off "
+            "the queue.")
         self._work_btn.clicked.connect(self._queue_work_through)
         actions_row.addWidget(self._work_btn)
 
@@ -1899,21 +1897,9 @@ class KGDetailPane(QWidget):
         self._work_menu_btn.setStyleSheet(
             "QPushButton::menu-indicator { image: none; width: 0px; }")
         self._work_menu_btn.setToolTip(
-            "Send one half only — or run the whole pass now, without queueing "
-            "it.")
+            "Run Find & write on this now, without queueing it.")
         _wm = QMenu(self._work_menu_btn)
-        self._create_btn = _wm.addAction("＋ AI Create only")
-        self._create_btn.setToolTip(
-            "Skip the search. Sends this gap to AI Create with its notes "
-            "attached and lets the AI write the card.")
-        self._create_btn.triggered.connect(self._send_to_create)
-        self._browse_btn = _wm.addAction("🔍 AI Browse only")
-        self._browse_btn.setToolTip(
-            "Skip the writing. Sends this gap to AI Browse to find what your "
-            "deck already has.")
-        self._browse_btn.triggered.connect(self._send_to_browse)
-        _wm.addSeparator()
-        self._work_now_act = _wm.addAction("⚡ Work through now — skip the queue")
+        self._work_now_act = _wm.addAction("Find & write now — skip the queue")
         self._work_now_act.setToolTip(
             "Open the unified pass on this selection straight away, without "
             "parking it first.")
@@ -2434,17 +2420,13 @@ class KGDetailPane(QWidget):
         though they did, and for a long time they didn't."""
         many = n > 1
         if many:
-            self._work_btn.setText(f"⚡ Work through {n} gaps")
-            self._browse_btn.setText(f"🔍 AI Browse only ({n} gaps)")
-            self._create_btn.setText(f"＋ AI Create only ({n} gaps)")
+            self._work_btn.setText(f"Send {n} gaps to queue")
             self._work_now_act.setText(
-                f"⚡ Work through {n} gaps now — skip the queue")
+                f"Find & write {n} gaps now — skip the queue")
             self._own_btn.setText(f"✎ Write my own for {n} gaps")
         else:
-            self._work_btn.setText("⚡ Work through")
-            self._browse_btn.setText("🔍 AI Browse only")
-            self._create_btn.setText("＋ AI Create only")
-            self._work_now_act.setText("⚡ Work through now — skip the queue")
+            self._work_btn.setText("Send to queue")
+            self._work_now_act.setText("Find & write now — skip the queue")
             self._own_btn.setText("✎ Write my own card")
         # The two Browse doors search ONE title, so they say so when the
         # selection is bigger than one rather than implying they'll do the lot.
@@ -2506,19 +2488,6 @@ class KGDetailPane(QWidget):
             tooltip("Pick a gap first.")
             return
         open_anki_browse(str(kg.get("title") or ""), as_tag=as_tag)
-
-    def _send_to_browse(self) -> None:
-        # Persist local edits first so the handoff carries fresh data.
-        self.flush()
-        ids = self._send_ids()
-        if ids:
-            self._parent_panel._bulk_send_to_browse(ids)
-
-    def _send_to_create(self) -> None:
-        self.flush()
-        ids = self._send_ids()
-        if ids:
-            self._parent_panel._bulk_send_to_create(ids)
 
     def _write_own_card(self) -> None:
         """No AI: type the card yourself, in Anki's own Add window.
@@ -2822,8 +2791,7 @@ class _BulkImportDialog(QDialog):
         self._use_groups.setChecked(True)
         self._use_groups.setToolTip(
             "A markdown heading, or a Things project, becomes the gap's group "
-            "— the unit Bulk search, Mass AI Create and the tag tree all work "
-            "on. Untick to import everything ungrouped.")
+            "— the unit the queue and the tag tree both work on. Untick to import everything ungrouped.")
         self._use_groups.stateChanged.connect(lambda _s: self._fill_table())
         opt.addWidget(self._use_groups)
 
@@ -3244,21 +3212,19 @@ class _GroupsView(QWidget):
             Qt.TextInteractionFlag.TextSelectableByMouse)
         rcol.addWidget(self._meta)
 
-        # The same condensing as the gap pane, for the same reason: Bulk
-        # search and Mass AI Create were the two halves of Work through
-        # standing next to it as rivals. One button sends the group to the
-        # queue; the ▾ holds the halves for when you want only one.
+        # The same as the gap pane: one button sends the group to the queue,
+        # and the ▾ runs it straight away instead.
         self._buttons: dict[str, QPushButton] = {}
         run_row = QHBoxLayout()
         run_row.setSpacing(4)
-        b = QPushButton("⚡ Work through…")
+        b = QPushButton("Send to queue")
         b.setAutoDefault(False)
         b.setToolTip(
-            "Park this group's open gaps on the work-through queue. They wait "
-            "there — add as many groups as you like — until you press the "
-            "bottom-right button, which works through the lot in one pass, "
-            "then empties.\n\nRight-click a gap to take it back off the "
-            "queue.")
+            "Park this group's open gaps on the queue. They wait there — add "
+            "as many groups as you like — until you press ▶ Run queue in the "
+            "bottom right, which finds and writes cards for the lot in one "
+            "pass, then empties.\n\nRight-click a gap to take it back off "
+            "the queue.")
         self._buttons["work"] = b
         run_row.addWidget(b)
 
@@ -3268,15 +3234,9 @@ class _GroupsView(QWidget):
         self._work_menu_btn.setStyleSheet(
             "QPushButton::menu-indicator { image: none; width: 0px; }")
         self._work_menu_btn.setToolTip(
-            "Send one half only — or run the whole pass now, without queueing "
-            "it.")
+            "Run Find & write on this group now, without queueing it.")
         _gm = QMenu(self._work_menu_btn)
-        _gm.addAction("＋ AI Create only",
-                      lambda: self._run(panel._bulk_send_to_create))
-        _gm.addAction("🔍 AI Browse only",
-                      lambda: self._run(panel._bulk_send_to_browse))
-        _gm.addSeparator()
-        _gm.addAction("⚡ Work through now — skip the queue",
+        _gm.addAction("Find & write now — skip the queue",
                       lambda: self._run(panel._work_through_now))
         self._work_menu_btn.setMenu(_gm)
         run_row.addWidget(self._work_menu_btn)
@@ -3481,7 +3441,7 @@ class _GroupsView(QWidget):
             self._gaps_lbl.setText("")
             self._gaps.clear()
             self._after_gap_ticks()
-            self._buttons["work"].setText("⚡ Work through…")
+            self._buttons["work"].setText("Send to queue")
             for k in ("rename", "retag", "archive"):
                 self._buttons[k].setEnabled(False)
             return
@@ -3567,11 +3527,11 @@ class _GroupsView(QWidget):
         if open_n:
             self._buttons["work"].setEnabled(True)
             self._work_menu_btn.setEnabled(True)
-            self._buttons["work"].setText(f"⚡ Work through {open_n} gap(s)…")
+            self._buttons["work"].setText(f"Send {open_n} gap(s) to queue")
         else:
             self._buttons["work"].setEnabled(False)
             self._work_menu_btn.setEnabled(False)
-            self._buttons["work"].setText("⚡ Work through — all Closed")
+            self._buttons["work"].setText("Send to queue — all Closed")
 
         # Rebuilt with signals off, then _on_gap_select is called ONCE at the
         # end: clearing a list emits a selection change per row, and each one
@@ -3762,6 +3722,78 @@ class KnowledgeGapsPanel(QWidget):
         self._filter = "open"
         self._build()
         self.refresh_list()
+        # Groups first: it's the page you work from, and the gap list is a
+        # click away.
+        self._set_view("groups")
+
+    def _build_corner(self, row) -> None:
+        """The rest of Ankisstant, small, in the top-right corner.
+
+        There is no sidebar any more: this page IS Ankisstant, and the other
+        pages are places you visit and come back from (each has a ← Gaps link).
+        AI Browse and AI Create are gone as pages — the queue does both."""
+        css = ("QPushButton { padding: 3px 10px; font-size: 11px; "
+               "border: 1px solid rgba(127,127,127,0.3); border-radius: 5px; "
+               "background: transparent; }"
+               "QPushButton:hover { background: rgba(127,127,127,0.12); }")
+        try:
+            from ..ui.main_window import _tool_visible
+        except Exception:
+            def _tool_visible(_k):
+                return True
+        row.addSpacing(10)
+        for key, text, tip in (
+            ("lecture", "AI Lecture",
+             "Find & write from a lecture, a document, screenshots, pasted "
+             "text or a web page — sections instead of gaps, with the slides "
+             "attached to the cards."),
+            ("qbank", "AI QBank", "Question banks and captured misses."),
+        ):
+            if not _tool_visible(key):
+                continue
+            b = QPushButton(text)
+            b.setAutoDefault(False)
+            b.setToolTip(tip)
+            b.setStyleSheet(css)
+            b.clicked.connect(lambda _c=False, k=key: self._open_page(k))
+            row.addWidget(b)
+        gear = QPushButton("Settings")
+        gear.setAutoDefault(False)
+        gear.setToolTip("Ankisstant settings")
+        gear.setStyleSheet(css)
+        gear.clicked.connect(self._open_settings)
+        row.addWidget(gear)
+        try:
+            from ..core import synapse as _syn
+            dockable = _syn.synapse_available()
+        except Exception:
+            dockable = False
+        if dockable:
+            dock = QPushButton("⧉")
+            dock.setAutoDefault(False)
+            dock.setToolTip("Move between SynapsePro's side panel and a window "
+                            "of its own.")
+            dock.setStyleSheet(css)
+            dock.clicked.connect(self._toggle_dock)
+            row.addWidget(dock)
+
+    def _open_page(self, key: str) -> None:
+        body = _queue_owner(self)
+        if body is not None and hasattr(body, "show_page"):
+            body.show_page(key)
+
+    def _open_settings(self) -> None:
+        body = _queue_owner(self)
+        if body is not None and hasattr(body, "_open_settings"):
+            body._open_settings()
+            return
+        from ..ui.settings import open_settings
+        open_settings()
+
+    def _toggle_dock(self) -> None:
+        body = _queue_owner(self)
+        if body is not None and hasattr(body, "_request_popout"):
+            body._request_popout()
 
     def showEvent(self, ev):
         super().showEvent(ev)
@@ -3838,16 +3870,18 @@ class KnowledgeGapsPanel(QWidget):
             "run, Cmd-click to add one, or press <i>Select all</i>. Cmd-click a "
             "group header to act on the whole group. The <b>tick box</b> is not "
             "the selection: ticking a gap CLOSES it, which is also what a "
-            "finished work-through pass does to it.</li>"
-            "<li>Press <b>⚡ Work through</b> to park them on the queue. Send "
-            "as many as you like, from either page; they wait there, and they "
-            "survive quitting Anki.</li>"
-            "<li>Press the <b>bottom-right</b> button to work through the "
-            "whole queue in one pass — your deck is searched for each gap AND "
-            "cards are written for whatever nothing covers. Right-click it to "
-            "clear the queue instead. The <b>▾</b> beside Work through has "
-            "<i>AI Create only</i> and <i>AI Browse only</i> if you want just "
-            "one half.</li>"
+            "finished Find & write pass does to it.</li>"
+            "<li>Press <b>Send to queue</b> to park them. Send as many as you "
+            "like, from either page; they wait there, and they survive "
+            "quitting Anki.</li>"
+            "<li>Press <b>▶ Run queue</b> (bottom right) to Find &amp; write "
+            "the whole queue in one pass — your deck is searched for each gap "
+            "AND cards are written for whatever nothing covers. Want only one "
+            "half? Untick Find or Write for that gap on the plan page. "
+            "Right-click ▶ Run queue to clear the queue instead.</li>"
+            "<li><b>AI Lecture</b> (top right) takes a lecture, a document, "
+            "screenshots, pasted text or a web page and runs it through the "
+            "same Find &amp; write screen.</li>"
             "<li>The <b>🏷</b> and <b>🔎</b> buttons open Anki's own Browse "
             "screen on the gap's title — as a tag search and a card search.</li>"
             "<li>For <b>LO</b>-type KGs, the detail pane shows an inline "
@@ -3859,12 +3893,13 @@ class KnowledgeGapsPanel(QWidget):
             "</ol>",
             self,
         ))
+        self._build_corner(title_row)
         root.addLayout(title_row)
 
         intro = QLabel(
-            "Every gap from every source. Tick the ones you want, press ⚡ Work "
-            "through to park them, then work through the lot with the button "
-            "in the bottom right."
+            "Every gap from every source. Pick the ones you want, press Send "
+            "to queue to park them, then press ▶ Run queue in the bottom "
+            "right."
         )
         intro.setStyleSheet("color: gray; font-size: 11px;")
         intro.setWordWrap(True)
@@ -4088,7 +4123,7 @@ class KnowledgeGapsPanel(QWidget):
         # everything you've parked, and pressing it works through the lot.
         queue_row = QHBoxLayout()
         queue_row.addStretch(1)
-        self._work_queue_btn = QPushButton("⚡ Work through queue")
+        self._work_queue_btn = QPushButton("▶ Run queue")
         self._work_queue_btn.setAutoDefault(False)
         self._work_queue_btn.setMinimumHeight(30)
         self._work_queue_btn.setStyleSheet(
@@ -5259,18 +5294,17 @@ class KnowledgeGapsPanel(QWidget):
         # The unified pass. First in the menu because it is the one that ends
         # with the gap actually closed: search and create were always two halves
         # of one question ("is this in my deck, and if not, write it").
-        work = menu.addAction(f"⚡ Work through {label}",
+        work = menu.addAction(f"Send {label} to queue",
                               lambda: self._queue_work_through(ids))
         work.setToolTip(
-            "Park these on the work-through queue. They wait there until you "
-            "press the bottom-right button, which works through the lot in "
-            "one pass: your deck is searched for every point, cards are "
-            "written for the points nothing covered, and one button adds both "
-            "in one undoable step."
+            "Park these on the queue. They wait there until you press ▶ Run "
+            "queue, which does the lot in one pass: your deck is searched for "
+            "every point, cards are written for the points nothing covered, "
+            "and one button adds both in one undoable step."
         )
-        now = menu.addAction(f"⚡ Work through {label} now…",
+        now = menu.addAction(f"Find & write {label} now…",
                              lambda: self._work_through_now(ids))
-        now.setToolTip("Open the unified pass on these straight away, without "
+        now.setToolTip("Open Find & write on these straight away, without "
                        "parking them first.")
         # Only when there is something to take off — an always-there entry that
         # is usually a no-op reads as a second queue button.
@@ -5282,7 +5316,7 @@ class KnowledgeGapsPanel(QWidget):
                 " off the queue",
                 lambda: self._unqueue_work_through(queued))
             off.setToolTip(
-                "Un-send: these stop waiting for the bottom-right button. The "
+                "Un-send: these stop waiting for ▶ Run queue. The "
                 "gaps are not changed — they stay exactly as they are in the "
                 "list.")
         menu.addSeparator()
@@ -5293,11 +5327,6 @@ class KnowledgeGapsPanel(QWidget):
             "The group adds one level to their auto-tag, so the whole batch "
             "ends up as one branch of your tag tree."
         )
-        menu.addSeparator()
-        menu.addAction(f"＋ AI Create only — {label}",
-                       lambda: self._bulk_send_to_create(ids))
-        menu.addAction(f"🔍 AI Browse only — {label}",
-                       lambda: self._bulk_send_to_browse(ids))
         menu.addSeparator()
         # Anki's own Browse, on the gap you right-clicked. One title, not six —
         # see open_anki_browse.
@@ -5399,28 +5428,23 @@ class KnowledgeGapsPanel(QWidget):
             skipped = menu.addAction(f"All {n} gap(s) are Closed — nothing to run")
             skipped.setEnabled(False)
         else:
-            work = menu.addAction(f"⚡ Work through {label} ({m}){done_note}…",
+            work = menu.addAction(f"Send {label} ({m}){done_note} to queue",
                                   lambda: self._queue_work_through(live))
             work.setToolTip(
-                "Park these on the work-through queue. They wait there until "
-                "you press the bottom-right button, which works through the "
-                "lot in one pass: your deck is searched for every point, "
+                "Park these on the queue. They wait there until you press "
+                "▶ Run queue, which does the lot in one pass: your deck is "
+                "searched for every point, "
                 "cards are written for the points nothing covered, and one "
                 "button adds both in one undoable step."
                 + ("\n\nGaps already Closed are left out." if done_note else "")
             )
-            menu.addAction(f"⚡ Work through {label} ({m}){done_note} now…",
+            menu.addAction(f"Find & write {label} ({m}){done_note} now…",
                            lambda: self._work_through_now(live))
             on_queue = self._queued_set()
             queued = [i for i in ids if i in on_queue]
             if queued:
                 menu.addAction(f"Take {len(queued)} off the queue",
                                lambda: self._unqueue_work_through(queued))
-            menu.addSeparator()
-            menu.addAction(f"＋ AI Create only — {label} ({m})",
-                           lambda: self._bulk_send_to_create(live))
-            menu.addAction(f"🔍 AI Browse only — {label} ({m})",
-                           lambda: self._bulk_send_to_browse(live))
         menu.addSeparator()
         menu.addAction(f"Regroup {label} ({n})…",
                        lambda: self._assign_group(ids))
@@ -5597,8 +5621,8 @@ class KnowledgeGapsPanel(QWidget):
             bits.append(f"{skipped} skipped as Closed")
         total = work_queue.count()
         tooltip("   ·   ".join(bits)
-                + f" — {total} on the queue. Work through the lot with the "
-                  "button in the bottom right.")
+                + f" — {total} on the queue. Press ▶ Run queue when you're "
+                  "ready.")
 
     def _unqueue_work_through(self, ids: list[str]) -> None:
         """Take these off the queue. The gaps themselves are untouched — this
@@ -5635,13 +5659,12 @@ class KnowledgeGapsPanel(QWidget):
         except Exception as e:
             print(f"[ankisstant] work queue count failed: {e}")
             return
-        btn.setText(f"⚡ Work through queue  ({n})" if n
-                    else "⚡ Work through queue")
+        btn.setText(f"▶ Run queue  ({n})" if n else "▶ Run queue")
         btn.setEnabled(bool(n))
         btn.setToolTip(
-            "Nothing waiting yet — tick gaps and press ⚡ Work through to "
+            "Nothing waiting yet — pick gaps and press Send to queue to "
             "park them here." if not n else
-            f"Work through all {n} queued gap(s) now, in one pass.\n\n"
+            f"Find & write all {n} queued gap(s) now, in one pass.\n\n"
             "The queue empties as that window opens — this is the sitting. "
             "Gaps you don't run stay Open in the list; re-tick them to queue "
             "them again.\n\nRight-click for the queue's housekeeping."
@@ -5668,7 +5691,7 @@ class KnowledgeGapsPanel(QWidget):
         from .kg import work_queue
         ids = work_queue.ids()
         if not ids:
-            tooltip("Nothing queued yet — tick gaps and press ⚡ Work through "
+            tooltip("Nothing queued yet — pick gaps and press Send to queue "
                     "to park them here.")
             return
         self._work_through_now(ids)
@@ -5679,7 +5702,7 @@ class KnowledgeGapsPanel(QWidget):
         from .kg import work_queue
         n = work_queue.count()
         menu = QMenu(self._work_queue_btn)
-        run = menu.addAction(f"⚡ Work through all {n} now…",
+        run = menu.addAction(f"Find & write all {n} now…",
                              self._run_work_queue)
         run.setEnabled(bool(n))
         menu.addSeparator()
@@ -5717,7 +5740,7 @@ class KnowledgeGapsPanel(QWidget):
         else:
             n = work_queue.count()
             if n and not askUser(
-                    f"Take all {n} gap(s) off the work-through queue?\n\n"
+                    f"Take all {n} gap(s) off the queue?\n\n"
                     "The gaps themselves are untouched.", parent=self):
                 return
             work_queue.clear()
@@ -5741,7 +5764,7 @@ class KnowledgeGapsPanel(QWidget):
             from .kg.bulk_search import open_unified
         except Exception as e:
             print(f"[ankisstant] unified pass unavailable: {e}")
-            showWarning(f"Couldn't open the unified pass:\n\n{e}")
+            showWarning(f"Couldn't open Find & write:\n\n{e}")
             return None
         kgs = [kg for kg in (kg_store.get(i) for i in ids) if kg]
         if not kgs:
@@ -5803,24 +5826,6 @@ class KnowledgeGapsPanel(QWidget):
         tooltip(f"Work queue cleared ({n} gap(s)) — this is the sitting. Any "
                 "you don't run stay Open in the list.")
 
-    def _mass_create(self, ids: list[str]) -> None:
-        """Open the mass-create dialog on this selection. Deliberately does NOT
-        touch the Create queue: this is a terminal path (plan → generate →
-        review → done), and queueing the same gaps as well would leave them
-        waiting to be generated a second time. "Send to Create" is still there
-        for the one-at-a-time flow."""
-        try:
-            from .kg.mass_create import open_mass_create
-        except Exception as e:
-            print(f"[ankisstant] mass create unavailable: {e}")
-            showWarning(f"Couldn't open Mass AI Create:\n\n{e}")
-            return
-        kgs = [kg for kg in (kg_store.get(i) for i in ids) if kg]
-        if not kgs:
-            tooltip("Those gaps are no longer in the list.")
-            return
-        open_mass_create(kgs, parent=self.window())
-
     def _mark_in_progress(self, ids: list[str]) -> None:
         """A gap that's been handed to a tool is no longer untouched. Only Open
         gaps move — sending a Done one somewhere doesn't reopen it."""
@@ -5831,79 +5836,6 @@ class KnowledgeGapsPanel(QWidget):
                     kg_store.update(kid, status="in_progress")
             except Exception as e:
                 print(f"[ankisstant] couldn't mark {kid} in progress: {e}")
-
-    def _bulk_send_to_create(self, ids: list[str]) -> None:
-        main = _queue_owner(self)
-        if main is None:
-            showWarning("Open the KG page from Tools → Ankisstant first.")
-            return
-        sent: list[str] = []
-        for kid in ids:
-            kg = kg_store.get(kid)
-            if not kg:
-                continue
-            stem_html = kg_store.field(kg, "stem_html")
-            # concept rides separately (leads the Missed Questions field), so
-            # keep it out of notes to avoid duplicating it on the card.
-            notes_bits = [kg_store.field(kg, k) for k in ("notes", "lo")]
-            notes_bits = [b for b in notes_bits if b]
-            images = (kg.get("fields") or {}).get("images") or []
-            main.gap_queue.append({
-                "title":       kg.get("title", ""),
-                "kg_id":       kg.get("id", ""),
-                "stem_html":   stem_html or None,
-                "notes":       "\n\n".join(notes_bits) or None,
-                "concept":     kg_store.field(kg, "concept") or "",
-                "explanation": kg_store.field(kg, "explanation") or "",
-                "images":      list(images),
-                "kg_type":     (kg.get("type") or "").lower(),
-                "group":       str(kg.get("group") or "").strip(),
-                "tags":        [t for t in (kg.get("tags") or []) if t],
-                "resources":   list(kg.get("resources") or []),
-            })
-            sent.append(kid)
-        if hasattr(main, "refresh_queue_badge"):
-            main.refresh_queue_badge()
-        # Deliberately NOT switching tabs: queueing is a filing action, and
-        # being thrown onto another screen mid-triage is what made working
-        # through a list of gaps painful. The nav badge is the feedback, and
-        # the Create panel's own queue view is refreshed in place.
-        if hasattr(main, "refresh_tool_queue"):
-            main.refresh_tool_queue("card_creator")
-        self._mark_in_progress(sent)
-        tooltip(f"Queued {len(sent)} gap(s) for AI Create — see the AI Create "
-                "badge in the sidebar.")
-        self.refresh_list()
-
-    def _bulk_send_to_browse(self, ids: list[str]) -> None:
-        main = _queue_owner(self)
-        if main is None or not hasattr(main, "browse_queue"):
-            showWarning("Open the KG page from Tools → Ankisstant first.")
-            return
-        existing = {q.get("id") for q in main.browse_queue if isinstance(q, dict)}
-        sent: list[str] = []
-        already = 0
-        for kid in ids:
-            if kid in existing:
-                already += 1
-                continue
-            kg = kg_store.get(kid)
-            if not kg:
-                continue
-            main.browse_queue.append(kg)
-            existing.add(kid)
-            sent.append(kid)
-        if hasattr(main, "refresh_queue_badge"):
-            main.refresh_queue_badge()
-        # No tab switch — see _bulk_send_to_create.
-        if hasattr(main, "refresh_tool_queue"):
-            main.refresh_tool_queue("browse")
-        self._mark_in_progress(sent)
-        msg = f"Queued {len(sent)} KG(s) for AI Browse — see the AI Browse badge."
-        if already:
-            msg += f" {already} was already in that queue."
-        tooltip(msg)
-        self.refresh_list()
 
     # ── add / analyse ────────────────────────────────────────────────────────
 

@@ -168,6 +168,17 @@ def _on_profile_loaded() -> None:
     except Exception as e:
         log.error(f"kg patch inbox failed: {e}")
 
+    # Written cards from a Find & write window that is no longer open. Run
+    # here rather than in a tool's init: AI Create, which used to own this
+    # store's startup pass, no longer has a page.
+    try:
+        from .tools import create_jobs as _create_jobs
+        dropped = _create_jobs.drop_work_through_leftovers()
+        if dropped:
+            log.info(f"discarded {dropped} unapplied Find & write job(s)")
+    except Exception as e:
+        log.error(f"find & write leftover cleanup failed: {e}")
+
     for key, module in TOOLS:
         if not tool_enabled(key):
             continue

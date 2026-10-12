@@ -268,7 +268,7 @@ def separator() -> QFrame:
 def open_run(records: list, *, plans=None, matches=None, coverage=None,
              door: str = "", title: str = "", parent=None,
              on_committed=None, unified: bool = True, adopt_batch: str = "",
-             source: str = ""):
+             source: str = "", lecture=None):
     """Open the shared run view on whatever this door has already produced.
 
     Four ways in, and the door picks by how much it has done already:
@@ -292,18 +292,25 @@ def open_run(records: list, *, plans=None, matches=None, coverage=None,
     slide images there. `created` is {item_id: [(nid, card), ...]} so the door
     can act on the specific cards it just wrote. Anything it does is covered
     by the same Ctrl+Z.
+
+    `lecture` (a lecture.door.LectureRun) opens the view on a lecture that has
+    not been read yet: READ, APPROVE and FIND all run here, and `records` may
+    be empty — the run supplies its own.
     """
     from .kg.bulk_search import BulkSearchDialog
     from aqt.utils import tooltip
 
     records = [r for r in (records or []) if isinstance(r, dict)]
+    if lecture is not None and not records:
+        records = [lecture.record()]
     if not records:
-        tooltip("Nothing to work through.")
+        tooltip("Nothing to run.")
         return None
     dlg = BulkSearchDialog(records, parent=parent, unified=unified,
                            plans=plans, matches=matches, coverage=coverage,
                            door=door, title=title, on_committed=on_committed,
-                           adopt_batch=adopt_batch, source=source)
+                           adopt_batch=adopt_batch, source=source,
+                           lecture=lecture)
     dlg.show()
     dlg.raise_()
     dlg.activateWindow()

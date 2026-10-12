@@ -51,7 +51,7 @@ from aqt import mw
 from aqt.qt import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QEvent,
     QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QMenu, QMessageBox, QPlainTextEdit,
+    QHeaderView, QLabel, QLineEdit, QMenu, QPlainTextEdit,
     QProgressBar,
     QPushButton, QRect, QSpinBox, QStackedWidget, QStyledItemDelegate, Qt,
     QTableWidget, QTableWidgetItem, QTextCursor,
@@ -70,6 +70,8 @@ from .. import autotag
 from . import store as kg_store, triage as kg_triage
 from .. import commit
 from .. import pipeline
+from ..lecture.door import LectureDoorMixin
+from .card_pane import CardPaneMixin
 
 
 # How many judge-approved-but-not-chosen cards to offer per point, under the
@@ -100,6 +102,32 @@ class _AllPoints:
 
     def __init__(self, point):
         self.point = point
+
+
+def split_budget(wants: list, total: int) -> dict:
+    """Share `total` cards across [(key, wanted)] in order, never giving a key
+    more than it wants. Largest-remainder proportional, so one big section
+    can't starve the rest; ties go to the earlier key (teaching order)."""
+    wants = [(k, max(0, int(n))) for k, n in wants]
+    need = sum(n for _k, n in wants)
+    total = max(0, int(total))
+    if need <= total:
+        return {k: n for k, n in wants}
+    if not need:
+        return {k: 0 for k, _n in wants}
+    shares = [(k, n, n * total / need) for k, n in wants]
+    out = {k: min(n, int(sh)) for k, n, sh in shares}
+    left = total - sum(out.values())
+    order = sorted(range(len(shares)),
+                   key=lambda i: (-(shares[i][2] - int(shares[i][2])), i))
+    for i in order:
+        if left <= 0:
+            break
+        k, n, _sh = shares[i]
+        if out[k] < n:
+            out[k] += 1
+            left -= 1
+    return out
 
 
 def create_record_for(kg: dict, concept: str, points: list[dict],
@@ -372,7 +400,7 @@ class _ProseDelegate(QStyledItemDelegate):
         return super().eventFilter(obj, ev)
 
 
-class BulkSearchDialog(QDialog):
+class BulkSearchDialog(CardPaneMixin, LectureDoorMixin, QDialog):
     """Read a batch of gaps → search the deck for all of them → commit per gap."""
 
     # Roles on the tree items, so the commit walk can tell the three row kinds
@@ -387,8 +415,13 @@ class BulkSearchDialog(QDialog):
     def __init__(self, kgs: list[dict], parent=None, *, unified: bool = False,
                  plans=None, matches=None, coverage=None, door: str = "",
                  title: str = "", on_committed=None, adopt_batch: str = "",
-                 source: str = ""):
+                 source: str = "", lecture=None):
         super().__init__(parent or mw)
+        # AI Lecture's door (tools/lecture/door.py). Set before anything is
+        # built: half the construction asks "is this a lecture?".
+        self._lec_init(lecture)
+        if self._lecture is not None and on_committed is None:
+            on_committed = self._lec_on_committed
         # ── the other doors ──────────────────────────────────────────────────
         # This dialog started as the work-through's own screen and is now THE
         # output page: every tool lands here (see tools/run_view.py). A door
@@ -424,7 +457,7 @@ class BulkSearchDialog(QDialog):
         # committing rolls straight on into Mass AI Create carrying the points
         # your deck turned out not to have. One pass, one decision per gap.
         self._unified = bool(unified)
-        self.setWindowTitle(title or ("Work through knowledge gaps" if unified
+        self.setWindowTitle(title or ("Find & write — knowledge gaps" if unified
                                       else "Bulk search — knowledge gaps"))
         self.setMinimumSize(940, 660)
         self.resize(1180, 760)
@@ -515,6 +548,8 @@ class BulkSearchDialog(QDialog):
             self._run_plans = list(self._seed_plans)
             self._wants = {p.kg_id: (True, True) for p in self._run_plans}
             QTimer.singleShot(0, self._render_results)
+        elif self._lecture is not None:
+            self._lec_setup_ui()
         elif provider_configured() and not is_manual_provider():
             self._set_status(
                 "Nothing has been sent to the AI yet. Edit any gap's notes "
@@ -703,8 +738,10 @@ class BulkSearchDialog(QDialog):
                      "Clear the cell to go back to reading it from the title. "
                      "To change the SEARCH TERMS a point matches on rather than "
                      "the subject itself, use “Review points…”."),
-            (C_CARDS, "How many existing cards each gap should pull. Changing "
-                      "the scope resets it to that scope's default."),
+            (C_CARDS, "How many cards this gap should end up with — the cards "
+                      "found in your deck AND the ones written for what it "
+                      "doesn't have, together. Starts at one per point. "
+                      "Changing the scope resets it to that scope's default."),
             (C_PTS, "How many searchable points a gap was split into. A broad "
                     "gap splits into several — that's what actually finds more "
                     "cards, since one point only matches cards about one thing."),
@@ -834,8 +871,50 @@ class BulkSearchDialog(QDialog):
         strip.addStretch(1)
         outer.addLayout(strip)
 
+        # The two AI Create switches that change what a written card IS, per
+        # run, here — before the writing starts on its own. Their defaults
+        # are AI Create's (Settings → Create, and the notetype's grounding
+        # override), and the cards show what they produced in the card panel.
+        opts = QHBoxLayout()
+        opts.setContentsMargins(20, 0, 0, 0)
+        self._ground_cb = QCheckBox("📚 Ground in guidelines")
+        self._ground_cb.setStyleSheet("font-size: 11px;")
+        self._ground_cb.setToolTip(
+            "Give the writer the Australian/WA clinical-guideline allow-list, "
+            "so each card cites a real source instead of an invented one. The "
+            "citation shows in the card panel on the results screen.\n\n"
+            "Starts from Settings → Create and this notetype's Grounding "
+            "override.")
+        opts.addWidget(self._ground_cb)
+        self._autoimg_cb = QCheckBox("🖼️ Auto-image")
+        self._autoimg_cb.setStyleSheet("font-size: 11px;")
+        self._autoimg_cb.setChecked(bool(
+            (cc_cfg.get("images") or {}).get("auto_find", False)))
+        self._autoimg_cb.setToolTip(
+            "Let the writer flag the cards a real picture would help (derm, "
+            "radiology, anatomy, histology, ECG…). On the results screen, "
+            "click one of those cards and its suggested images are there — "
+            "one click puts one on the card.\n\n"
+            "Starts from Settings → Create → Images.")
+        opts.addWidget(self._autoimg_cb)
+        opts.addStretch(1)
+        outer.addLayout(opts)
+
+        def _sync_ground(*_a) -> None:
+            try:
+                from .. import card_creator as cc
+                prof = cc._resolved_profile(cc_cfg,
+                                            self._notetype.currentText().strip())
+                self._ground_cb.setChecked(
+                    cc._grounding_active(cc_cfg, prof, "topic"))
+            except Exception as e:
+                log.warn(f"work through: grounding default failed: {e}")
+        _sync_ground()
+        self._notetype.currentIndexChanged.connect(_sync_ground)
+
         def _sync(on: bool) -> None:
-            for wd in (self._deck, self._notetype, lbl, lbl2):
+            for wd in (self._deck, self._notetype, lbl, lbl2,
+                       self._ground_cb, self._autoimg_cb):
                 wd.setEnabled(on)
         self._write_cb.toggled.connect(_sync)
         return outer
@@ -970,8 +1049,8 @@ class BulkSearchDialog(QDialog):
         self._tree.setTextElideMode(Qt.TextElideMode.ElideRight)
         self._tree.headerItem().setToolTip(1,
             "Applied to every ticked card under a gap. Prefilled from the gap's "
-            "own system/subsystem/topic, in the same scheme AI Browse and AI "
-            "Create use. Edit or clear it freely.")
+            "own system/subsystem/topic, in the same scheme written cards "
+            "use. Edit or clear it freely.")
         # A card's full text is still a hover away — over its checkbox. Double-
         # click opens the note in the browser, which is the better read anyway.
         tips_on_checkbox_only(self._tree)
@@ -979,7 +1058,18 @@ class BulkSearchDialog(QDialog):
         self._tree.itemDoubleClicked.connect(self._on_tree_double_clicked)
         self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._on_tree_context_menu)
-        col.addWidget(self._tree, 1)
+        # The card panel (card_pane.py): whichever row is selected, in full —
+        # the rows only hold a line. A lecture adds its slides and Lecture
+        # Notes to the same panel.
+        from aqt.qt import QSplitter
+        split = QSplitter(Qt.Orientation.Horizontal)
+        split.addWidget(self._tree)
+        split.addWidget(self._build_card_pane())
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        split.setSizes([700, 380])
+        self._tree.currentItemChanged.connect(self._pane_show)
+        col.addWidget(split, 1)
 
         ctl = QHBoxLayout()
         for label, fn in (("Expand all", lambda: self._tree.expandAll()),
@@ -1026,6 +1116,14 @@ class BulkSearchDialog(QDialog):
             "That list cost a search and a relevance pass to produce.")
         self._copy_btn.clicked.connect(self._copy_menu)
         ctl.addWidget(self._copy_btn)
+        self._lec_more_btn = QPushButton("Lecture ▾")
+        self._lec_more_btn.setAutoDefault(False)
+        self._lec_more_btn.setToolTip(
+            "Search again for the points your deck didn't cover, or save "
+            "them with their slide numbers.")
+        self._lec_more_btn.clicked.connect(self._lec_more_menu)
+        self._lec_more_btn.setVisible(False)
+        ctl.addWidget(self._lec_more_btn)
         ctl.addStretch(1)
         self._sel_lbl = QLabel("")
         self._sel_lbl.setStyleSheet("color: gray; font-size: 11px;")
@@ -1147,6 +1245,9 @@ class BulkSearchDialog(QDialog):
         return it
 
     def _refresh_title(self) -> None:
+        if self._lecture is not None:
+            self._title.setText(self._lec_title())
+            return
         n = len(self._kgs)
         if self._plans:
             active = self._active_plans()
@@ -1224,6 +1325,8 @@ class BulkSearchDialog(QDialog):
         point is that the AI sees what you just typed. Writing to the store as
         well as to the in-memory record means the edit survives the run, so you
         fix a badly-worded gap once rather than every time you look at it."""
+        if self._lecture is not None:
+            return 0          # a lecture's sections have no store behind them
         changed = 0
         for row, kg in enumerate(self._kgs):
             cell = self._table.item(row, C_NOTES)
@@ -1267,6 +1370,8 @@ class BulkSearchDialog(QDialog):
         wording, invalidates that gap's cached reading by construction, and
         survives to every later run.
         """
+        if self._lecture is not None:
+            return []         # read-only on a lecture: the points are the reading
         rewritten: list = []
         for row, p in enumerate(self._plans):
             if row >= len(self._kgs):
@@ -1326,8 +1431,14 @@ class BulkSearchDialog(QDialog):
         return out
 
     def _refresh_buttons(self) -> None:
-        can_read = (bool(self._checked_rows()) and not self._busy
-                    and provider_configured() and not is_manual_provider())
+        if self._lecture is not None:
+            # A lecture reads as a whole, and the copy/paste provider can read
+            # one through the file hand-off.
+            can_read = not self._busy and (provider_configured()
+                                           or is_manual_provider())
+        else:
+            can_read = (bool(self._checked_rows()) and not self._busy
+                        and provider_configured() and not is_manual_provider())
         self._read_btn.setEnabled(can_read)
         has_points = any(p.points for p in self._active_plans())
         self._search_btn.setEnabled(bool(self._active_plans()) and not self._busy)
@@ -1336,6 +1447,9 @@ class BulkSearchDialog(QDialog):
     # ── stage 1: the read ────────────────────────────────────────────────────
 
     def _on_read(self, *_a, then=None) -> None:
+        if self._lecture is not None:
+            self._lec_read()
+            return
         rows = self._checked_rows()
         if not rows:
             tooltip("Tick at least one gap first.")
@@ -1548,6 +1662,12 @@ class BulkSearchDialog(QDialog):
         self._table.blockSignals(False)
         self._fit_rows()
 
+        if self._lecture is not None:
+            self._lec_fix_table()
+            self._refresh_buttons()
+            self._refresh_title()
+            return
+
         n_ok = sum(1 for p in self._plans if p.ok)
         n_shaky = sum(1 for p in self._plans if p.ok and p.confidence == "low")
         msg = f"Read {n_ok} gap(s)."
@@ -1589,7 +1709,7 @@ class BulkSearchDialog(QDialog):
             # is handled by _sync_reading, which saves it onto the gap and has
             # it read again — this only keeps the label on screen matching.
             it1 = self._table.item(row, C_READ)
-            if it1 is not None and p.ok:
+            if it1 is not None and p.ok and self._lecture is None:
                 txt = it1.text().strip()
                 if txt and txt != "— not read —":
                     p.concept = txt
@@ -1642,17 +1762,31 @@ class BulkSearchDialog(QDialog):
         import threading
         from ..lecture.panel import run_pipeline
 
-        cfg = dict(tool_config("lecture"))
-        cfg["lo_text"] = ""                       # never the LO branch: points win
-        cfg["target_cards"] = kg_triage.total_cards(plans)
-        # Depth no longer decides the per-point cap here (cap_for does), but it
-        # still sizes the candidate POOL the judge reads. Use the deepest preset
-        # so a broad gap has enough candidates to draw a real cluster from.
-        cfg["depth"] = "thorough"
-        cap_for = kg_triage.cap_for(plans)
-        # ...but a narrow gap's point still gets a SMALL pool: the judge reads
-        # every candidate, and that read is the slow leg of the whole run.
-        cand_cap_for = kg_triage.cand_cap_for(plans)
+        extra: dict = {}
+        if self._lecture is not None:
+            if is_manual_provider():
+                # No AI provider: the lecture's own file hand-off, round two.
+                self._stage(pipeline.APPROVE, pipeline.DONE)
+                self._stage(pipeline.FIND, pipeline.RUNNING)
+                self._lec_fm_find(points)
+                return
+            # The lecture's own budget and depth, not per-gap shares: a lecture
+            # searched here finds the cards it found on its own page.
+            cfg, extra = self._lec_search_args(plans)
+            cap_for = cand_cap_for = None
+        else:
+            cfg = dict(tool_config("lecture"))
+            cfg["lo_text"] = ""                   # never the LO branch: points win
+            cfg["target_cards"] = kg_triage.total_cards(plans)
+            # Depth no longer decides the per-point cap here (cap_for does), but
+            # it still sizes the candidate POOL the judge reads. Use the deepest
+            # preset so a broad gap has enough candidates to draw a real
+            # cluster from.
+            cfg["depth"] = "thorough"
+            cap_for = kg_triage.cap_for(plans)
+            # ...but a narrow gap's point still gets a SMALL pool: the judge
+            # reads every candidate, and that read is the slow leg of the run.
+            cand_cap_for = kg_triage.cand_cap_for(plans)
 
         self._cancel_ev = threading.Event()
         cancel_ev = self._cancel_ev
@@ -1675,7 +1809,7 @@ class BulkSearchDialog(QDialog):
                 reclassify_points(points, report=_report)
                 return run_pipeline(None, cfg, report=_report, cancel_ev=cancel_ev,
                                     points=points, cap_for=cap_for,
-                                    cand_cap_for=cand_cap_for)
+                                    cand_cap_for=cand_cap_for, **extra)
             finally:
                 core_api.set_cancel_event(None)
 
@@ -1923,31 +2057,7 @@ class BulkSearchDialog(QDialog):
                 node.setToolTip(0, f"{m.point.concept}\n\nterms: {m.point.terms}")
 
                 for nid in chosen + extra:
-                    leaf = QTreeWidgetItem(node)
-                    leaf.setData(0, self.ROLE_KIND, "note")
-                    leaf.setData(0, self.ROLE_KEY, int(nid))
-                    leaf.setFlags(leaf.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                    leaf.setCheckState(0, Qt.CheckState.Checked if nid in chosen
-                                       else Qt.CheckState.Unchecked)
-                    susp, tot = m.susp.get(nid, (0, 0))
-                    # Words, not colour: a suspended card is the one there's
-                    # something to DO about, and that has to read as text.
-                    mark = ("⏸ suspended  " if susp else "in rotation  ") \
-                        if tot else ""
-                    # Show as much of the card as the row can hold, and keep the
-                    # rest in the tooltip: deciding whether a card belongs to a
-                    # gap is unreadable off a 150-character stub.
-                    full = matcher.note_text(nid, 700)
-                    # Stage 6 CHECK, on a card you already own. Local, free and
-                    # instant (see pipeline.check_found) — no AI call — so a
-                    # found card is finally held to the same standard as a
-                    # written one before it's unsuspended and studied.
-                    flaw = self._found_flaw(nid)
-                    leaf.setText(0, f"{mark}{_short(full, 260)}"
-                                    + (f"   [{flaw}]" if flaw else ""))
-                    leaf.setToolTip(0, f"{full}\n\nDouble-click to open this "
-                                       "note in the Anki browser."
-                                    + (f"\n\nQuality check: {flaw}" if flaw else ""))
+                    self._make_found_leaf(node, m, nid, chosen=nid in chosen)
                 if not chosen and not extra:
                     empty = QTreeWidgetItem(node)
                     empty.setData(0, self.ROLE_KIND, "info")
@@ -1980,9 +2090,48 @@ class BulkSearchDialog(QDialog):
         # Start writing straight away, on this same screen. Deferred one tick so
         # the found cards paint first: they are readable for the whole time the
         # rest is being generated, which is the point of not making this a page.
+        if self._lecture is not None:
+            self._lec_after_results()
         if (self._unified and self._write_cb is not None
                 and self._write_cb.isChecked() and not self._gen_batch_id):
             QTimer.singleShot(0, self._start_generation)
+
+    def _make_found_leaf(self, node, m, nid: int, *, chosen: bool):
+        """One found card's row under its point. Shared by the results render
+        and anything that adds cards to a point afterwards (a lecture's
+        re-search), so a card reads the same however it got there."""
+        from ..lecture import matcher
+        leaf = QTreeWidgetItem(node)
+        leaf.setData(0, self.ROLE_KIND, "note")
+        leaf.setData(0, self.ROLE_KEY, int(nid))
+        leaf.setFlags(leaf.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        leaf.setCheckState(0, Qt.CheckState.Checked if chosen
+                           else Qt.CheckState.Unchecked)
+        susp, tot = m.susp.get(nid, (0, 0))
+        # Words, not colour: a suspended card is the one there's something to
+        # DO about, and that has to read as text.
+        mark = ("⏸ suspended  " if susp else "in rotation  ") if tot else ""
+        # Show as much of the card as the row can hold, and keep the rest in
+        # the tooltip: deciding whether a card belongs to a gap is unreadable
+        # off a 150-character stub.
+        full = matcher.note_text(nid, 700)
+        # Stage 6 CHECK, on a card you already own. Local, free and instant
+        # (see pipeline.check_found) — no AI call — so a found card is held to
+        # the same standard as a written one before it's unsuspended.
+        flaw = self._found_flaw(nid)
+        # A lecture also flags a chosen card that doesn't really answer its
+        # point. Flagged, never hidden.
+        off = self._lec_leaf_flag(m, nid, chosen) if self._lecture else ""
+        flags = [f for f in (flaw, off) if f]
+        leaf.setText(0, f"{mark}{_short(full, 260)}"
+                        + "".join(f"   [{f}]" for f in flags))
+        leaf.setToolTip(0, f"{full}\n\nDouble-click to open this note in the "
+                           "Anki browser."
+                        + (f"\n\nQuality check: {flaw}" if flaw else "")
+                        + (f"\n\n{off[0].upper() + off[1:]}: it matched none of "
+                           "the point's search terms and the judge rated it "
+                           "tangential." if off else ""))
+        return leaf
 
     def _course_tag(self, group: str | None = None) -> str:
         """The branch shared by every card in a gap's group, or "".
@@ -2117,6 +2266,8 @@ class BulkSearchDialog(QDialog):
         """This gap's hierarchical tag. Built from the point levels the triage
         pass assigned — preferring a point that actually found cards, since a
         gap point's levels are the least corroborated thing in the group."""
+        if self._lecture is not None:
+            return self._lec_suggest_tag(plan)
         ordered = [m for m in group if m.final] + [m for m in group if not m.final]
         for m in ordered:
             try:
@@ -2221,6 +2372,7 @@ class BulkSearchDialog(QDialog):
                 menu.addAction(
                     "Untick this point\u2019s found cards",
                     lambda: self._untick_point(item))
+            self._lec_menu(menu, item, kind)
             menu.exec(self._tree.mapToGlobal(pos))
             return
 
@@ -2667,7 +2819,12 @@ class BulkSearchDialog(QDialog):
         if untagged:
             lines.append(f"\n{len(untagged)} gap(s) have an empty tag box — their "
                          "cards will be unsuspended but not tagged.")
-        lines.append("\nCard content is never modified.")
+        extra = self._lec_confirm_lines(all_nids)
+        if extra:
+            lines.append("")
+            lines.extend(extra)
+        else:
+            lines.append("\nCard content is never modified.")
         if not askUser("\n".join(lines)):
             return
 
@@ -2676,6 +2833,14 @@ class BulkSearchDialog(QDialog):
             mw.checkpoint("Ankisstant: bulk gap search")
 
         tagged, unsuspended = self._apply_found(ticked, all_nids, do_unsuspend)
+        # The door's own commit step (a lecture's slides and notes), inside the
+        # same checkpoint — the written-card route runs it in _finish_apply.
+        if self._on_committed is not None:
+            try:
+                self._on_committed({}, all_nids)
+            except Exception as e:
+                log.error(f"run view: the {self._door} door's commit step "
+                          f"failed: {e}")
         closed = self._close_gaps(full)
 
         self._commit_btn.setEnabled(False)
@@ -2738,9 +2903,10 @@ class BulkSearchDialog(QDialog):
             for tag in tags:
                 per_item.append((tag, list(rec["nids"])))
 
-        cfg = tool_config("browse")
+        # A lecture's cards carry AI Lecture's audit trail, as they always have.
+        cfg = tool_config("lecture" if self._lecture is not None else "browse")
         cplan = pipeline.CommitPlan(
-            label="Ankisstant: work through gaps",
+            label="Ankisstant: find & write",
             tag_ops=commit.tag_ops_for(
                 per_item=per_item,
                 audit=(cfg.get("audit_tag") or "").strip(),
@@ -2763,7 +2929,7 @@ class BulkSearchDialog(QDialog):
 
     # ── unified: the writing half, on the same screen ────────────────────────
 
-    def _create_payload(self) -> list[dict]:
+    def _create_payload(self, *, for_writing: bool = False) -> list[dict]:
         """The gaps your deck didn't cover, as KG records carrying ONLY their
         uncovered points.
 
@@ -2784,6 +2950,26 @@ class BulkSearchDialog(QDialog):
                 if not missing_by_kg[kg_id]:
                     missing_by_kg[kg_id] = [
                         _AllPoints(pt) for pt in plans_by_id[kg_id].points]
+        # ONE BUDGET FOR FINDING AND WRITING. A gap's card count is how many
+        # cards it should end up with, not how many to FIND — so turning it
+        # down must not turn into "write cards for whatever didn't fit".
+        #
+        # Two rules do that. A point whose cards exist but lost the budget
+        # lottery is not a gap and is never written for (is_gap is False:
+        # the deck covers it, the budget just went elsewhere). And what IS
+        # written for a gap is capped at its budget minus the found cards
+        # ticked under it.
+        allowance: dict = {}
+        self._budget_held = 0
+        if for_writing and self._coverage is not None:
+            for kg_id in list(missing_by_kg):
+                missing_by_kg[kg_id] = [
+                    m for m in missing_by_kg[kg_id]
+                    if getattr(m, "is_gap", True)
+                    or not getattr(m, "available", None)]
+            allowance = self._write_allowance(
+                {k: len(v) for k, v in missing_by_kg.items() if v},
+                plans_by_id)
         out: list[dict] = []
         for kg_id, missing in missing_by_kg.items():
             if not missing:
@@ -2792,17 +2978,50 @@ class BulkSearchDialog(QDialog):
             # asked for.
             if self._wants and not self._wants.get(kg_id, (True, True))[1]:
                 continue
+            if kg_id in allowance:
+                n_ok = allowance[kg_id]
+                self._budget_held += max(0, len(missing) - n_ok)
+                if n_ok <= 0:
+                    continue
             plan = plans_by_id.get(kg_id)
             kg = self._record_for(kg_id)
             if plan is None or not kg:
                 continue
-            out.append(create_record_for(
+            rec = create_record_for(
                 kg, plan.concept,
                 [{"concept": m.point.concept, "terms": list(m.point.terms),
                   "system": m.point.system, "subsystem": m.point.subsystem,
                   "topic": m.point.topic}
                  for m in missing],
-                style_examples=self._style_examples_for(kg_id)))
+                style_examples=self._style_examples_for(kg_id))
+            if kg_id in allowance:
+                # The points stay listed in priority order; gen_prompt cuts the
+                # list to this and asks for exactly one card each.
+                rec["target_cards"] = max(1, min(len(missing), allowance[kg_id]))
+            out.append(rec)
+        return out
+
+    def _write_allowance(self, wants: dict, plans_by_id: dict) -> dict:
+        """{kg_id: cards this gap may still WRITE} — its budget minus the found
+        cards ticked under it.
+
+        A lecture has one budget for the whole lecture (its Coverage dial), so
+        there the remainder is shared across the sections that still need cards,
+        in teaching order."""
+        ticked = self._ticked()
+        if self._lecture is not None:
+            budget = int(getattr(self._coverage, "budget", 0) or 0)
+            if budget <= 0:
+                return {}
+            found = len({n for r in ticked.values() for n in r["nids"]})
+            return split_budget(list(wants.items()), max(0, budget - found))
+        out = {}
+        for kg_id, n in wants.items():
+            plan = plans_by_id.get(kg_id)
+            if plan is None:
+                continue
+            have = len((ticked.get(kg_id) or {}).get("nids") or [])
+            out[kg_id] = max(0, kg_triage.clamp_cards(plan.cards) - have)
         return out
 
     # How many found-card fronts ride along as style examples, and the longest
@@ -3030,13 +3249,18 @@ class BulkSearchDialog(QDialog):
                 "Writing the missing cards needs a provider — set one up in "
                 "Ankisstant Settings.")
             return
-        payload = self._create_payload()
+        payload = self._create_payload(for_writing=True)
+        held = getattr(self, "_budget_held", 0)
         if not payload:
             self._stage(pipeline.WRITE, pipeline.SKIPPED,
                         "nothing left to write")
             self._stage(pipeline.CHECK, pipeline.SKIPPED)
             self._show_written_ui()
             self._gen_note.setText(
+                f"The card budget is already spent on cards you own — "
+                f"{held} uncovered point(s) were left unwritten. Raise a "
+                "gap's card count, or right-click a point to write for it "
+                "anyway." if held else
                 "Every point was covered by a card you already have.")
             return
         notetype_name = (self._notetype.currentText().strip()
@@ -3089,7 +3313,8 @@ class BulkSearchDialog(QDialog):
             plans=plans, gaps_by_id=gaps_by_id, deck_name=deck_name,
             notetype_name=notetype_name, base_tags=base_tags,
             tags_by_kg=tags_by_kg, model=pipeline.dial_for(pipeline.WRITE),
-            origin="work-through")
+            origin="work-through",
+            grounding=self._ground_on(), auto_image=self._autoimg_on())
         if not records:
             self._show_written_ui()
             self._gen_note.setText(
@@ -3117,7 +3342,10 @@ class BulkSearchDialog(QDialog):
         self._gen_note.setText(
             f"{len(records)} gap(s) queued. Read the found cards above while "
             "this runs \u2014 nothing is added to your collection until you "
-            "press Apply.")
+            "press Apply."
+            + (f" {held} more uncovered point(s) were left unwritten because "
+               "their gap's card budget is spent \u2014 right-click a point to "
+               "write for it anyway." if held else ""))
         self._render_written_placeholders(records)
         self._progress.setRange(0, 100)
         self._progress.setValue(0)
@@ -3199,7 +3427,8 @@ class BulkSearchDialog(QDialog):
             notetype_name=notetype_name, base_tags=base_tags,
             tags_by_kg={kg_id: self._tag_text(kg_id)},
             model=pipeline.dial_for(pipeline.WRITE), origin="work-through",
-            batch_id=self._gen_batch_id)
+            batch_id=self._gen_batch_id,
+            grounding=self._ground_on(), auto_image=self._autoimg_on())
         if not records:
             showWarning("Couldn't build a generation request for that point — "
                         "see the log.")
@@ -3680,6 +3909,8 @@ class BulkSearchDialog(QDialog):
         self._gen_rendered = True
         self._show_written_ui()
         self._refresh_gen_head()
+        if self._lecture is not None:
+            self._lec_refresh_badges()
 
     def _label_written(self, leaf, card: dict, dup: str | None,
                        verdicts: list, i: int) -> None:
@@ -3701,6 +3932,12 @@ class BulkSearchDialog(QDialog):
         n_img = len(card.get("_image_paths") or [])
         if n_img:
             bits.append(f"{n_img} image(s)")
+        elif str(card.get("image_query") or "").strip():
+            # Auto-image flagged it. Said on the row so the cards worth
+            # opening for a picture can be found without opening every one.
+            bits.append("image suggested")
+        if str(card.get("source") or "").strip():
+            bits.append("cites a source")
         if card.get("_no_emphasis"):
             # The model left the front unmarked AND the deterministic repair
             # couldn't find a known anchor in it (see card_creator's
@@ -3856,11 +4093,11 @@ class BulkSearchDialog(QDialog):
             return
         if self._coverage is None and not self._run_plans:
             return
-        if self._gen_active and not askUser(
-                "Cards are still being written for some of these gaps.\n\n"
-                "Apply what your deck already had now, and leave the writing "
-                "running? You'd add those cards separately from AI Create.",
-                defaultno=True):
+        if self._gen_active:
+            # There is nowhere for cards to land after Apply any more, so
+            # Apply waits for the writing rather than stranding it.
+            tooltip("Cards are still being written — wait for them, or press "
+                    "Stop, then Apply.", period=5000)
             return
 
         ticked = self._ticked()
@@ -3898,6 +4135,7 @@ class BulkSearchDialog(QDialog):
         if untagged:
             lines.append(f"• {len(untagged)} gap(s) have an empty tag box — "
                          "their found cards are unsuspended but not tagged.")
+        lines.extend(self._lec_confirm_lines(all_nids))
         lines.append("")
         if review:
             # Said plainly rather than repeating the old promise. Cards added
@@ -3911,12 +4149,12 @@ class BulkSearchDialog(QDialog):
         else:
             lines.append("Existing card content is never modified, and one "
                          "Ctrl+Z takes the whole thing back out.")
-        if not askUser("\n".join(lines), title="Work through gaps"):
+        if not askUser("\n".join(lines), title="Find & write"):
             return
 
         # ONE checkpoint around both halves.
         if hasattr(mw, "checkpoint"):
-            mw.checkpoint("Ankisstant: work through gaps")
+            mw.checkpoint("Ankisstant: find & write")
 
         self._stage(pipeline.REVIEW, pipeline.DONE,
                     f"{len(all_nids) + n_new} kept")
@@ -4010,7 +4248,8 @@ class BulkSearchDialog(QDialog):
             bits.append(f"{n_created} card(s) added")
         if discarded:
             bits.append(f"{discarded} not added — you closed the Add window")
-        bits.append(f"{closed} gap(s) closed")
+        if self._lecture is None:
+            bits.append(f"{closed} gap(s) closed")
         msg = "Done — " + ", ".join(bits) + "."
         try:
             self._stage(pipeline.COMMIT, pipeline.DONE,
@@ -4120,7 +4359,7 @@ class BulkSearchDialog(QDialog):
             # checkpoint=False: _on_apply_everything already opened one around
             # both halves of this screen.
             cplan = pipeline.CommitPlan(
-                label="Ankisstant: work through gaps", new_cards=list(cards),
+                label="Ankisstant: find & write", new_cards=list(cards),
                 deck_name=deck_name, commit_ctx=cctx, notetype=nt)
             res = commit.run(cplan, checkpoint=False)
             if res.errors:
@@ -4250,7 +4489,7 @@ class BulkSearchDialog(QDialog):
             f"across {len(payload)} gap(s)?\n\n"
             "Mass AI Create opens with them already planned — you review every "
             "card before anything is added to your collection.",
-            title="Work through gaps"):
+            title="Find & write"):
             self._set_status(
                 f"Stopped after the search. {len(payload)} gap(s) stay open — "
                 "run them through AI Create when you want the cards.")
@@ -4267,6 +4506,8 @@ class BulkSearchDialog(QDialog):
     def _close_gaps(self, kg_ids: list[str]) -> int:
         """Mark fully-covered gaps done. Best-effort: a store failure must never
         undo the tagging and unsuspending that already succeeded."""
+        if self._lecture is not None:
+            return 0          # a lecture's sections aren't knowledge gaps
         closed = 0
         for kg_id in kg_ids:
             try:
@@ -4527,40 +4768,25 @@ class BulkSearchDialog(QDialog):
             self._gen_active = False
         elif self._gen_rendered and not self._applied:
             pending = sum(len(c) for _k, c in self._approved_written())
-            if pending:
-                # Three real answers, so three buttons. The old two-way question
-                # silently left the batch behind, and a leftover batch shows up
-                # in AI Create later looking like a create run the user never
-                # started \u2014 which is exactly how it was found.
-                box = QMessageBox(self)
-                box.setWindowTitle("Close without adding?")
-                box.setIcon(QMessageBox.Icon.Question)
-                box.setText(f"{pending} written card(s) haven\u2019t been added "
-                            "yet, and the found cards on this screen aren\u2019t "
-                            "committed either.")
-                box.setInformativeText(
-                    "Keep them and they wait in AI Create as a \u201cWork "
-                    "through gaps\u201d batch you can commit or discard there. "
-                    "The search results are not saved either way.")
-                keep = box.addButton("Close and keep the cards",
-                                     QMessageBox.ButtonRole.AcceptRole)
-                drop = box.addButton("Close and discard them",
-                                     QMessageBox.ButtonRole.DestructiveRole)
-                back = box.addButton("Stay here", QMessageBox.ButtonRole.RejectRole)
-                box.setDefaultButton(back)
-                box.exec()
-                clicked = box.clickedButton()
-                if clicked is back or clicked is None:
-                    ev.ignore()
-                    return
-                if clicked is drop:
-                    try:
-                        from .. import create_jobs
-                        create_jobs.remove_batch(self._gen_batch_id)
-                    except Exception as e:
-                        log.warn("work through: couldn't discard the batch: "
-                                 f"{e}")
-                _ = keep
+            # Two answers, not three. There used to be "close and keep the
+            # cards", which parked them in AI Create — and nobody goes back
+            # for cards they didn't take the first time; they just turned up
+            # later looking like gaps queued from nowhere. Not applied = gone.
+            if pending and not askUser(
+                    f"{pending} written card(s) haven\u2019t been added, and the "
+                    "found cards on this screen aren\u2019t committed either.\n\n"
+                    "Close anyway? The written cards are thrown away.",
+                    defaultno=True, title="Close without adding?"):
+                ev.ignore()
+                return
+        if not self._applied and self._gen_batch_id:
+            # Whatever was written and not applied goes now — nothing else
+            # will ever show it.
+            try:
+                from .. import create_jobs
+                create_jobs.remove_batch(self._gen_batch_id)
+            except Exception as e:
+                log.warn(f"find & write: couldn't discard the batch: {e}")
         self._closed = True
         try:
             self._poll.stop()

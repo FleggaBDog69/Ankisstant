@@ -443,55 +443,28 @@ def finish_matches(matches, *, target_cards, depth=matcher.DEFAULT_DEPTH,
     return coverage
 
 
-def run_pipeline(path: str, cfg: dict, *, report, cancel_ev: threading.Event,
-                 points: list | None = None, cap_for=None, cand_cap_for=None,
-                 companion=None):
-    """Ingest → extract → match → relevance → allocate → summarise.
+def read_material(path: str, cfg: dict, *, report, check, companion=None):
+    """Ingest → extract: the READ stage on its own. Returns (lecture, points).
 
-    Runs entirely on a worker thread. Returns (lecture, matches, coverage).
-    Every collection touch goes through _on_col (Anki's collection thread,
-    never the UI one); every AI call stays here.
+    Split out of run_pipeline so the work-through can stop between reading a
+    lecture and searching the deck for it — that pause is where the learning
+    points are grouped into sections, reviewed and edited (stages 2 → 3 → 4).
+    run_pipeline still calls it, so a plain lecture run behaves exactly as
+    before. `lecture` is None on the pasted-objectives path.
 
-    `points` short-circuits the whole read step. KG mode supplies them: the gaps
-    were triaged (and edited by the user) BEFORE the run, so there is nothing
-    left to extract — everything from the deck search onward is identical to a
-    lecture. `cap_for` rides with them to give each gap its own card share, and
-    `cand_cap_for` shrinks the candidate pool for the narrow ones so the judge
-    isn't reading twenty cards for a gap that wants one.
-
-    `companion` is the user's own notes / a transcript (ingest.CompanionText),
-    snapshotted by the panel before the run starts. Supplemental in both of its
-    roles: it may contribute a hard-capped handful of learning points, and it
-    supplies material for the card-note pass. None (or empty) is the default and
-    changes nothing about the run.
+    Worker-thread safe: no Qt, no collection access. `check()` raises
+    Cancelled when the user presses Stop.
     """
-    def _check():
-        if cancel_ev.is_set():
-            raise Cancelled()
-
-    # `points` is rebound below when we extract, so remember whether the CALLER
-    # supplied them — that's what distinguishes a lecture run from KG mode.
-    supplied_points = points
+    _check = check
+    lecture = None
 
     target_points = int(cfg.get("target_points") or extractor.DEFAULT_TARGET_POINTS)
-    target_cards = int(cfg.get("target_cards") or matcher.DEFAULT_TARGET_CARDS)
-    depth = str(cfg.get("depth") or matcher.DEFAULT_DEPTH)
-    # Candidate pool follows depth automatically (leaner depth -> leaner, faster
-    # judging) unless Settings carries an explicit override. Logged because a
-    # silently-small pool is invisible in the results and costs good cards.
-    candidate_cap = matcher.resolve_candidate_cap(cfg)
-    log.info(f"lecture: depth '{depth}' — judging up to {candidate_cap} candidate(s) per point")
     use_vision = bool(cfg.get("use_vision", False))
     use_ocr = bool(cfg.get("use_local_ocr", True))
     high_yield = bool(cfg.get("high_yield_only", True))
     # Off = the lecture is the source of truth (no backfilling facts it omits).
     # In the extraction cache key, so flipping it forces a fresh read.
     enrich = bool(cfg.get("enrich", False))
-    notetype_filter = (cfg.get("notetype_filter") or "").strip()
-    # Optional deck/tag restriction on every deck search (Mass AI Create's
-    # "skip what a deck or tag already covers"). "" is the default and
-    # searches the whole collection, exactly as before.
-    search_scope = (cfg.get("search_scope") or "").strip()
     force_reextract = bool(cfg.get("force_reextract", False))
     lo_text = (cfg.get("lo_text") or "").strip()
     model_x = pipeline.dial_for(pipeline.READ)
@@ -505,15 +478,7 @@ def run_pipeline(path: str, cfg: dict, *, report, cancel_ev: threading.Event,
             target_points, cfg.get("companion_lp_share", DEFAULT_COMPANION_SHARE))
         comp_digest = cache.companion_digest(companion)
 
-    lecture = None
-
-    if points is not None:
-        # KG MODE — the points arrived pre-read. tools/kg/triage.py already did
-        # the one AI call that turns rough knowledge gaps into searchable points
-        # (and the user has since reviewed and edited them), so there is no
-        # ingest, no OCR, no extraction and no cache lookup to do here.
-        report(f"{len(points)} point(s) from your knowledge gaps…", 30)
-    elif lo_text:
+    if lo_text:
         # LO MODE — the user handed over the objectives directly, so skip ingest,
         # OCR, imagery and the whole-document extraction read. One cheap AI call
         # turns the pasted list into the same LearningPoints the file path would
@@ -661,6 +626,68 @@ def run_pipeline(path: str, cfg: dict, *, report, cancel_ev: threading.Event,
             # Only cache a real, non-empty extraction we just paid for.
             cache.store(ck, points)
 
+    return lecture, points
+
+
+def run_pipeline(path: str, cfg: dict, *, report, cancel_ev: threading.Event,
+                 points: list | None = None, cap_for=None, cand_cap_for=None,
+                 companion=None, lecture=None):
+    """Ingest → extract → match → relevance → allocate → summarise.
+
+    Runs entirely on a worker thread. Returns (lecture, matches, coverage).
+    Every collection touch goes through _on_col (Anki's collection thread,
+    never the UI one); every AI call stays here.
+
+    `points` short-circuits the whole read step. KG mode supplies them: the gaps
+    were triaged (and edited by the user) BEFORE the run, so there is nothing
+    left to extract — everything from the deck search onward is identical to a
+    lecture. `cap_for` rides with them to give each gap its own card share, and
+    `cand_cap_for` shrinks the candidate pool for the narrow ones so the judge
+    isn't reading twenty cards for a gap that wants one.
+
+    `companion` is the user's own notes / a transcript (ingest.CompanionText),
+    snapshotted by the panel before the run starts. Supplemental in both of its
+    roles: it may contribute a hard-capped handful of learning points, and it
+    supplies material for the card-note pass. None (or empty) is the default and
+    changes nothing about the run.
+    """
+    def _check():
+        if cancel_ev.is_set():
+            raise Cancelled()
+
+    # `points` is rebound below when we extract, so remember whether the CALLER
+    # supplied them — that's what distinguishes a lecture run from KG mode.
+    supplied_points = points
+
+    target_cards = int(cfg.get("target_cards") or matcher.DEFAULT_TARGET_CARDS)
+    depth = str(cfg.get("depth") or matcher.DEFAULT_DEPTH)
+    # Candidate pool follows depth automatically (leaner depth -> leaner, faster
+    # judging) unless Settings carries an explicit override. Logged because a
+    # silently-small pool is invisible in the results and costs good cards.
+    candidate_cap = matcher.resolve_candidate_cap(cfg)
+    log.info(f"lecture: depth '{depth}' — judging up to {candidate_cap} candidate(s) per point")
+    notetype_filter = (cfg.get("notetype_filter") or "").strip()
+    # Optional deck/tag restriction on every deck search (Mass AI Create's
+    # "skip what a deck or tag already covers"). "" is the default and
+    # searches the whole collection, exactly as before.
+    search_scope = (cfg.get("search_scope") or "").strip()
+
+    # `lecture` is the already-read Lecture when the caller supplied points
+    # (the work-through), else None until read_material fills it.
+
+    if points is not None:
+        # The points arrived pre-read. Two callers do this: KG mode, where
+        # tools/kg/triage.py read the gaps (and the user has since reviewed and
+        # edited them), and the lecture door of the work-through, which ran
+        # read_material itself and paused for the review. Either way there is
+        # no ingest, no OCR, no extraction and no cache lookup to do here.
+        report(f"{len(points)} point(s) "
+               + ("from the lecture…" if lecture is not None
+                  else "from your knowledge gaps…"), 30)
+    else:
+        lecture, points = read_material(path, cfg, report=report, check=_check,
+                                        companion=companion)
+
     # Diagnostic trail (file logging only, via log.trace): the exact learning
     # points + terms — logged on BOTH paths so a cached run is just as
     # diagnosable, in case matching later fails and we want the extraction record.
@@ -720,7 +747,10 @@ def run_pipeline(path: str, cfg: dict, *, report, cancel_ev: threading.Event,
     # NOT in KG mode. When `points` was supplied, the budget is the sum of the
     # per-gap card targets the triage pass worked out (and the user edited in
     # the plan table) — a deliberate figure, not a default to improve on.
-    if supplied_points is None and bool(cfg.get("auto_target_cards", True)):
+    # The lecture door supplies its points (read earlier, then reviewed) but is
+    # still a lecture: it asks for the same sizing with "size_from_points".
+    if (supplied_points is None or cfg.get("size_from_points")) \
+            and bool(cfg.get("auto_target_cards", True)):
         sized = matcher.auto_target_cards(len(points or []))
         if sized != target_cards:
             log.info(f"lecture: {len(points or [])} point(s) -> max notes "
@@ -832,6 +862,9 @@ class LecturePanel(QWidget):
         self._mode_combo = QComboBox()
         self._mode_combo.addItem("A file — slides, handout or transcript", "file")
         self._mode_combo.addItem("Paste learning objectives (skips extraction)", "lo")
+        if _work_through_available():
+            self._mode_combo.addItem(
+                "Screenshots, pasted text or a web page", "material")
         self._mode_combo.setToolTip(
             "Paste your own learning objectives to skip the slow, costly "
             "extraction read entirely — they're already the atomic, "
@@ -888,6 +921,51 @@ class LecturePanel(QWidget):
         lo_col.addWidget(self._lo_hint)
         self._lo_widget.setVisible(False)
         setup.addWidget(self._lo_widget)
+
+        # Screenshots / pasted text / a web page (mode = material) — what AI
+        # Create's source mode used to take. Bound into one PDF at run time
+        # (see material.py) so it reads, and attaches, like a slide deck.
+        self._shots: list[str] = []
+        self._material_title = ""
+        self._mat_widget = QWidget()
+        mat_col = QVBoxLayout(self._mat_widget)
+        mat_col.setContentsMargins(0, 0, 0, 0)
+        shot_row = QHBoxLayout()
+        paste_btn = QPushButton("Paste screenshot")
+        paste_btn.setToolTip(
+            "Take a screenshot to the clipboard (⌘⇧⌃4 on a Mac), then press "
+            "this. Each screenshot becomes a page: it's read with OCR (and "
+            "vision, if that's on below) and attached to the cards it taught.")
+        paste_btn.clicked.connect(self._paste_shot)
+        shot_row.addWidget(paste_btn)
+        add_btn = QPushButton("Add images…")
+        add_btn.clicked.connect(self._add_shots)
+        shot_row.addWidget(add_btn)
+        self._shots_clear = QPushButton("Clear")
+        self._shots_clear.clicked.connect(self._clear_shots)
+        self._shots_clear.setVisible(False)
+        shot_row.addWidget(self._shots_clear)
+        self._shots_lbl = QLabel("No screenshots")
+        self._shots_lbl.setStyleSheet("color: gray;")
+        shot_row.addWidget(self._shots_lbl, 1)
+        mat_col.addLayout(shot_row)
+        self._url_edit = QLineEdit()
+        self._url_edit.setPlaceholderText("https://… (optional) — a web page to read")
+        self._url_edit.textChanged.connect(lambda _t: self._update_run_enabled())
+        mat_col.addWidget(self._url_edit)
+        self._mat_text = QPlainTextEdit()
+        self._mat_text.setPlaceholderText(
+            "…and / or paste text — lecture notes, a textbook excerpt, a "
+            "guideline.")
+        self._mat_text.setMinimumHeight(110)
+        self._mat_text.textChanged.connect(self._update_run_enabled)
+        mat_col.addWidget(self._mat_text)
+        self._mat_name = QLineEdit()
+        self._mat_name.setPlaceholderText(
+            "Name (optional) — used for the tag and the window title")
+        mat_col.addWidget(self._mat_name)
+        self._mat_widget.setVisible(False)
+        setup.addWidget(self._mat_widget)
 
         # Companion text — your own notes, or a transcript. Strictly
         # supplemental and OFF by default: the slides are the spine of a run,
@@ -1060,7 +1138,7 @@ class LecturePanel(QWidget):
         root.addWidget(self._hsep())
 
         # Progress + results
-        self._sec("RESULTS", root)
+        self._results_lbl = self._sec("RESULTS", root)
         self._progress = QProgressBar()
         self._progress.setVisible(False)
         root.addWidget(self._progress)
@@ -1189,12 +1267,83 @@ class LecturePanel(QWidget):
 
         self._load_cfg()
         self._refresh_notetypes()
+        self._intro_lbl = intro
+        if _work_through_available():
+            self._as_intake_form()
+
+    # -- the intake form --
+    #
+    # In Ankisstant this tab is now only the TAKE IN stage: what to read and how
+    # much of it. Everything after — the read, the learning points, the deck
+    # search, the cards written for what's missing, slides and Lecture Notes,
+    # the commit — happens on the work-through screen (tools/lecture/door.py).
+    #
+    # The results page below is NOT deleted: it is what the standalone
+    # LectureLens build runs (it ships no work-through), so it only switches
+    # off here, where the work-through exists.
+
+    def _as_intake_form(self):
+        self._intro_lbl.setText(
+            "<b>AI Lecture</b> — point it at a lecture, paste your learning "
+            "objectives, or give it screenshots, pasted text or a web page. "
+            "It reads them into learning points, grouped by section, then "
+            "opens <b>Find &amp; write</b>: it finds the cards "
+            "you already own for each point, writes cards for what your deck "
+            "is missing, and staples the source slides and Lecture Notes onto "
+            "them. Nothing reaches your collection until you press Apply.")
+        for w in (self._web, self._results_lbl, self._confirm_btn,
+                  self._new_btn, self._unsuspend_cb):
+            w.setVisible(False)
+        self._attach_cb.setText("Pre-tick suggested slides")
+        self._attach_cb.setToolTip(
+            "On Find & write, every card shows the slides its point came "
+            "from (PDF only, and only pages with a diagram, table or picture) "
+            "with a tick box each.\n\nWith this on, the ones worth a picture — "
+            "points about a mechanism, pathway, anatomy, table or graph — start "
+            "ticked. You can change any of them before Apply.")
+        self._notes_cb.setToolTip(
+            self._notes_cb.toolTip()
+            + "\n\nRuns at the end of the deck search, so decide before you "
+              "start; the proposed lines then show beside each card on the "
+              "Find & write screen.")
+        self._run_btn.setText("Find & write  ▶")
+        self._run_btn.setMinimumWidth(210)
+        self._status_lbl.setText("")
+        self.layout().addStretch(1)
+
+    def _open_work_through(self, cfg: dict, mode: str, lo_text: str):
+        """Hand the intake over to the work-through, which runs the rest."""
+        from .door import LectureRun
+        from ..run_view import open_run
+        tag = self._tag_input.text().strip()
+        if not tag and mode == "file" and self._path:
+            root = (self.cfg.get("tag_root") or "lecture").strip()
+            leaf = anki_utils.slugify_tag_leaf(
+                self._material_title or ingest._title_from_path(self._path))
+            tag = anki_utils.build_tag(root, leaf)
+            self._tag_input.setText(tag)
+        title = (self._material_title
+                 or (os.path.splitext(os.path.basename(self._path))[0]
+                     if mode == "file" and self._path else "Your objectives"))
+        cfg = dict(cfg)
+        cfg["attach_slides"] = self._attach_cb.isChecked()
+        cfg["attach_notes"] = self._notes_cb.isChecked()
+        run = LectureRun(path=self._path if mode == "file" else "",
+                         lo_text=lo_text if mode == "lo" else "",
+                         cfg=cfg, companion=self._companion, tag=tag,
+                         title=title)
+        self._work_dlg = open_run(
+            [], lecture=run, door="lecture", title=f"AI Lecture — {title}",
+            parent=self,
+            source=(autotag.source_for_lecture(self._path)
+                    if mode == "file" and self._path else ""))
 
     # -- small ui helpers --
     def _sec(self, text: str, layout):
         lbl = QLabel(text)
         lbl.setStyleSheet("font-size: 10px; font-weight: 700; color: gray; letter-spacing: 0.6px;")
         layout.addWidget(lbl)
+        return lbl
 
     def _hsep(self) -> QFrame:
         f = QFrame()
@@ -1298,9 +1447,11 @@ class LecturePanel(QWidget):
     def _on_mode_changed(self):
         if self._fm_stage and not self._running:
             self._fm_reset()          # switching source cancels an in-progress hand-off
-        lo = self._current_mode() == "lo"
-        self._file_widget.setVisible(not lo)
+        mode = self._current_mode()
+        lo = mode == "lo"
+        self._file_widget.setVisible(mode == "file")
         self._lo_widget.setVisible(lo)
+        self._mat_widget.setVisible(mode == "material")
         # Vision reads slide images — meaningless when there's no file. The cache
         # toggle still applies (LO extraction is cached too), so it stays live.
         self._vision_cb.setEnabled(not lo)
@@ -1352,11 +1503,80 @@ class LecturePanel(QWidget):
         if self._running:
             self._run_btn.setEnabled(False)
             return
-        if self._current_mode() == "lo":
+        mode = self._current_mode()
+        if mode == "lo":
             ready = bool(self._lo_text.toPlainText().strip())
+        elif mode == "material":
+            ready = bool(self._shots or self._mat_text.toPlainText().strip()
+                         or self._url_edit.text().strip())
         else:
             ready = bool(self._path)
         self._run_btn.setEnabled(ready)
+
+    # -- screenshots / pasted text / a web page --
+    def _paste_shot(self):
+        from . import material
+        path = material.save_clipboard_image()
+        if not path:
+            tooltip("There's no image on the clipboard — take a screenshot to "
+                    "the clipboard first.")
+            return
+        self._shots.append(path)
+        self._refresh_shots()
+
+    def _add_shots(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Add screenshots or images", self.cfg.get("last_file_dir") or "",
+            "Images (*.png *.jpg *.jpeg *.gif *.webp *.bmp *.heic)")
+        if paths:
+            self._shots.extend(p for p in paths if p not in self._shots)
+            self._refresh_shots()
+
+    def _clear_shots(self):
+        self._shots = []
+        self._refresh_shots()
+
+    def _refresh_shots(self):
+        n = len(self._shots)
+        self._shots_lbl.setText(f"{n} screenshot{'s' if n != 1 else ''}"
+                                if n else "No screenshots")
+        self._shots_lbl.setStyleSheet("" if n else "color: gray;")
+        self._shots_clear.setVisible(bool(n))
+        self._update_run_enabled()
+
+    def _material_to_pdf(self) -> bool:
+        """Bind the screenshots, pasted text and web page into one PDF and
+        point this run at it. False (having said why) if there's nothing."""
+        from . import material
+        text = self._mat_text.toPlainText().strip()
+        url = self._url_edit.text().strip()
+        if url:
+            try:
+                mw.app.setOverrideCursor(Qt.CursorShape.WaitCursor)
+                try:
+                    page = material.fetch_url_text(url)
+                finally:
+                    mw.app.restoreOverrideCursor()
+            except Exception as e:
+                showWarning(f"Couldn't read that web page:\n\n{e}")
+                return False
+            text = (text + "\n\n" if text else "") + f"From {url}:\n\n{page}"
+        title = (self._mat_name.text().strip()
+                 or material.default_title(self._mat_text.toPlainText(), url,
+                                           len(self._shots)))
+        try:
+            path = material.build_pdf(title, text, list(self._shots))
+        except Exception as e:
+            log.error(f"lecture: building the material PDF failed: {e}")
+            showWarning(f"Couldn't put that material together:\n\n{e}")
+            return False
+        if not path:
+            showWarning("Nothing to read — add a screenshot, some text or a "
+                        "web page.")
+            return False
+        self._path = path
+        self._material_title = title
+        return True
 
     # -- file --
     def _pick_file(self):
@@ -1466,6 +1686,12 @@ class LecturePanel(QWidget):
             return
         if mode == "lo" and not lo_text:
             return
+        self._material_title = ""
+        if mode == "material":
+            # From here on it IS a file — one PDF, read like any other.
+            if not self._material_to_pdf():
+                return
+            mode = "file"
 
         # Persist the knobs — these are the user's, and they are the whole point
         # of exposing them. tool_config/save_tool_config only ever writes the
@@ -1509,6 +1735,11 @@ class LecturePanel(QWidget):
         # which one is present.
         cfg["source_mode"] = mode
         cfg["lo_text"] = lo_text if mode == "lo" else ""
+
+        # Ankisstant: everything from here on runs on the work-through.
+        if _work_through_available():
+            self._open_work_through(cfg, mode, lo_text)
+            return
 
         # No AI provider set up (copy/paste selected): run the two-step FILE
         # hand-off instead of blocking. The tool exports a prompt file, the user
@@ -3470,6 +3701,18 @@ class LecturePanel(QWidget):
         if "Lecture Notes" in keys:
             return "Lecture Notes"
         return None
+
+
+def _work_through_available() -> bool:
+    """True in Ankisstant, where the work-through exists. The standalone
+    LectureLens build ships tools/lecture without tools/kg, and keeps this
+    tab's own results page."""
+    try:
+        from ..kg import bulk_search  # noqa: F401
+        from .. import run_view  # noqa: F401
+        return True
+    except Exception:
+        return False
 
 
 def _esc(s: str, limit: int | None = None) -> str:

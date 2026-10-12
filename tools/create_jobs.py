@@ -397,6 +397,56 @@ def remove_batch(batch_id: str) -> None:
         remove(job["id"])
 
 
+def drop_work_through_leftovers() -> int:
+    """Startup only: remove every Find & write batch left from a past session.
+
+    A Find & write run's written cards exist only for that window. Once it
+    has closed they are either in your collection or thrown away, so anything
+    still on disk at startup is a leftover — from a crash, a quit with the
+    window hidden, or a build that used to park them in AI Create. Returns how
+    many job records were dropped."""
+    bids = {it.get("batch_id") for it in load_all()
+            if it.get("origin") == "work-through" and it.get("batch_id")}
+    n = 0
+    for bid in bids:
+        n += len(by_batch(bid))
+        remove_batch(bid)
+    return n
+
+
+def drop_settled_work_through() -> int:
+    """Remove work-through batches whose every gap has since been closed.
+
+    A work-through batch is only meant to outlive its window when you closed it
+    WITHOUT applying ("Close and keep the cards"), and in that case its gaps
+    stay open. Once every gap it wrote for is done, the run was applied and
+    whatever is left in the batch is the cards you skipped in the Add window —
+    yet it kept showing in AI Create as gaps you had apparently queued there.
+
+    A batch with anything still queued or running is left alone, and so is one
+    whose gaps aren't in the store (a lecture run's sections aren't gaps).
+    Returns how many job records were dropped."""
+    try:
+        from .kg import store as kg_store
+        status = {str(k.get("id") or ""): k.get("status")
+                  for k in kg_store.load_all()}
+    except Exception:
+        return 0
+    batches: dict[str, list] = {}
+    for it in load_all():
+        if it.get("origin") == "work-through" and it.get("batch_id"):
+            batches.setdefault(it["batch_id"], []).append(it)
+    n = 0
+    for bid, jobs in batches.items():
+        if any(j.get("status") in ACTIVE_STATUSES for j in jobs):
+            continue
+        kg_ids = {str(j.get("kg_id") or "") for j in jobs}
+        if kg_ids and all(k and status.get(k) == "done" for k in kg_ids):
+            remove_batch(bid)
+            n += len(jobs)
+    return n
+
+
 def batch_progress(batch_id: str) -> dict:
     """Counts by state, for the running page's progress bar and status line.
 

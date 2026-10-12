@@ -1,4 +1,4 @@
-# Ankisstant's main UI — a nav sidebar plus a stacked panel area.
+# Ankisstant's main UI — the Knowledge Gaps page, plus the pages it opens.
 #
 # It lives in one of two hosts, and can move between them without being rebuilt:
 #
@@ -24,7 +24,7 @@ import importlib
 
 from aqt import gui_hooks, mw
 from aqt.qt import (
-    QDialog, QDockWidget, QEvent, QFrame, QHBoxLayout, QLabel, QPushButton, QSize,
+    QDialog, QDockWidget, QEvent, QHBoxLayout, QLabel, QPushButton, QSize,
     QSizePolicy, QStackedWidget, Qt, QTimer, QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -50,6 +50,11 @@ TOOLS: list[tuple[str, str, str]] = [
     ("update_by_tag",    "Update by Tag",   f"{_PKG}.tools.update_by_tag"),
     ("lecture",          "AI Lecture",      f"{_PKG}.tools.lecture"),
 ]
+
+# What can be shown. Knowledge Gaps is home; the other two are visited from
+# its corner. The rest of TOOLS keeps its entry so settings and the panel
+# cache still know the names, but nothing opens them.
+PAGES = ("knowledge_gaps", "lecture", "qbank")
 
 # Rail icons, one per tool, drawn as SVG and recoloured from the live palette —
 # same reasoning as core/synapse_sidebar: they have to track whatever accent
@@ -294,144 +299,58 @@ class AnkisstantBody(QWidget):
     # ── construction ─────────────────────────────────────────────────────────
 
     def _build(self, select: str | None = None) -> None:
+        """No sidebar. The Knowledge Gaps page IS Ankisstant; AI Lecture and
+        AI QBank are pages you visit from its corner and come back from.
+
+        AI Browse, AI Create and Update by Tag have no way in any more: the
+        queue (Find & write) does both halves, a free-text card search is
+        Anki's own Browse window with ✨ AI Search, and nobody used the tag
+        tool. Their code is left where it is."""
         root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
-        root.addWidget(self._build_rail() if self._compact else self._build_sidebar())
-
+        self._holders: dict[str, QWidget] = {}
         self.stack = QStackedWidget()
         self.stack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        # Placeholder welcome page so the window has content on first open.
-        welcome = QWidget()
-        wl = QVBoxLayout(welcome)
-        wl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        wl.addWidget(QLabel("<h2 style='margin:0'>Welcome to Ankisstant</h2>"))
-        msg = QLabel("Pick a tool from the sidebar to get started.")
-        msg.setStyleSheet("color: gray;")
-        wl.addWidget(msg)
-        self.stack.addWidget(welcome)
         root.addWidget(self.stack, 1)
+        key = select if select in PAGES else "knowledge_gaps"
+        self._show_tool(key)
 
-        # Land on the tool that was showing before a pop-out, else the first.
-        wanted = [select] if select in self._nav_buttons else []
-        for key, _label, _path in TOOLS:
-            if key in self._nav_buttons:
-                wanted.append(key)
-        if wanted:
-            key = wanted[0]
-            self._nav_buttons[key].setChecked(True)
-            self._show_tool(key)
+    def show_page(self, key: str) -> None:
+        """Open one of the pages. Anything that isn't one goes home."""
+        self._show_tool(key if key in PAGES else "knowledge_gaps")
 
-    def _build_sidebar(self) -> QWidget:
-        """The wide, text-labelled nav — unchanged from before the dock existed."""
-        sidebar = QFrame()
-        sidebar.setFrameShape(QFrame.Shape.StyledPanel)
-        sidebar.setFixedWidth(200)
-        sidebar.setStyleSheet(
-            "QFrame { background-color: %s; border-right: 1px solid %s; }"
-            % (synapse.color("bg", "palette(window)"),
-               synapse.color("grey_light", "palette(mid)"))
-        )
-        side_layout = QVBoxLayout(sidebar)
-        side_layout.setContentsMargins(8, 14, 8, 8)
-        side_layout.setSpacing(4)
-
-        title = QLabel("<b style='font-size:14px'>Ankisstant</b>")
-        title.setTextFormat(Qt.TextFormat.RichText)
-        title.setStyleSheet("padding: 4px 6px 10px; opacity: 0.85;")
-        side_layout.addWidget(title)
-
-        # `palette(highlight)` is Anki's accent; with SynapsePro present we use
-        # its accent instead so the nav strip matches the rest of the shell.
-        sel_bg = synapse.color("blue", "palette(highlight)")
-        sel_fg = synapse.color("surface", "palette(highlighted-text)")
-        hover = synapse.color("hover_subtle", "rgba(127,127,127,0.12)")
-        for key, label, _path in TOOLS:
-            if not _tool_visible(key):
-                continue
-            btn = QPushButton(label)
-            btn.setCheckable(True)
-            btn.setAutoExclusive(True)
-            btn.setMinimumHeight(34)
-            btn.setStyleSheet(
-                "QPushButton { text-align: left; padding: 4px 10px; border: none; "
-                "background: transparent; }"
-                f"QPushButton:checked {{ background: {sel_bg}; color: {sel_fg}; "
-                "border-radius: 6px; }"
-                f"QPushButton:hover:!checked {{ background: {hover}; border-radius: 6px; }}"
-                "QPushButton:disabled { color: rgba(127,127,127,0.6); }"
-            )
-            btn.clicked.connect(lambda _checked=False, k=key: self._show_tool(k))
-            self._nav_buttons[key] = btn
-            side_layout.addWidget(btn)
-
-        side_layout.addStretch(1)
-
-        extras = []
-        # The way back from the pop-out. The rail has this as an icon; without
-        # it here the trip is one-way, since the wide sidebar is exactly what
-        # you get *after* popping out.
-        if synapse.synapse_available():
-            extras.append(("⧉  Dock to side panel", self._request_popout))
-        extras += [("＋  Add KG", self._open_add_kg),
-                   ("⚙  Settings", self._open_settings)]
-
-        for text, slot in extras:
-            b = QPushButton(text)
-            b.setMinimumHeight(32)
-            b.setStyleSheet(
-                "QPushButton { text-align: left; padding: 4px 10px; border: none; "
-                "background: transparent; }"
-                f"QPushButton:hover {{ background: {hover}; border-radius: 6px; }}"
-            )
-            b.clicked.connect(slot)
-            side_layout.addWidget(b)
-        return sidebar
-
-    def _build_rail(self) -> QWidget:
-        """The narrow icon rail used in the dock.
-
-        Every button is icon-only with a tooltip, so nothing here is conveyed by
-        shape alone either — hovering names it, and the queue counts are spelled
-        out in the tooltip rather than left to the dot.
-        """
-        rail = QFrame()
-        rail.setFrameShape(QFrame.Shape.NoFrame)
-        rail.setFixedWidth(44)
-        rail.setStyleSheet(
-            "QFrame { background-color: %s; border-right: 1px solid %s; }"
-            % (synapse.color("bg", "palette(window)"),
-               synapse.color("grey_light", "palette(mid)"))
-        )
-        layout = QVBoxLayout(rail)
-        layout.setContentsMargins(4, 8, 4, 8)
-        layout.setSpacing(4)
-
-        for key, label, _path in TOOLS:
-            if not _tool_visible(key):
-                continue
-            btn = self._rail_button(_TOOL_SVG.get(key, ""), label, accent=True)
-            btn.setCheckable(True)
-            btn.setAutoExclusive(True)
-            btn.clicked.connect(lambda _checked=False, k=key: self._show_tool(k))
-            self._nav_buttons[key] = btn
-            layout.addWidget(btn)
-
-        layout.addStretch(1)
-
-        pop = self._rail_button(_RAIL_SVG_EXTRA["popout"],
-                                "Open in a separate window")
-        pop.clicked.connect(self._request_popout)
-        layout.addWidget(pop)
-
-        add = self._rail_button(_RAIL_SVG_EXTRA["add_kg"], "Add a knowledge gap")
-        add.clicked.connect(self._open_add_kg)
-        layout.addWidget(add)
-
-        gear = self._rail_button(_RAIL_SVG_EXTRA["settings"], "Ankisstant settings")
-        gear.clicked.connect(self._open_settings)
-        layout.addWidget(gear)
-        return rail
+    def _wrap_page(self, key: str, widget: QWidget) -> QWidget:
+        """A visited page, with the way back above it."""
+        holder = self._holders.get(key)
+        if holder is not None:
+            try:
+                if widget.parent() is holder:
+                    return holder
+            except RuntimeError:
+                pass
+        holder = QWidget()
+        holder._ank_key = key
+        col = QVBoxLayout(holder)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(0)
+        bar = QHBoxLayout()
+        bar.setContentsMargins(8, 6, 8, 2)
+        back = QPushButton("← Gaps")
+        back.setAutoDefault(False)
+        back.setToolTip("Back to Knowledge Gaps")
+        back.setStyleSheet(
+            "QPushButton { padding: 3px 10px; font-size: 11px; "
+            "border: 1px solid rgba(127,127,127,0.3); border-radius: 5px; "
+            "background: transparent; }"
+            "QPushButton:hover { background: rgba(127,127,127,0.12); }")
+        back.clicked.connect(lambda: self.show_page("knowledge_gaps"))
+        bar.addWidget(back)
+        bar.addStretch(1)
+        col.addLayout(bar)
+        col.addWidget(widget, 1)
+        self._holders[key] = holder
+        return holder
 
     def _rail_button(self, svg: str, tooltip: str, accent: bool = False) -> QToolButton:
         btn = QToolButton()
@@ -543,20 +462,12 @@ class AnkisstantBody(QWidget):
                 print(f"[ankisstant] {key}.refresh_queue_state failed: {e}")
 
     def show_create_tool(self) -> None:
-        """Programmatic switch to the Create tool — used after Browse hands off
-        gaps."""
-        btn = self._nav_buttons.get("card_creator")
-        if btn is not None and btn.isEnabled():
-            btn.setChecked(True)
-        self._show_tool("card_creator")
+        """Kept for old callers. There is no Create page any more."""
+        self.show_page("knowledge_gaps")
 
     def show_browse_tool(self) -> None:
-        """Programmatic switch to the Browse tool — used after the KG page
-        queues gaps for Browse."""
-        btn = self._nav_buttons.get("browse")
-        if btn is not None and btn.isEnabled():
-            btn.setChecked(True)
-        self._show_tool("browse")
+        """Kept for old callers. There is no Browse page any more."""
+        self.show_page("knowledge_gaps")
 
     def _show_tool(self, key: str) -> None:
         # Pick a panel: tool's get_panel() if visible, else a placeholder.
@@ -604,6 +515,8 @@ class AnkisstantBody(QWidget):
                 widget._ank_compacted = self._compact
             except Exception:
                 pass
+        if key != "knowledge_gaps":
+            widget = self._wrap_page(key, widget)
         self.load_panel(widget)
 
     def load_panel(self, widget: QWidget) -> None:
@@ -1003,6 +916,9 @@ def _toggle_mode() -> None:
 def _current_tool_key(body) -> str | None:
     try:
         showing = body.stack.currentWidget()
+        key = getattr(showing, "_ank_key", None)
+        if key:
+            return key
         for key, widget in body._panel_cache.items():
             if widget is showing:
                 return key

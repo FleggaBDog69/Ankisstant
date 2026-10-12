@@ -2723,6 +2723,12 @@ class CreatorPanel(QWidget):
         store. Cheap, fail-open; called on show and on job completion."""
         from . import create_jobs
         try:
+            # Leftovers from a work-through you already applied — otherwise
+            # they sit here looking like gaps queued from nowhere.
+            create_jobs.drop_settled_work_through()
+        except Exception as e:
+            print(f"[ankisstant] work-through cleanup failed: {e}")
+        try:
             items = create_jobs.load_all()
         except Exception:
             items = []
@@ -2789,8 +2795,14 @@ class CreatorPanel(QWidget):
             # route to the written cards, not a way back into the run.
             work = str(jobs[0].get("origin") or "") == "work-through"
             name = "Work through gaps" if work else "Mass AI Create"
-            bits = f"{name} — {len(jobs)} gap(s) ({ready} ready"
+            # Gaps, not jobs: a point re-written from the results screen is a
+            # second job for the same gap, and counting jobs over-states it.
+            n_gaps = len({j.get("kg_id") or j.get("id") for j in jobs})
+            when = str(jobs[0].get("created_at") or "")[:10]
+            bits = f"{name} — {n_gaps} gap(s) ({ready} ready"
             bits += f", {errs} failed)" if errs else ")"
+            if when:
+                bits += f" · from {when}"
             lbl = QLabel(bits)
             if work:
                 lbl.setToolTip(
