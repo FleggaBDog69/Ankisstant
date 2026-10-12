@@ -44,8 +44,6 @@ _PKG = __name__.split(".")[0]
 TOOLS: list[tuple[str, str, str]] = [
     ("knowledge_gaps",   "Knowledge Gaps",  f"{_PKG}.tools.knowledge_gaps"),
     ("qbank",            "AI QBank",        f"{_PKG}.tools.qbank"),
-    ("browse",           "AI Browse",       f"{_PKG}.tools.browse"),
-    ("card_creator",     "AI Create",       f"{_PKG}.tools.card_creator"),
     ("update_by_tag",    "Update by Tag",   f"{_PKG}.tools.update_by_tag"),
     ("lecture",          "AI Lecture",      f"{_PKG}.tools.lecture"),
 ]
@@ -240,14 +238,6 @@ class AnkisstantBody(QWidget):
         return holder
 
     # ── queue handoff (Browse → Create) ──────────────────────────────────────
-
-    def show_create_tool(self) -> None:
-        """Kept for old callers. There is no Create page any more."""
-        self.show_page("knowledge_gaps")
-
-    def show_browse_tool(self) -> None:
-        """Kept for old callers. There is no Browse page any more."""
-        self.show_page("knowledge_gaps")
 
     def _show_tool(self, key: str) -> None:
         # Pick a panel: tool's get_panel() if visible, else a placeholder.
