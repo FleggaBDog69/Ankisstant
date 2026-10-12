@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import copy
+
 from aqt import mw
 
 # The add-on's package/folder name. When installed from AnkiWeb this is the
@@ -78,6 +80,10 @@ DEFAULTS: dict = {
     # _migrate_dead_gemini_models). Flips to True after the first rewrite so a
     # paying user can re-select Pro afterwards and have it stick.
     "gemini_freetier_migrated": False,
+    # One-time add of the MQ type's AI "explanation" field for configs saved
+    # before it existed (see _migrate_mq_explanation_field). Flips to True so a
+    # user who later deletes the field in Settings has it stay deleted.
+    "mq_explanation_field_migrated": False,
     "first_run_seen": False,
     "debug_logging": False,
     "anthropic_api_key": "",
@@ -706,6 +712,7 @@ def ensure_config() -> None:
     _migrate_group_axes(merged)
     _migrate_dead_gemini_models(merged)
     _migrate_stale_claude_models(merged)
+    _migrate_mq_explanation_field(merged)
     if merged != raw:
         mw.addonManager.writeConfig(ADDON, merged)
 
@@ -722,6 +729,7 @@ def load_config() -> dict:
     _migrate_ai_matrix(cfg)
     _migrate_dead_gemini_models(cfg)
     _migrate_stale_claude_models(cfg)
+    _migrate_mq_explanation_field(cfg)
     return cfg
 
 
@@ -838,6 +846,42 @@ _CLAUDE_SUCCESSORS: dict[str, str] = {
     "claude-sonnet-4-5": "claude-sonnet-5",
     "claude-sonnet-4":   "claude-sonnet-5",
 }
+
+
+def _migrate_mq_explanation_field(cfg: dict) -> None:
+    """Give a saved MQ type the AI "explanation" field it predates.
+
+    Lists are replaced, not merged (_deep_merge), so a type list saved before
+    the field was added to DEFAULTS never gains it. The create call only asks
+    for the fields the type declares, so those MQ cards went out with no
+    explanation at all — and with the request "merged", the separate-call
+    fallback never fired either. Silent, not a crash.
+
+    Inserted right after "concept" (where DEFAULTS has it), copied from
+    DEFAULTS so the prompt and Anki target are the tuned ones. Runs once,
+    guarded by mq_explanation_field_migrated.
+    """
+    if not isinstance(cfg, dict) or cfg.get("mq_explanation_field_migrated"):
+        return
+    try:
+        types = cfg["tools"]["knowledge_gaps"]["types"]
+        default_mq = next(t for t in DEFAULTS["tools"]["knowledge_gaps"]["types"]
+                          if t.get("key") == "mq")
+        field = next(f for f in default_mq["fields"] if f.get("key") == "explanation")
+    except (KeyError, TypeError, StopIteration):
+        return
+    for t in types if isinstance(types, list) else []:
+        if not isinstance(t, dict) or str(t.get("key", "")).lower() != "mq":
+            continue
+        fields = t.get("fields")
+        if not isinstance(fields, list):
+            continue
+        keys = [f.get("key") for f in fields if isinstance(f, dict)]
+        if "explanation" in keys:
+            continue
+        at = keys.index("concept") + 1 if "concept" in keys else 0
+        fields.insert(at, copy.deepcopy(field))
+    cfg["mq_explanation_field_migrated"] = True
 
 
 def _migrate_stale_claude_models(cfg: dict) -> None:

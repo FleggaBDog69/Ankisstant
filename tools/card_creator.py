@@ -3624,6 +3624,11 @@ class CreatorPanel(QWidget):
             if obj:
                 system_prompt += obj
             self._gen_plan = plan
+            # The explanation only folds in if the type declares the field. A
+            # type without one would otherwise get it neither merged nor from
+            # the separate call below — no explanation at all.
+            if merge_explanation and "explanation" not in plan.note_fields:
+                merge_explanation = False
             if gap is not None and req_fields:
                 refs = engine.build_refs_context(req_fields, gap)
                 if refs:

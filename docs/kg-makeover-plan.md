@@ -1,7 +1,15 @@
 # Implementation plan — KG types declarative makeover
 
-> Companion to `kg-types-audit.md` (Parts A & B). This is the agreed implementation
-> plan, parked for later. Not yet started.
+> Companion to `kg-types-audit.md` (Parts A & B).
+>
+> **Status (Oct 2026): built.** Steps 1–6 landed in June (1.8–1.9): `tools/kg/engine.py`,
+> the extended DEFAULTS, Create/Browse/capture on the engine, the field editor in
+> Settings, and the single-source `_load_types()`. The planned
+> `_migrate_kg_field_specs` was never written — `engine.normalise_field` infers the
+> new keys instead — which left saved MQ types without the `explanation` field, so
+> no explanation was ever requested. `_migrate_mq_explanation_field` fixes that one
+> case. Still hardcoded: the LO analyser shows on `type == "lo"`, and Browse /
+> gen_prompt / create_jobs branch on `"mq"` for the explanation and the stem image.
 
 ## Context
 Today a KG type's *fields* are data-driven, but everything around them is hardcoded:

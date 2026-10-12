@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed — MQ cards had no AI explanation
+
+- **The explanation was never asked for.** The one-call request only asks for
+  fields the KG type declares, and an MQ type saved before the *Explanation (AI)*
+  field existed never gained it — config lists are replaced, not merged. Because
+  the request counted as "merged", the separate explanation call didn't fire
+  either. A one-time migration now adds the field to an MQ type that lacks it
+  (delete it in Settings afterwards and it stays deleted), and Create falls back
+  to the separate call whenever the type has no such field.
+
 ### Changed — queues stop being busywork
 
 - **Bulk search reads on open**, like Mass AI Create now does.
