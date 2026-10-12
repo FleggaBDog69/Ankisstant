@@ -42,6 +42,8 @@ zip -rXq "$out" . \
   --exclude 'package.sh' \
   --exclude '*.ankiaddon' \
   --exclude '_phaseA_backup_*' \
-  --exclude '_phaseA_backup_*/*'
+  --exclude '_phaseA_backup_*/*' \
+  --exclude 'scratchpad' \
+  --exclude 'scratchpad/*'
 
 echo "wrote $out"
