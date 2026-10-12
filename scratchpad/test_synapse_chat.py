@@ -97,7 +97,12 @@ def _install_addon_package():
 
 _install_addon_package()
 
-synapse = __import__(f"{PKG}.core.synapse", fromlist=["synapse"])
+# The failure paths below log errors on purpose. Point the log at a throwaway
+# file, or every test run writes fake "webview died" lines into the real one.
+_log = __import__(f"{PKG}.core.log", fromlist=["log"])
+_log._LOG_PATH = os.path.join(tempfile.mkdtemp(prefix="ank-test-log-"), "test.log")
+
+synapse =__import__(f"{PKG}.core.synapse", fromlist=["synapse"])
 chat = __import__(f"{PKG}.core.synapse_chat", fromlist=["synapse_chat"])
 store = __import__(f"{PKG}.tools.kg.store", fromlist=["store"])
 

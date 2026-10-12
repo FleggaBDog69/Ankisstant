@@ -34,6 +34,10 @@ restart Anki.
 - [ ] Groups view with no group picked: just the heading and a hint, no
       greyed-out button rows. Pick a group: everything appears.
 - [ ] Menus read "Find & write …" with the ampersand.
+- [ ] Make the window narrow: the gap pane's buttons wrap to a new line;
+      Save and Delete stay visible; the list still shows a screenful of gaps.
+- [ ] Gaps with and without a notes line start at the same x.
+- [ ] Manage groups… shows the END of each course branch, not "!!…".
 
 ## 2. Work-through — one gap, end to end
 - [ ] READ: the points arrive without you pressing anything.
@@ -92,6 +96,9 @@ restart Anki.
 - [ ] Settings → Tools: one "✨ AI Search box…" tick box, no AI Create switch.
       The ✨ AI Search box still appears in Anki's Browse window.
 - [ ] Settings → QBank: "Add an AI-written explanation…" is unticked.
+- [ ] Writing cards has no "On failure", "Background", "Default # cards" or
+      "Mass create columns" rows; the month tag is there and NOT on Finding
+      cards. Untick it, Save, reopen: still unticked.
 
 ## 5c. Data safety (optional, 1 minute)
 - [ ] Use the kg-add skill (or drop a line into `user_files/kg_inbox.json`)

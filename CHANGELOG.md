@@ -29,6 +29,19 @@
   shown, holding only what still runs. The found-cards audit tag is back on
   screen — it was only shown in the old Browse panel mode. Settings → Tools
   has one tick box for the in-browser AI Search, and no AI Create switch.
+- **Switches that did nothing are gone** from Writing cards: "On failure:
+  auto-regenerate", its retry count and paste-mode switch (nothing
+  regenerates — a weak card is flagged on Review), "Generate in the
+  background", "Default # cards", "# cards per LO gap" and the Mass AI Create
+  columns. Stored values are kept. "Max parallel background jobs" is now
+  "Cards written at once", which is what it sets.
+- **The month tag is one control**, on Writing cards. It was drawn on both
+  Finding and Writing cards as two linked copies of one setting.
+- **Wording that pointed at screens that no longer exist** — "the creator
+  panel", "the Create editors", "AI Browse", "Analyse KG sub-feature",
+  "Ankisstant's own rail" — now names what's there.
+- **Setup wizard** asks the same things Settings → Tools does: no AI Create
+  switch and no "Full AI Browse panel", just the ✨ AI Search tick box.
 
 ### Fixed — UI
 
@@ -40,6 +53,22 @@
 - **The gap pane ran off the right edge** (Delete, "added …"). Its actions are
   two rows now; the empty state no longer shows a bare "Type:" and "Tags:".
 - **Groups with nothing picked** hide their controls instead of greying them.
+- **In a narrow window** the gap pane's buttons and the Gaps page's buttons
+  wrap onto a second line instead of pushing Save/Delete off the edge, and the
+  list and the pane get about half each.
+- **Gap lists line up**: a gap with a notes line sat ~10px left of one
+  without. Long titles are cut with "…" instead of a sideways scrollbar, and
+  a long title opens at its start, not its end.
+- **Manage groups showed most course branches as "!!…"** — the table wrapped
+  the tag after its "!!". One line now, cut from the left, so the part that
+  differs is what you see.
+- **Settings**: Edit/Remove on notetype, QBank and exam rows no longer pushed
+  off by a long summary; model names show from the start ("claude-haiku…",
+  not "laude-haiku…"); the CLI-path hint isn't squeezed into a sliver; the
+  exam-dates list is taller; Bulk import's group box shows its whole hint;
+  the type editor's field list doesn't scroll sideways.
+- **"&" in names**: "Reset to Australian & WA preset", and group names with an
+  & in menus and on the Group button, lost the &.
 - **AI Lecture options** read as one cap ("Cap at 40 notes / or size the cap
   from the lecture"); the notetype box no longer stretches across the window.
 

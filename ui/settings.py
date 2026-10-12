@@ -50,6 +50,9 @@ class _ModelField(QWidget):
         self._cb = QComboBox()
         self._cb.setEditable(True)
         self._cb.setMinimumWidth(min_width)
+        # Wide enough for the longest model ID it lists. Without this the box
+        # took a fixed width and showed the END of a long ID ("laude-haiku-4-5-…").
+        self._cb.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         self._cb.setToolTip(
             "Pick a known model or type a custom model ID. Saved separately per "
             "provider, so switching providers keeps each one's choice."
@@ -68,6 +71,8 @@ class _ModelField(QWidget):
         if cur and self._cb.findText(cur) < 0:
             self._cb.addItem(cur)
         self._cb.setCurrentText(cur)
+        if self._cb.lineEdit() is not None:
+            self._cb.lineEdit().setCursorPosition(0)
         self._cb.blockSignals(False)
 
     def _capture(self) -> None:
@@ -122,6 +127,12 @@ def _synapse_theme(widget: QWidget, dialog: bool = False) -> None:
         pass
 
 
+def _amp(text: str) -> str:
+    """Escape & for a button or group-box label, where a single & is eaten
+    as a keyboard mnemonic ("Australian & WA" showed as "Australian  WA")."""
+    return str(text).replace("&", "&&")
+
+
 def _expand_form(layout: QFormLayout) -> QFormLayout:
     """Make QFormLayout field columns fill the row width, and put a label ABOVE
     its field when the two don't fit side by side.
@@ -156,34 +167,17 @@ def _slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (text or "").lower())[:24] or "qbank"
 
 
-def _link_checkbox(a: QCheckBox, b: QCheckBox) -> None:
-    """Keep two checkboxes that edit the same shared setting in sync — Qt
-    only re-emits `toggled` when the value actually changes, so this can't
-    loop. Used for "Month tag", which is shown on both the Browse and Create
-    tabs (it's a single global setting, just relevant to both flows)."""
-    a.toggled.connect(b.setChecked)
-    b.toggled.connect(a.setChecked)
-
-
-def _link_lineedit(a: QLineEdit, b: QLineEdit) -> None:
-    """Keep two line edits that edit the same shared setting in sync (see
-    `_link_checkbox` — same no-loop guarantee via Qt's change-only emission)."""
-    a.textChanged.connect(b.setText)
-    b.textChanged.connect(a.setText)
-
-
 def _month_tag_group(cfg: dict) -> tuple[QGroupBox, QCheckBox, QLineEdit]:
-    """Build a 'Month tag' group box — shown on both the Browse and Create
-    tabs since both flows can apply it. Returns the box plus the checkbox/
-    line-edit so the caller can sync the two copies and read back values."""
+    """Build the 'Month tag' group box (Writing cards tab). Returns the box
+    plus the checkbox/line-edit to read back on save."""
     box = QGroupBox("Month tag")
     form = _expand_form(QFormLayout(box))
     form.setVerticalSpacing(8)
-    chk = QCheckBox("Add a month tag to created && unsuspended cards")
+    chk = QCheckBox("Add a month tag to written && found cards")
     chk.setChecked(bool(cfg.get("month_tag_enabled", True)))
     chk.setToolTip(
-        "When on, every card you create (Create) or unsuspend/tag (Browse) "
-        "also gets a tag <prefix>::<YYYY-MM> for the current month."
+        "When on, every card a run writes or finds and you keep also gets "
+        "a tag <prefix>::<YYYY-MM> for the current month."
     )
     form.addRow(chk)
     prefix = QLineEdit(str(cfg.get("month_tag_prefix", "Ankisstant::Month") or ""))
@@ -713,7 +707,9 @@ class _AITab(QWidget):
         cli_hint.setWordWrap(True)
         cli_hint.setTextFormat(Qt.TextFormat.RichText)
         cli_hint.setStyleSheet("color: gray;")
-        cli_form.addRow("", cli_hint)
+        # Spanning the row: in the field column a wrapped label was squeezed
+        # to a third of the width, six lines deep.
+        cli_form.addRow(cli_hint)
         self._cli_extra = QLineEdit(" ".join(cfg.get("claude_cli_extra_args") or []))
         self._cli_extra.setPlaceholderText("e.g. --permission-mode bypassPermissions")
         cli_form.addRow("CLI extra args:", self._cli_extra)
@@ -734,7 +730,7 @@ class _AITab(QWidget):
         ollama_hint.setWordWrap(True)
         ollama_hint.setTextFormat(Qt.TextFormat.RichText)
         ollama_hint.setStyleSheet("color: gray;")
-        ollama_form.addRow("", ollama_hint)
+        ollama_form.addRow(ollama_hint)
         layout.addRow("", self._ollama_container)
 
         self._default_model = _ModelField(
@@ -839,7 +835,7 @@ class _AITab(QWidget):
             "QLabel { background: rgba(80,160,255,0.12); border: 1px solid "
             "rgba(80,160,255,0.5); border-radius: 6px; padding: 10px; }"
         )
-        layout.addRow("", self._manual_note)
+        layout.addRow(self._manual_note)
         self._form = layout
 
         test_row = QHBoxLayout()
@@ -1035,6 +1031,7 @@ class _AITab(QWidget):
         lbl = QLabel(f"<b>{entry['label']}</b> "
                      f"<span style='color:gray;font-size:11px'>· {name} · </span>{status}")
         lbl.setTextFormat(Qt.TextFormat.RichText)
+        lbl.setWordWrap(True)   # long summaries wrap instead of pushing Edit/Remove off
         row.addWidget(lbl, 1)
         btn = QPushButton("Remove" if entry["installed"] else "Install")
         if entry["installed"]:
@@ -1178,7 +1175,7 @@ class _GlobalTab(QWidget):
         self._tool_kg.setChecked(bool(tools_cfg.get("knowledge_gaps", {}).get("enabled", True)))
         tb.addWidget(self._tool_kg)
 
-        self._tool_ga = QCheckBox("    ↳ Analyse Knowledge Gaps (AI sub-feature)")
+        self._tool_ga = QCheckBox("    ↳ 🔬 Analyse this LO (on learning-objective gaps)")
         self._tool_ga.setChecked(bool(tools_cfg.get("gap_analyser", {}).get("enabled", True)))
         self._tool_ga.setEnabled(self._tool_kg.isChecked())
         self._tool_kg.toggled.connect(self._tool_ga.setEnabled)
@@ -1295,7 +1292,7 @@ class _QBankTab(QWidget):
         tl.addWidget(add_per)
 
         tl.addWidget(QLabel("Exam dates (shown red on the heatmap):"))
-        self._exam_scroll, _i2, self._exam_list = _scroll_list(80, 140)
+        self._exam_scroll, _i2, self._exam_list = _scroll_list(120, 260)
         tl.addWidget(self._exam_scroll)
         add_ex = QPushButton("+ Add exam date")
         add_ex.clicked.connect(self._add_exam)
@@ -1390,6 +1387,7 @@ class _QBankTab(QWidget):
             row = QHBoxLayout()
             lbl = QLabel(f"<b>{p['name']}</b>  <span style='color:gray;font-size:11px'>{p['url']}</span>")
             lbl.setTextFormat(Qt.TextFormat.RichText)
+            lbl.setWordWrap(True)   # long summaries wrap instead of pushing Edit/Remove off
             row.addWidget(lbl, stretch=1)
             edit_btn = QPushButton("Edit")
             edit_btn.clicked.connect(lambda _, idx=i: self._edit_platform(idx))
@@ -1440,6 +1438,7 @@ class _QBankTab(QWidget):
             row = QHBoxLayout()
             lbl = QLabel(f"{p['from']}  →  {p['to']}:  <b>{p['daily']} Q/day</b>")
             lbl.setTextFormat(Qt.TextFormat.RichText)
+            lbl.setWordWrap(True)   # long summaries wrap instead of pushing Edit/Remove off
             row.addWidget(lbl, stretch=1)
             del_btn = QPushButton("Remove")
             del_btn.clicked.connect(lambda _, idx=i: self._remove_period(idx))
@@ -1477,6 +1476,7 @@ class _QBankTab(QWidget):
             row = QHBoxLayout()
             lbl = QLabel(f"<b>{e['date']}</b>  —  {e['label']}")
             lbl.setTextFormat(Qt.TextFormat.RichText)
+            lbl.setWordWrap(True)   # long summaries wrap instead of pushing Edit/Remove off
             row.addWidget(lbl, stretch=1)
             del_btn = QPushButton("Remove")
             del_btn.clicked.connect(lambda _, idx=i: self._remove_exam(idx))
@@ -1557,10 +1557,14 @@ class _BrowseTab(QWidget):
             "later which cards Ankisstant touched.")
         layout.addRow("Tag found cards with:", self._audit_tag)
 
-        # Shared with Writing cards — both halves of a run apply it, so it's
-        # shown (and kept in sync) in both places. See _link_checkbox.
-        mt_box, self._month_tag, self._month_tag_prefix = _month_tag_group(cfg)
-        layout.addRow(mt_box)
+        # The month tag is ONE setting, so it's one control — on Writing
+        # cards. It used to be drawn here as well, two linked copies of the
+        # same box, which reads as two settings.
+        mt_note = QLabel("The month tag (Settings → Writing cards) goes on "
+                         "found cards too.")
+        mt_note.setWordWrap(True)
+        mt_note.setStyleSheet("color: gray; font-size: 11px;")
+        layout.addRow(mt_note)
 
         # ── Native browser AI Search — scope filters ─────────────────────────
         # Restricts what the "✨ AI Search" checkbox in Anki's own Browse window
@@ -1940,7 +1944,7 @@ class _TypeEditorDialog(QDialog):
         )
         type_name_hint.setStyleSheet("color: gray;")
         type_name_hint.setTextFormat(Qt.TextFormat.RichText)
-        form.addRow("", type_name_hint)
+        form.addRow(type_name_hint)
 
         if existing:
             key_lbl = QLabel(f"<small>key: <code>{existing.get('key', '')}</code></small>")
@@ -1973,6 +1977,11 @@ class _TypeEditorDialog(QDialog):
 
         self._fields_list = QListWidget()
         self._fields_list.setAlternatingRowColors(True)
+        # One line a field, cut at the edge — the full summary is the tooltip.
+        # It used to scroll sideways to show each field's placeholder text.
+        self._fields_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._fields_list.setTextElideMode(Qt.TextElideMode.ElideRight)
         self._fields_list.itemDoubleClicked.connect(lambda _it: self._edit_field())
         self._refresh_fields_list()
         fb.addWidget(self._fields_list)
@@ -2034,6 +2043,7 @@ class _TypeEditorDialog(QDialog):
                 ph = f["placeholder"]
                 sub += f' · "{ph[:40] + ("…" if len(ph) > 40 else "")}"'
             li = QListWidgetItem(label + "  ·  " + sub)
+            li.setToolTip(f"{f.get('label','')}\n{sub}")
             li.setData(Qt.ItemDataRole.UserRole, f.get("key"))
             self._fields_list.addItem(li)
 
@@ -2187,7 +2197,7 @@ class _KnowledgeGapsTab(QWidget):
         tv.setSpacing(6)
         hint = QLabel(
             "Categories for KG entries. The three default types — MQ, KG, LO — "
-            "map onto QBank captures, manual entries, and Analyse-LO results. "
+            "are QBank captures, gaps you add by hand, and learning objectives. "
             "Add your own, rename, recolour, or delete."
         )
         hint.setStyleSheet("color: gray; font-size: 11px;")
@@ -2216,7 +2226,7 @@ class _KnowledgeGapsTab(QWidget):
         root.addWidget(types_box)
 
         # ── Analyse KG (formerly its own settings tab) ────────────────────────
-        analyse_box = QGroupBox("Analyse KG (AI sub-feature)")
+        analyse_box = QGroupBox("🔬 Analyse this LO")
         ab = _expand_form(QFormLayout(analyse_box))
         ab.setContentsMargins(10, 8, 10, 8)
         ab.setVerticalSpacing(8)
@@ -2246,8 +2256,9 @@ class _KnowledgeGapsTab(QWidget):
         ab.addRow("Max gaps to return:", self._ga_max_gaps)
 
         ga_hint = QLabel(
-            "<small>Pulls cards under a tag, asks AI what's missing, and "
-            "pushes the approved gaps into the queue above.</small>"
+            "<small>The button on a learning-objective gap: pulls your cards "
+            "under its tag, asks the AI what the objective needs that they "
+            "don't cover, and adds what you approve to the gap's notes.</small>"
         )
         ga_hint.setTextFormat(Qt.TextFormat.RichText)
         ga_hint.setStyleSheet("color: gray;")
@@ -2257,10 +2268,10 @@ class _KnowledgeGapsTab(QWidget):
         root.addWidget(analyse_box)
 
         outro = QLabel(
-            "<small>The Knowledge Gaps tab is the unified queue for things you "
-            "don't know — from manual notes, the Analyse KG sub-feature, captured "
-            "QBank misses, or items saved from Browse. From any KG you can send "
-            "to AI Browse, or create a card directly.</small>"
+            "<small>Knowledge Gaps is the one list of things you don't know — "
+            "added by hand, imported, captured from a QBank, or from the AI "
+            "chat. Send them to the queue and ▶ Run queue finds and writes "
+            "cards for them, or write a card yourself.</small>"
         )
         outro.setTextFormat(Qt.TextFormat.RichText)
         outro.setStyleSheet("color: gray;")
@@ -2438,61 +2449,25 @@ class _CreatorTab(QWidget):
         self._audit_tag = QLineEdit(cc_cfg.get("audit_tag", ""))
         top_form.addRow("Audit tag:", self._audit_tag)
 
-        self._n_cards = QSpinBox()
-        self._n_cards.setRange(1, 40)
-        self._n_cards.setValue(int(cc_cfg.get("default_n_cards", 10)))
-        top_form.addRow("Default # cards:", self._n_cards)
-
-        self._gap_n_cards = QSpinBox()
-        self._gap_n_cards.setRange(1, 20)
-        self._gap_n_cards.setValue(int(cc_cfg.get("gap_n_cards", 3)))
-        top_form.addRow("# cards per LO gap:", self._gap_n_cards)
-
-        self._bg_gen = QCheckBox("Generate cards in the background (review later)")
-        self._bg_gen.setChecked(bool(cc_cfg.get("background_generation", True)))
-        self._bg_gen.setToolTip(
-            "When on, Generate runs in the background so you can keep using Anki; "
-            "finished cards appear in a 'Ready to review' list. When off, generation "
-            "blocks and opens the review window immediately (the old behaviour)."
-        )
-        top_form.addRow("Background:", self._bg_gen)
-
+        # Gone from here: "Default # cards", "# cards per LO gap", "Generate in
+        # the background" and the Mass AI Create column switches. They belonged
+        # to the Create screens that no longer exist; nothing read them, so
+        # they were switches that did nothing. Stored values are left alone
+        # (Save merges over the old config).
         self._max_parallel = QSpinBox()
         self._max_parallel.setRange(1, 6)
         self._max_parallel.setValue(int(cc_cfg.get("max_parallel_jobs", 2)))
         self._max_parallel.setToolTip(
-            "How many background generations may run at once. Extra ones queue. "
-            "The manual/paste provider always runs one at a time."
+            "How many gaps Find & write writes cards for at the same time. "
+            "Extra ones wait their turn. The manual/paste provider always does "
+            "one at a time."
         )
-        top_form.addRow("Max parallel background jobs:", self._max_parallel)
-
-        # Mass AI Create's per-gap override columns. Off means the batch-level
-        # setting applies to every gap, which is the simpler table; on adds a
-        # column so one gap can differ from the rest. Notetype is deliberately
-        # not offered per gap — the whole batch commits through one profile.
-        mc_cols = tool_config("card_creator").get("mass_create_columns") or {}
-        self._mc_tag_col = QCheckBox("Per-gap tag column")
-        self._mc_tag_col.setChecked(bool(mc_cols.get("tag", True)))
-        self._mc_tag_col.setToolTip(
-            "Adds a Tag box to each row in Mass AI Create, on top of the tags the "
-            "gap already carries. Useful when one batch spans several topics.")
-        self._mc_deck_col = QCheckBox("Per-gap deck column")
-        self._mc_deck_col.setChecked(bool(mc_cols.get("deck", False)))
-        self._mc_deck_col.setToolTip(
-            "Adds a Deck box to each row in Mass AI Create. Leave a row blank to "
-            "use the batch deck.")
-        mc_row = QHBoxLayout()
-        mc_row.addWidget(self._mc_tag_col)
-        mc_row.addWidget(self._mc_deck_col)
-        mc_row.addStretch(1)
-        mc_holder = QWidget()
-        mc_holder.setLayout(mc_row)
-        top_form.addRow("Mass create columns:", mc_holder)
+        top_form.addRow("Cards written at once:", self._max_parallel)
 
         root.addLayout(top_form)
 
-        # Shared with Browse — both flows can apply it, so it's shown (and
-        # kept in sync) in both places. See _link_checkbox/_link_lineedit.
+        # Applies to found cards as well as written ones; this is its only
+        # control (Finding cards points here).
         mt_box, self._month_tag, self._month_tag_prefix = _month_tag_group(cfg)
         root.addWidget(mt_box)
 
@@ -2500,7 +2475,8 @@ class _CreatorTab(QWidget):
         nt_box = QGroupBox("Notetypes")
         nt_layout = QVBoxLayout(nt_box)
         nt_hint = QLabel(
-            "The creator panel's notetype dropdown lists these profiles. "
+            "The notetypes Find & write can write into (the “as” box on its "
+            "plan page). "
             "Each profile maps a notetype to its field layout and can carry "
             "its own prompt addendum so AI tailors output to that style "
             "(e.g. the Malleus deck). Add as many as you like."
@@ -2526,15 +2502,15 @@ class _CreatorTab(QWidget):
         qp_box = QGroupBox("Card quality pass")
         qp_layout = QVBoxLayout(qp_box)
         qp_hint = QLabel(
-            "Scores each generated card against a retrieval-force rubric before "
-            "the review screen, and acts on the score (pass / flag / regenerate). "
-            "Off by default. Per-notetype overrides live in each notetype's editor."
+            "Scores each written card against a retrieval-force rubric before "
+            "the Review step, and flags the ones that fall short so you can fix "
+            "or untick them. Per-notetype overrides live in each notetype's editor."
         )
         qp_hint.setWordWrap(True)
         qp_hint.setStyleSheet("color: gray; font-size: 11px;")
         qp_layout.addWidget(qp_hint)
 
-        self._qp_enabled = QCheckBox("Score generated cards before review")
+        self._qp_enabled = QCheckBox("Score written cards before review")
         self._qp_enabled.setChecked(bool(self._qp_seed.get("enabled", False)))
         qp_layout.addWidget(self._qp_enabled)
 
@@ -2548,13 +2524,6 @@ class _CreatorTab(QWidget):
             1 if self._qp_seed.get("grading_mode") == "same_call" else 0)
         qp_form.addRow("Grading mode:", self._qp_mode)
 
-        self._qp_action = QComboBox()
-        self._qp_action.addItem("Flag only — pre-fill the regen hint", "flag_only")
-        self._qp_action.addItem("Auto-regenerate failures", "auto_regenerate")
-        self._qp_action.setCurrentIndex(
-            1 if self._qp_seed.get("verdict_action") == "auto_regenerate" else 0)
-        qp_form.addRow("On failure:", self._qp_action)
-
         self._qp_atomicity = QSpinBox()
         self._qp_atomicity.setRange(1, 6)
         self._qp_atomicity.setValue(int(self._qp_seed.get("atomicity_max_clozes", 2)))
@@ -2566,20 +2535,13 @@ class _CreatorTab(QWidget):
             "scoring agree.")
         qp_form.addRow("Flag cards with more than N clozes:", self._qp_atomicity)
 
-        self._qp_retries = QSpinBox()
-        self._qp_retries.setRange(0, 3)
-        self._qp_retries.setValue(int(self._qp_seed.get("auto_regen_max_retries", 2)))
-        qp_form.addRow("Max auto-regen retries:", self._qp_retries)
-
         # Grader model lives on the AI tab (Settings → AI → "Quality pass" model).
 
         qp_layout.addLayout(qp_form)
 
-        self._qp_regen_manual = QCheckBox(
-            "Allow auto-regenerate in manual/paste mode (each retry is another paste)")
-        self._qp_regen_manual.setChecked(bool(self._qp_seed.get("auto_regen_in_manual", False)))
-        qp_layout.addWidget(self._qp_regen_manual)
-
+        # No "On failure" / retries / regenerate-in-paste-mode controls: nothing
+        # regenerates. A card that falls short is flagged on the Review step and
+        # you decide. The switches were there, set, and did nothing.
         self._qp_prefer_skill = QCheckBox(
             "Prefer the anki-card-scorer skill on Anthropic (saves tokens)")
         self._qp_prefer_skill.setChecked(bool(self._qp_seed.get("prefer_skill", True)))
@@ -2596,7 +2558,8 @@ class _CreatorTab(QWidget):
             "chosen <b>region</b>) into <b>topic-based</b> generation, so cards cite "
             "real URLs instead of invented ones. In source mode your pasted material "
             "is the source, so grounding is skipped. Per-notetype overrides live "
-            "in each notetype's editor; a per-batch checkbox sits on the Create panel."
+            "in each notetype's editor; each run has its own tick box on the "
+            "Find &amp; write window."
         )
         gr_hint.setTextFormat(Qt.TextFormat.RichText)
         gr_hint.setWordWrap(True)
@@ -2663,9 +2626,9 @@ class _CreatorTab(QWidget):
         img_box = QGroupBox("Online images")
         img_layout = QVBoxLayout(img_box)
         img_hint = QLabel(
-            "Find images for cards from the review screen. <b>Auto-image</b> lets "
-            "the AI flag cards that need a visual and fetches candidates for just "
-            "those; per-card 🔍 search and 🌐 browse always work. Scraped sources "
+            "Images for written cards. <b>Auto-image</b> lets the AI flag cards "
+            "that need a visual and fetches candidates for just those; "
+            "<b>Find an image…</b> on any written card always works. Scraped sources "
             "(DermNet, Radiopaedia) are best-effort and may break; Bing needs an "
             "API key."
         )
@@ -2775,7 +2738,7 @@ class _CreatorTab(QWidget):
         if not self._profiles:
             lbl = QLabel(
                 "No notetype profiles configured. Add one to make it "
-                "available in the creator panel's dropdown."
+                "available to Find & write."
             )
             lbl.setStyleSheet("color: gray; font-size: 11px;")
             lbl.setWordWrap(True)
@@ -2806,6 +2769,7 @@ class _CreatorTab(QWidget):
                 f"{sources_marker}{skill_marker}{qp_marker}{gr_marker}{fmt_marker}{instr_marker}</span>"
             )
             lbl.setTextFormat(Qt.TextFormat.RichText)
+            lbl.setWordWrap(True)   # long summaries wrap instead of pushing Edit/Remove off
             row.addWidget(lbl, stretch=1)
             edit_btn = QPushButton("Edit")
             edit_btn.clicked.connect(lambda _, idx=i: self._edit_profile(idx))
@@ -2852,14 +2816,7 @@ class _CreatorTab(QWidget):
             "default_deck":     self._deck.currentText().strip(),
             "default_tags":     tags_raw,
             "audit_tag":        self._audit_tag.text().strip(),
-            "default_n_cards":  int(self._n_cards.value()),
-            "gap_n_cards":      int(self._gap_n_cards.value()),
-            "background_generation": self._bg_gen.isChecked(),
             "max_parallel_jobs": int(self._max_parallel.value()),
-            "mass_create_columns": {
-                "tag": self._mc_tag_col.isChecked(),
-                "deck": self._mc_deck_col.isChecked(),
-            },
             "notetypes":        list(self._profiles),
             "selected_notetype": selected,
             "default_notetype": selected,  # legacy mirror
@@ -2872,10 +2829,7 @@ class _CreatorTab(QWidget):
                 **self._qp_seed,
                 "enabled":              self._qp_enabled.isChecked(),
                 "grading_mode":         self._qp_mode.currentData(),
-                "verdict_action":       self._qp_action.currentData(),
                 "atomicity_max_clozes": int(self._qp_atomicity.value()),
-                "auto_regen_max_retries": int(self._qp_retries.value()),
-                "auto_regen_in_manual": self._qp_regen_manual.isChecked(),
                 "prefer_skill":         self._qp_prefer_skill.isChecked(),
                 # Grader model now resolves from the AI tab matrix; neutralise any
                 # stale per-tool override so it can't shadow the matrix choice.
@@ -3004,7 +2958,7 @@ class _GroundingSourcesDialog(QDialog):
         add.clicked.connect(self._add)
         rem = QPushButton("− Remove")
         rem.clicked.connect(self._remove)
-        self._defaults_btn = QPushButton(f"Reset to {preset_label(self._region)} preset")
+        self._defaults_btn = QPushButton(f"Reset to {_amp(preset_label(self._region))} preset")
         self._defaults_btn.setToolTip("Discard edits and fall back to the selected "
                                       "region's built-in guideline set.")
         self._defaults_btn.clicked.connect(self._use_defaults)
@@ -3035,7 +2989,7 @@ class _GroundingSourcesDialog(QDialog):
             return
         self._region = key
         self._sources = [dict(g) for g in region_preset(key)["sources"]]
-        self._defaults_btn.setText(f"Reset to {preset_label(key)} preset")
+        self._defaults_btn.setText(f"Reset to {_amp(preset_label(key))} preset")
         self._reload_list()
         if self._sources:
             self._list.setCurrentRow(0)
@@ -3347,15 +3301,13 @@ class _SynapseTab(QWidget):
              "restyled; checkboxes are deliberately left native so their "
              "state always reads correctly."),
             ("theme_dialogs", "Theme the smaller dialogs",
-             "Add KG, the Create editors, bulk search, screenshot capture and "
-             "the rest."),
+             "Add KG, Find & write, screenshot capture and the rest."),
         ])
 
         add_group("Where Ankisstant lives", [
             ("sidebar_buttons", "Add Ankisstant to SynapsePro's icon strip",
              "Two buttons: one opens Ankisstant, one adds a knowledge gap "
-             "without opening anything. The per-tool icons stay inside "
-             "Ankisstant's own rail rather than crowding the strip."),
+             "without opening anything."),
             ("hide_toolbar_link", "Drop the \"Ankisstant\" link from Anki's top toolbar",
              "Only while the strip button is actually there — if SynapsePro is "
              "missing or the button fails to appear, the link stays put. The "
@@ -3541,13 +3493,6 @@ class SettingsDialog(QDialog):
         self._lecture_tab = _LectureTab(self._original_cfg.get("tools", {}).get("lecture", {}))
         self._synapse_tab = _SynapseTab(self._original_cfg.get("synapse", {}))
         self._about_tab   = _AboutTab()
-
-        # Browse and Create both show a "Month tag" group editing the same
-        # shared setting — keep the two copies in sync so either one reflects
-        # what'll actually be saved (read back from the Create tab's copy,
-        # which always exists; Browse's may be absent in native-only mode).
-        _link_checkbox(self._browse_tab._month_tag, self._creator_tab._month_tag)
-        _link_lineedit(self._browse_tab._month_tag_prefix, self._creator_tab._month_tag_prefix)
 
         tabs.addTab(_wrap_scroll(self._ai_tab),      "AI")
         tabs.addTab(_wrap_scroll(self._global_tab),  "Tools")

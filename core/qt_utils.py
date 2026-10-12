@@ -8,6 +8,8 @@
 #  - dock_beside(helper, host):  glue one of our windows to the edge of an Anki
 #    window so the pair moves, resizes and closes as one. Returns the dock —
 #    call detach() on it when the helper closes.
+#  - FlowLayout / flow_row(*widgets):  a button row that wraps instead of
+#    widening its window.
 #  - resurface_at_home(win):  re-show a backgrounded window only once you're
 #    back on Anki's main window, so a finished run never chases you across
 #    desktops.
@@ -20,9 +22,9 @@ from contextlib import contextmanager
 from aqt import mw
 from aqt.qt import (
     QApplication, QCompleter, QDialog, QDialogButtonBox, QEvent, QEventLoop,
-    QFrame, QHBoxLayout, QLabel, QObject, QPlainTextEdit, QProgressDialog,
-    QPushButton, QRect, QStyle, QStyleOptionViewItem, Qt, QTimer, QToolTip,
-    QVBoxLayout, QWidget,
+    QFrame, QHBoxLayout, QLabel, QLayout, QObject, QPlainTextEdit, QPoint,
+    QProgressDialog, QPushButton, QRect, QSize, QSizePolicy, QStyle,
+    QStyleOptionViewItem, Qt, QTimer, QToolTip, QVBoxLayout, QWidget,
 )
 from aqt.utils import tooltip
 
@@ -590,6 +592,91 @@ def compact_button(btn: QPushButton) -> QPushButton:
     looked like. Shrinking the padding keeps the glyph and lets Qt size it."""
     btn.setStyleSheet(btn.styleSheet() + "QPushButton { padding: 4px 8px; }")
     return btn
+
+
+class FlowLayout(QLayout):
+    """A row of buttons that wraps onto the next line instead of widening.
+
+    A QHBoxLayout's minimum width is every button side by side, and in a
+    narrow window that pushes the last ones (Save, Delete) off the edge or
+    gives the whole pane a sideways scrollbar. This one's minimum is its widest
+    single button; the rest go to a new line when there isn't room."""
+
+    def __init__(self, parent=None, spacing: int = 6):
+        super().__init__(parent)
+        self._items: list = []
+        self._gap = spacing
+        self.setContentsMargins(0, 0, 0, 0)
+
+    def addItem(self, item) -> None:
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, i):
+        return self._items[i] if 0 <= i < len(self._items) else None
+
+    def takeAt(self, i):
+        return self._items.pop(i) if 0 <= i < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._lay_out(QRect(0, 0, width, 0), apply=False)
+
+    def setGeometry(self, rect) -> None:
+        super().setGeometry(rect)
+        self._lay_out(rect, apply=True)
+
+    def sizeHint(self):
+        w = h = 0
+        for it in self._visible():
+            s = it.sizeHint()
+            w += s.width() + (self._gap if w else 0)
+            h = max(h, s.height())
+        return QSize(w, h)
+
+    def minimumSize(self):
+        w = h = 0
+        for it in self._visible():
+            s = it.minimumSize().expandedTo(it.sizeHint())
+            w, h = max(w, s.width()), max(h, s.height())
+        m = self.contentsMargins()
+        return QSize(w + m.left() + m.right(), h + m.top() + m.bottom())
+
+    def _visible(self):
+        return [it for it in self._items
+                if it.widget() is None or not it.widget().isHidden()]
+
+    def _lay_out(self, rect, *, apply: bool) -> int:
+        m = self.contentsMargins()
+        r = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        x, y, line_h = r.x(), r.y(), 0
+        for it in self._visible():
+            s = it.sizeHint()
+            if x > r.x() and x + s.width() > r.right() + 1:
+                x, y = r.x(), y + line_h + self._gap
+                line_h = 0
+            if apply:
+                it.setGeometry(QRect(QPoint(x, y), s))
+            x += s.width() + self._gap
+            line_h = max(line_h, s.height())
+        return y + line_h - rect.y() + m.bottom()
+
+
+def flow_row(*widgets, spacing: int = 6) -> QWidget:
+    """A wrapping row holding these widgets, ready to add to any layout."""
+    holder = QWidget()
+    lay = FlowLayout(holder, spacing)
+    for w in widgets:
+        lay.addWidget(w)
+    holder.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+    return holder
 
 
 def make_help_button(title: str, body_html: str, parent: QWidget | None = None) -> QPushButton:

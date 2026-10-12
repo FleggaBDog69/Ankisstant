@@ -251,22 +251,14 @@ class _PageTools(QWidget):
          "Capture missed questions from your QBank and turn them into Anki cards"),
         ("knowledge_gaps", "Knowledge Gaps",
          "Track what you don't know yet, then turn gaps into cards or searches"),
-        ("card_creator", "AI Create",
-         "Generate cards from text, PDFs, or web pages"),
         ("lecture", "AI Lecture",
-         "Point a lecture or LO list at your deck — finds and unsuspends the "
-         "cards you ALREADY own for it (hands off to Browse/Create if enabled)"),
+         "Point a lecture, handout or LO list at your deck — finds the cards "
+         "you already own for it and writes cards for what's missing"),
     ]
-
-    _BROWSE_MODES = [
-        ("off", "Off", "Skip AI Browse entirely"),
-        ("native_only", "Just the in-browser AI search",
-         "Adds a ✨ AI Search checkbox to Anki's own Browse window — type a "
-         "topic in plain English, get matching cards. Lightweight, no extra panel."),
-        ("full", "Full AI Browse panel",
-         "A dedicated search panel in Ankisstant — source-deck badges, audit "
-         "tags, auto-tagging — plus the in-browser search above."),
-    ]
+    # No "AI Create" switch: there's no AI Create page any more, and every
+    # run writes cards (Settings → Writing cards). No three-way AI Browse
+    # choice either — the full panel is gone; what's left is the ✨ box in
+    # Anki's own Browse window. Same as Settings → Tools.
 
     def __init__(self, wizard: SetupWizard, parent=None):
         super().__init__(parent)
@@ -296,66 +288,30 @@ class _PageTools(QWidget):
 
         root.addWidget(_hsep())
 
-        browse_lbl = QLabel("<b>AI Browse</b>")
-        browse_lbl.setTextFormat(Qt.TextFormat.RichText)
-        root.addWidget(browse_lbl)
-
-        br_cfg = tools_cfg.get("browse", {})
-        if not br_cfg.get("enabled", True):
-            cur_mode = "off"
-        elif br_cfg.get("native_only"):
-            cur_mode = "native_only"
-        else:
-            cur_mode = "full"
-
-        self._browse_grp = QButtonGroup(self)
-        for i, (mode_key, label, desc) in enumerate(self._BROWSE_MODES):
-            rb = QRadioButton()
-            self._browse_grp.addButton(rb, i)
-            row_widget = QWidget()
-            row_lay = QHBoxLayout(row_widget)
-            row_lay.setContentsMargins(0, 0, 0, 0)
-            row_lay.setSpacing(8)
-            row_lay.addWidget(rb)
-            inner = QVBoxLayout()
-            inner.setSpacing(1)
-            name_lbl = QLabel(f"<b>{label}</b>")
-            name_lbl.setTextFormat(Qt.TextFormat.RichText)
-            sub_lbl = QLabel(desc)
-            sub_lbl.setStyleSheet("color: gray; font-size: 11px;")
-            sub_lbl.setWordWrap(True)
-            inner.addWidget(name_lbl)
-            inner.addWidget(sub_lbl)
-            row_lay.addLayout(inner, 1)
-            name_lbl.mousePressEvent = lambda _e, b=rb: b.setChecked(True)
-            sub_lbl.mousePressEvent  = lambda _e, b=rb: b.setChecked(True)
-            root.addWidget(row_widget)
-            if mode_key == cur_mode:
-                rb.setChecked(True)
+        self._native = QCheckBox("✨ AI Search box in Anki's own Browse window")
+        self._native.setChecked(bool(tools_cfg.get("browse", {}).get("enabled", True)))
+        root.addWidget(self._native)
+        root.addWidget(_muted(
+            "<small>Type a topic in plain English in Anki's Browse window and "
+            "get the matching cards.</small>"))
 
         root.addStretch(1)
 
-    def _browse_mode(self) -> str:
-        idx = self._browse_grp.checkedId()
-        if 0 <= idx < len(self._BROWSE_MODES):
-            return self._BROWSE_MODES[idx][0]
-        return "full"
-
     def selected_tools(self) -> dict:
-        mode = self._browse_mode()
         return {
             "qbank":              self._boxes["qbank"].isChecked(),
-            "browse":             mode != "off",
-            "browse_native_only": mode == "native_only",
+            "browse":             self._native.isChecked(),
+            "browse_native_only": True,
             "knowledge_gaps":     self._boxes["knowledge_gaps"].isChecked(),
-            "card_creator":       self._boxes["card_creator"].isChecked(),
+            # Every run writes cards; the deck/notetype questions still apply.
+            "card_creator":       True,
             "lecture":            self._boxes["lecture"].isChecked(),
         }
 
     def validate(self) -> bool:
         sel = self.selected_tools()
         if not (sel["qbank"] or sel["browse"] or sel["knowledge_gaps"]
-                or sel["card_creator"] or sel["lecture"]):
+                or sel["lecture"]):
             showWarning(
                 "Pick at least one tool to continue — you can turn any of "
                 "them on or off later in Settings."

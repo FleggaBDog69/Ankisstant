@@ -37,7 +37,7 @@ from ..core.config import (
     auto_tag_base, save_tool_config, tool_config,
 )
 from ..core.qt_utils import (
-    compact_button,
+    FlowLayout, compact_button,
     attach_source_completer, attach_tag_completer, make_help_button,
     make_setup_banner,
     provider_configured, refresh_deck_browser, run_claude_json,
@@ -301,8 +301,13 @@ class AddKGDialog(QDialog):
         self._title.setPlaceholderText("e.g. mechanism of digoxin toxicity in hypokalaemia")
         layout.addWidget(self._title)
 
+        # Type and Group share one label width so their boxes line up.
+        type_lbl, group_lbl = QLabel("<b>Type</b>"), QLabel("<b>Group</b>")
+        _w = max(type_lbl.sizeHint().width(), group_lbl.sizeHint().width())
+        type_lbl.setFixedWidth(_w)
+        group_lbl.setFixedWidth(_w)
         type_row = QHBoxLayout()
-        type_row.addWidget(QLabel("<b>Type</b>"))
+        type_row.addWidget(type_lbl)
         self._type = QComboBox()
         for t in _load_types():
             self._type.addItem(t["name"], t["key"])
@@ -320,7 +325,7 @@ class AddKGDialog(QDialog):
         # Group — the batch this gap came in with. Editable, so a new batch can
         # be started here rather than in Manage groups first.
         group_row = QHBoxLayout()
-        group_row.addWidget(QLabel("<b>Group</b>"))
+        group_row.addWidget(group_lbl)
         self._group = QComboBox()
         self._group.setEditable(True)
         self._group.addItem("")                      # blank = ungrouped
@@ -582,9 +587,10 @@ class _KGGroupHeader(QListWidgetItem):
 class _KGItemDelegate(QStyledItemDelegate):
     """Draws group headers, and gaps that have a notes preview, as two lines.
 
-    A gap with no notes falls through to the default painter untouched, so the
-    common single-line row is byte-for-byte what it has always been — the new
-    drawing code can only affect rows that have something extra to show."""
+    Every gap row is drawn here, one line or two. Single-line rows used to fall
+    through to the default painter, which adds the theme's item padding that
+    this one doesn't — so a gap with notes sat ~10px left of one without, and
+    the list looked ragged. Titles are elided to the row, never scrolled to."""
 
     _PAD = 4
 
@@ -596,6 +602,9 @@ class _KGItemDelegate(QStyledItemDelegate):
 
     def sizeHint(self, option, index):
         size = super().sizeHint(option, index)
+        # Rows fit the list's width and elide; a width hint as long as the
+        # title is what gave the list a sideways scrollbar.
+        size.setWidth(1)
         if index.data(_HEADER_ROLE) is not None:
             size.setHeight(size.height() + self._PAD * 2)
         elif index.data(_NOTES_ROLE):
@@ -606,10 +615,6 @@ class _KGItemDelegate(QStyledItemDelegate):
     def paint(self, painter, option, index):
         group = index.data(_HEADER_ROLE)
         preview = index.data(_NOTES_ROLE)
-        if group is None and not preview:
-            super().paint(painter, option, index)
-            return
-
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
         text = opt.text
@@ -650,8 +655,17 @@ class _KGItemDelegate(QStyledItemDelegate):
             return
 
         title_font = QFont(opt.font)
-        sub_font = self._sub_font(opt.font)
         title_h = QFontMetrics(title_font).height()
+        if not preview:
+            painter.setFont(title_font)
+            painter.setPen(fg)
+            painter.drawText(rect, int(Qt.AlignmentFlag.AlignVCenter
+                                       | Qt.AlignmentFlag.AlignLeft),
+                             QFontMetrics(title_font).elidedText(
+                                 text, Qt.TextElideMode.ElideRight, rect.width()))
+            painter.restore()
+            return
+        sub_font = self._sub_font(opt.font)
         sub_h = QFontMetrics(sub_font).height()
         top = rect.top() + max(0, (rect.height() - title_h - sub_h) // 2)
 
@@ -1097,6 +1111,12 @@ class _GroupManagerDialog(QDialog):
         hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        # One line per cell, cut from the LEFT. Tables word-wrap by default,
+        # and Qt breaks a tag after its "!!" — so a one-line row showed "!!…",
+        # the one part every tag shares. The end is the part that differs.
+        self._table.setWordWrap(False)
+        self._table.setTextElideMode(Qt.TextElideMode.ElideLeft)
+        hh.setStretchLastSection(False)
         for c in (3, 4, 5, 6):
             hh.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
         self._table.itemSelectionChanged.connect(self._refresh_buttons)
@@ -1872,7 +1892,8 @@ class KGDetailPane(QWidget):
         root.addWidget(self._lo_analyser)
 
         # Actions
-        actions_row = QHBoxLayout()
+        self._actions_w = QWidget()
+        actions_row = FlowLayout(self._actions_w)
         # Labels are rewritten by refresh_send_labels() to name the selection
         # size, because these buttons act on every selected gap, not just the
         # one on screen.
@@ -1943,24 +1964,23 @@ class KGDetailPane(QWidget):
             "Select several gaps to work through them one after another.")
         self._own_btn.clicked.connect(self._write_own_card)
         actions_row.addWidget(self._own_btn)
-        actions_row.addStretch(1)
         self._save_btn = QPushButton("Save")
         self._save_btn.setAutoDefault(False)
         self._save_btn.clicked.connect(self._save)
         actions_row.addWidget(self._save_btn)
-        root.addLayout(actions_row)
-        # Second row: looking it up, and getting rid of it. Seven buttons on
-        # one line were wider than the pane, and Delete was the one pushed
-        # off the edge.
-        lookup_row = QHBoxLayout()
+        root.addWidget(self._actions_w)
+        # Second row: looking it up, and getting rid of it. Both rows WRAP
+        # (FlowLayout): as fixed rows, a narrow window pushed Save and Delete
+        # past the edge and gave the pane a sideways scrollbar.
+        self._lookup_w = QWidget()
+        lookup_row = FlowLayout(self._lookup_w)
         lookup_row.addWidget(self._find_tag_btn)
         lookup_row.addWidget(self._find_cards_btn)
-        lookup_row.addStretch(1)
         self._delete_btn = QPushButton("🗑 Delete")
         self._delete_btn.setAutoDefault(False)
         self._delete_btn.clicked.connect(self._delete)
         lookup_row.addWidget(self._delete_btn)
-        root.addLayout(lookup_row)
+        root.addWidget(self._lookup_w)
 
         # Empty-state overlay
         self._empty_lbl = QLabel("Select a knowledge gap, or click ＋ Add KG to start.")
@@ -2000,6 +2020,9 @@ class KGDetailPane(QWidget):
         self._empty_lbl.setVisible(False)
 
         self._title_input.setText(kg.get("title", ""))
+        # Show the START of a long title. setText leaves the cursor at the end,
+        # so a narrow pane opened on "…eligibility, age range and i".
+        self._title_input.setCursorPosition(0)
         self._refresh_group_btn(kg)
 
         # Type combo — may have changed since panel was built. Block
@@ -2536,7 +2559,7 @@ class KGDetailPane(QWidget):
                 "Not in a group. Click to put it in one."
             )
             return
-        self._group_btn.setText(f"Group: {name}")
+        self._group_btn.setText(f"Group: {name}".replace("&", "&&"))
         self._group_btn.setToolTip(
             f"In “{name}” — tags as {autotag.group_segment(name)}. "
             "Click to move or remove it."
@@ -2811,10 +2834,9 @@ class _BulkImportDialog(QDialog):
         opt.addWidget(QLabel("Put all in group:"))
         self._group_override = QLineEdit()
         self._group_override.setPlaceholderText("(leave blank to keep the ones above)")
-        self._group_override.setMaximumWidth(220)
         self._group_override.textChanged.connect(lambda _t: self._fill_table())
-        opt.addWidget(self._group_override)
-        opt.addStretch(1)
+        # Takes the rest of the row: capped at 220px, its own hint was cut off.
+        opt.addWidget(self._group_override, 1)
         root.addLayout(opt)
 
         self._use_claude = QCheckBox(
@@ -3165,6 +3187,8 @@ class _GroupsView(QWidget):
         self._list.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection)
         self._list.setItemDelegate(_KGItemDelegate(self._list))
+        self._list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._list.customContextMenuRequested.connect(self._on_menu)
         self._list.itemSelectionChanged.connect(self._on_select)
@@ -3310,6 +3334,8 @@ class _GroupsView(QWidget):
         self._gaps.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection)
         self._gaps.setItemDelegate(_KGItemDelegate(self._gaps))
+        self._gaps.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._gaps.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._gaps.customContextMenuRequested.connect(self._on_gap_menu)
         self._gaps.itemDoubleClicked.connect(self._on_gap_opened)
@@ -3530,7 +3556,7 @@ class _GroupsView(QWidget):
                 rows.append("Source: " + _html.escape(str(ov["source"])))
             last = (self._stats.get(one) or {}).get("last") or ""
             if last:
-                rows.append("Last touched: " + _html.escape(last[:16]))
+                rows.append("Last touched: " + _html.escape(last[:16].replace("T", " ")))
         elif one == "":
             rows.append("Not in a group — these file by content and source "
                         "only.")
@@ -4020,6 +4046,8 @@ class KnowledgeGapsPanel(QWidget):
         self._list.customContextMenuRequested.connect(self._on_list_context_menu)
         self._list.itemSelectionChanged.connect(self._on_select)
         self._list.setItemDelegate(_KGItemDelegate(self._list))
+        self._list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._list.itemClicked.connect(self._on_item_clicked)
         self._list.itemChanged.connect(self._on_item_checked)
         lcol.addWidget(self._list, 1)
@@ -4046,7 +4074,10 @@ class KnowledgeGapsPanel(QWidget):
         sel_hint.setStyleSheet("color: gray; font-size: 10px;")
         sel_hint.setWordWrap(True)
         lcol.addWidget(sel_hint)
-        btn_row = QHBoxLayout()
+        # Wraps (FlowLayout): as one fixed row these five set the list's
+        # minimum width, which in a narrow window starved the gap pane.
+        btn_row_w = QWidget()
+        btn_row = FlowLayout(btn_row_w)
         add_btn = QPushButton("＋ Add KG")
         add_btn.setAutoDefault(False)
         add_btn.setToolTip(
@@ -4102,12 +4133,12 @@ class KnowledgeGapsPanel(QWidget):
                 btn_row.addWidget(self._chat_btn)
         except Exception as e:
             print(f"[ankisstant] chat KG button unavailable: {e}")
-        btn_row.addStretch(1)
         btn_row.addWidget(refresh_btn)
-        lcol.addLayout(btn_row)
+        lcol.addWidget(btn_row_w)
 
         # Clear-completed row — sits below add/analyse so it's out of the way.
-        clear_row = QHBoxLayout()
+        clear_row_w = QWidget()
+        clear_row = FlowLayout(clear_row_w)
         self._clear_btn = QPushButton("Clear completed (0)")
         self._clear_btn.setAutoDefault(False)
         self._clear_btn.setStyleSheet("font-size: 11px;")
@@ -4126,8 +4157,7 @@ class KnowledgeGapsPanel(QWidget):
                 "completed — this is for the backlog, or if you turned that off.")
             sync_btn.clicked.connect(lambda: sync_done_to_things(parent=self))
             clear_row.addWidget(sync_btn)
-        clear_row.addStretch(1)
-        lcol.addLayout(clear_row)
+        lcol.addWidget(clear_row_w)
         splitter.addWidget(left)
 
         # Right side
@@ -4138,7 +4168,12 @@ class KnowledgeGapsPanel(QWidget):
         right_wrap.setWidget(self._detail)
         splitter.addWidget(right_wrap)
 
-        splitter.setSizes([280, 620])
+        # Close to half each. The list used to be held wide by its fixed
+        # button row; with that row wrapping, [280, 620] left room for three
+        # gaps and stacked the buttons five deep in a narrow window.
+        splitter.setSizes([460, 540])
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
 
         # Two pages: the gaps, and the groups.
         self._stack = QStackedWidget()
@@ -5418,17 +5453,20 @@ class KnowledgeGapsPanel(QWidget):
                     seen.add(kid)
                     ids.append(kid)
         one = names[0] if len(names) == 1 else None
-        label = (one or NO_GROUP) if one is not None else f"{len(names)} groups"
+        # && — a group called "Obs & Gynae" is a menu label too, and a single
+        # & would be eaten as a shortcut marker.
+        label = ((one or NO_GROUP).replace("&", "&&") if one is not None
+                 else f"{len(names)} groups")
         n = len(ids)
         menu = QMenu(parent or self)
         if one is None:
-            head = menu.addAction(", ".join(g or NO_GROUP for g in names))
+            head = menu.addAction(", ".join(g or NO_GROUP for g in names).replace("&", "&&"))
             head.setEnabled(False)
             menu.addSeparator()
         else:
             # First, and above the early return below, because an empty group
             # is exactly the one that needs a gap put in it.
-            menu.addAction(f"＋ Add KG into “{one or NO_GROUP}”",
+            menu.addAction(f"＋ Add KG into “{label}”",
                            lambda: self._on_add_kg(group=one))
             menu.addSeparator()
         if not ids:

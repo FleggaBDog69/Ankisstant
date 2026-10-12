@@ -33,10 +33,21 @@ the add-on enabled:
     # within ~2s + ~20s of shots, user_files/dev_screens.done holds the folder
     cat user_files/dev_screens.done
 
-Then Read the PNGs in that folder (`index.txt` lists them with sizes). Every
-page, Gaps with a gap open, Groups empty and picked, every Settings tab, and a
-Find & write plan page — each at the window's size and at a narrow 900×640.
-Read-only: Settings is cancelled, nothing is run. Code: `tools/devscreens.py`.
+Then Read the PNGs in that folder (`index.txt` lists them with sizes, and ends
+with a measured PROBLEMS list: text wider than its widget, widgets past the
+edge). Every page at the window's size and at 900×640, every Settings tab,
+the Find & write plan page, and ~14 dialogs; `-full` shots are whole scroll
+areas. It all happens OFF-SCREEN (WA_DontShowOnScreen) — nothing appears on
+Fletcher's screen. Read-only: dialogs are cancelled, nothing is run.
+`devscreens.py` reloads itself per request, so editing it needs no restart;
+what it photographs does. A stuck run stops blocking new ones after 5 min, and
+`index.txt` names the step it was on. Code: `tools/devscreens.py`.
+
+Restarting Anki yourself: `osascript -e 'tell application "Anki" to quit'`
+then `open -a Anki` — ask first, it's his running app. AnkiConnect is
+installed: `curl -s localhost:8765 -X POST -d '{"action":"version","version":6}'`
+answers once Anki is up (and tells you the main thread isn't hung).
+`meta.json`'s `"disabled": true` is stale — the add-on loads regardless.
 
 ## Don't
 
@@ -57,6 +68,11 @@ Read-only: Settings is cancelled, nothing is run. Code: `tools/devscreens.py`.
 - **Qt `&`:** a single `&` in a button, menu or group-box label is eaten as a
   mnemonic — write `&&`. **Button widths:** the theme pads buttons 14px a side;
   never `setFixedWidth` a button — use `qt_utils.compact_button` for glyphs.
+  Text that comes from data (group names, preset labels) needs `&` → `&&` too.
+- **Button rows** that can get wide: `qt_utils.FlowLayout` (wraps) instead of
+  a QHBoxLayout, whose minimum width is every button side by side.
+- **Tables word-wrap by default** and break tags after "!!" — set
+  `setWordWrap(False)` on any table showing tags.
 
 ## Shape of the thing
 
