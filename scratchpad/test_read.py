@@ -84,3 +84,4 @@ check("HTML entities are decoded",
 
 print()
 print("FAILED: " + ", ".join(fails) if fails else "all green")
+sys.exit(1 if fails else 0)

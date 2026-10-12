@@ -1,5 +1,6 @@
 """The mTBI run, as a fixture. Numbers taken from his own trace log
 (user_files/ankisstant.log, 2026-09-21 13:29:57)."""
+import sys
 import harness
 m = harness.matcher
 LP = m.LearningPoint
@@ -85,3 +86,4 @@ check("the rubric carries the gap rules",
 
 print()
 print("FAILED: " + ", ".join(fails) if fails else "all green")
+sys.exit(1 if fails else 0)

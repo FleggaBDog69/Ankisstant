@@ -1,3 +1,4 @@
+import sys
 import harness_tag as h
 at = h.autotag
 
@@ -81,3 +82,4 @@ check("an unclassified gap with no group still yields nothing",
 
 print()
 print("FAILED: " + ", ".join(fails) if fails else "all green")
+sys.exit(1 if fails else 0)
