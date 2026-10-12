@@ -2,6 +2,61 @@
 
 ## Unreleased
 
+### Changed — one screen, and only one
+
+- **Find & write is the only run screen.** The find-only "bulk search" mode,
+  the *Send gaps to AI Create…* button and its dialog, and the hand-off into
+  the Mass AI Create window are gone. To search without writing, untick
+  **Write** on a gap — the per-gap column is now the only switch for it. The
+  global "Write cards for whatever the search doesn't find" box went too: it
+  answered the same question and disagreed with the column (a Find-off gap
+  wrote whatever the box said).
+- **The pages phase 6 retired are deleted** — AI Create, AI Browse, Mass AI
+  Create, the icon rail and its queue badges: about 7,000 lines nothing could
+  reach. Update by Tag is untouched (set aside, still unreachable).
+
+### Changed — Settings
+
+- **Nothing runs off the page.** Forms put a label above its field when the
+  two don't fit, instead of pushing the field past the edge, and 35 hard
+  320–480px field widths are gone.
+- **Settings → AI has one model per stage** — Read, Find, Write, Check — plus
+  the in-browser AI Search. The seven old per-tool rows each fed a stage only
+  if the rows before them were empty ("Search / Browse" did nothing once
+  "Lecture relevance" was set). Each row starts on the model its stage uses
+  today; the old slots are kept.
+- **AI Browse / AI Create tabs are Finding cards / Writing cards**, always
+  shown, holding only what still runs. The found-cards audit tag is back on
+  screen — it was only shown in the old Browse panel mode. Settings → Tools
+  has one tick box for the in-browser AI Search, and no AI Create switch.
+
+### Fixed — UI
+
+- **Blank grey squares** (help, refresh, remove, field ↑/↓): buttons fixed at
+  28px wide, inside a theme that pads 14px a side. Text buttons ("Edit",
+  "Remove", "Show") were clipped the same way.
+- **"Find & write" read "Find  write"** on AI Lecture and in menus — Qt eats a
+  single &.
+- **The gap pane ran off the right edge** (Delete, "added …"). Its actions are
+  two rows now; the empty state no longer shows a bare "Type:" and "Tags:".
+- **Groups with nothing picked** hide their controls instead of greying them.
+- **AI Lecture options** read as one cap ("Cap at 40 notes / or size the cap
+  from the lecture"); the notetype box no longer stretches across the window.
+
+### Fixed — data safety
+
+- **A crash mid-save could wipe every gap.** The gap, job, tick and queue
+  stores truncated their file before writing; they now write atomically.
+  And a store that won't parse is set aside as `…corrupt-<time>` rather than
+  read as empty — which the next save used to write over everything.
+- **Gaps or patches appended while the inbox was draining were lost.** Both
+  inboxes are now claimed (renamed) before they're read.
+- **`log.warning` doesn't exist** — the Anthropic-provider skill path raised
+  instead of logging.
+- **The tag classifier saw 300 characters of your notes**, cut silently. It
+  gets 1,500 and is told when a cut happens.
+
+
 ### Fixed — MQ cards had no AI explanation
 
 - **The explanation was never asked for.** The one-call request only asks for
@@ -9,8 +64,8 @@
   field existed never gained it — config lists are replaced, not merged. Because
   the request counted as "merged", the separate explanation call didn't fire
   either. A one-time migration now adds the field to an MQ type that lacks it
-  (delete it in Settings afterwards and it stays deleted), and Create falls back
-  to the separate call whenever the type has no such field.
+  (delete it in Settings afterwards and it stays deleted). The feature is off
+  by default in practice — Settings → QBank → "Add an AI-written explanation…".
 
 ### Changed — queues stop being busywork
 

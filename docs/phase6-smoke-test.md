@@ -12,6 +12,8 @@ restart Anki.
 - [ ] Anki starts with no error popup.
 - [ ] The Ankisstant window opens; every tab renders.
 - [ ] There is no AI Create page any more, and nothing links to one.
+- [ ] No blank grey squares: the **?** beside Gaps/Groups, the **⟳** beside
+      KG from AI chat and beside Manage groups… all show their glyph.
 
 ## 1. Gaps page — the doors
 - [ ] **＋ Add KG** into a group, with notes. Save. It appears in the group.
@@ -23,6 +25,15 @@ restart Anki.
       **Find & write {group} now…** both do what they say. A group that is
       all Closed says "nothing to run".
 - [ ] **✎ Write my own card** still opens the editor for that gap.
+
+## 1b. Gaps page — layout
+- [ ] Click a gap: nothing in the detail pane runs off the right edge —
+      Delete and "added …" are visible without scrolling sideways.
+- [ ] With no gap selected, the pane shows only "Select a knowledge gap…",
+      no bare "Type:" / "Tags:".
+- [ ] Groups view with no group picked: just the heading and a hint, no
+      greyed-out button rows. Pick a group: everything appears.
+- [ ] Menus read "Find & write …" with the ampersand.
 
 ## 2. Work-through — one gap, end to end
 - [ ] READ: the points arrive without you pressing anything.
@@ -37,8 +48,16 @@ restart Anki.
       tagged and unsuspended, the new cards exist in the right deck with the
       right tags (content / source / audit), and nothing was added twice.
 - [ ] The gap is marked done on the Gaps page.
+- [ ] Run again with **Write** unticked on every gap: it only searches, Apply
+      says "Apply — N found card(s)", and no second window opens afterwards.
+- [ ] There is no "Send gaps to AI Create…" button and no global "Write
+      cards for whatever the search doesn't find" box on the plan page.
 
 ## 3. AI Lecture — the new door
+- [ ] The button reads **Find & write ▶** (with the &).
+- [ ] Options: "Cap at [40 notes]  ☐ or size the cap from the lecture"; the
+      Search notetype box is a sensible width; Pre-tick suggested slides and
+      Add notes to cards sit under Options, not down by the button.
 - [ ] Choose a short PDF lecture → **Find & write ▶** opens the work-through
       (not the old results page).
 - [ ] READ shows the points grouped into the lecture's sections.
@@ -61,6 +80,23 @@ restart Anki.
 ## 5. Manual / paste provider (if you use it)
 - [ ] Switch provider to paste. Lecture: **Load the AI's points file →** and
       **Load the AI's relevance file →** round-trip correctly.
+
+## 5b. Settings
+- [ ] Open every tab at the default window size: no field or label runs off
+      the right edge, and no "Edit" / "Remove" / "Show" button is clipped.
+- [ ] Settings → AI → **Models** shows Read, Find, Write, Check and AI search
+      in Anki's browser, each on the model it used before (Read/Find
+      Sonnet 5, Write Opus 5, Check Haiku 4.5). Save, reopen: unchanged.
+- [ ] Tabs are named **Finding cards** and **Writing cards**. Finding cards
+      shows "Tag found cards with:" filled with your audit tag.
+- [ ] Settings → Tools: one "✨ AI Search box…" tick box, no AI Create switch.
+      The ✨ AI Search box still appears in Anki's Browse window.
+- [ ] Settings → QBank: "Add an AI-written explanation…" is unticked.
+
+## 5c. Data safety (optional, 1 minute)
+- [ ] Use the kg-add skill (or drop a line into `user_files/kg_inbox.json`)
+      while Anki is open, restart: the gap arrives once, and there's no
+      `kg_inbox.json.draining` left in user_files.
 
 ## 6. Leftovers to look at
 - [ ] The AI Lecture tab shows only the intake form — no old results pane,
