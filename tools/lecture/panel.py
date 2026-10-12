@@ -2740,60 +2740,18 @@ class LecturePanel(QWidget):
 
     # -- divert to Browse / Create --
     def _send_point_to(self, m, tool: str) -> bool:
-        """Divert one point to AI Browse ('browse') or AI Create ('create'): open
-        the Ankisstant window on that tool, switch to it, and prefill it with the
-        point's concept. Soft bridge — the target tool may be absent (standalone
-        build) — so it degrades to copying the concept to the clipboard.
-
-        Reaches the panel through the tool module's `_panel` global (get_panel()
-        returns a QScrollArea wrapper, not the panel), and sets the topic LAST,
-        after the tool is shown, so nothing on the show path clears it."""
-        key = "browse" if tool == "browse" else "card_creator"
-        label = "AI Browse" if tool == "browse" else "AI Create"
-        if not tool_enabled(key):
-            # The button should be hidden, but a stale render could still fire it.
-            tooltip(f"{label} is turned off in Settings → Tools.")
-            return False
+        """Divert one point elsewhere. AI Browse and AI Create are gone from
+        Ankisstant — the work-through finds and writes on one screen — so all
+        this old results page can still do is hand over the concept on the
+        clipboard. (LectureLens, which has neither tool, ships its own copy.)"""
         concept = m.point.concept
         try:
-            from ...ui import main_window as mwnd
-            if tool == "browse":
-                from .. import browse as mod
-                mod.get_panel()                    # build/cache the panel
-                mwnd.open_main_window()
-                win = getattr(mwnd, "_current", None)
-                if win is not None and hasattr(win, "show_browse_tool"):
-                    win.show_browse_tool()
-                p = getattr(mod, "_panel", None)
-                if p is not None:
-                    p.topic.setText(concept)
-                label = "AI Browse"
-            else:
-                from .. import card_creator as mod
-                mod.get_panel()
-                mwnd.open_main_window()
-                win = getattr(mwnd, "_current", None)
-                if win is not None and hasattr(win, "show_create_tool"):
-                    win.show_create_tool()
-                p = getattr(mod, "_panel", None)
-                if p is not None:
-                    # Topic mode first — the topic box is hidden unless rb_topic is
-                    # checked, so setting text alone would drop it into a hidden field.
-                    p.rb_topic.setChecked(True)
-                    p._sync_mode()
-                    p.topic.setText(concept)
-                label = "AI Create"
-            tooltip(f"Sent to {label} — review it before running.", period=3000)
-            return True
+            mw.app.clipboard().setText(concept)
+            tooltip("Concept copied — run it through Find & write from the "
+                    "Gaps page.", period=4000)
         except Exception as e:
-            log.error(f"lecture: hand-off to {tool} failed: {e}")
-            try:
-                mw.app.clipboard().setText(concept)
-                tooltip("That tool isn't available — concept copied to clipboard.",
-                        period=4000)
-            except Exception:
-                showWarning(f"Couldn't hand this off:\n\n{e}")
-            return False
+            showWarning(f"Couldn't copy this:\n\n{e}")
+        return False
 
     def _divert_all(self, dest: str):
         """Queue every gap through Browse/Create one at a time — each tool works a

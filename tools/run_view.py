@@ -21,8 +21,8 @@
 from __future__ import annotations
 
 from aqt.qt import (
-    QColor, QFont, QFontMetrics, QFrame, QHBoxLayout, QLabel, QPainter,
-    QPalette, QPen, QPoint, QRect, QSize, QSizePolicy, Qt, QWidget,
+    QColor, QFont, QFontMetrics, QHBoxLayout, QPainter, QPalette, QPen,
+    QPoint, QRect, QSize, QSizePolicy, Qt, QWidget,
 )
 
 from . import pipeline
@@ -254,13 +254,6 @@ class StageStrip(QWidget):
         of it, and the line is too short to carry both without truncating the
         useful half."""
         return (record.counts or {}).get(st.key, "") or _WORD.get(state, state)
-
-
-def separator() -> QFrame:
-    f = QFrame()
-    f.setFrameShape(QFrame.Shape.HLine)
-    f.setFrameShadow(QFrame.Shadow.Sunken)
-    return f
 
 
 # ── the one entry point ──────────────────────────────────────────────────────

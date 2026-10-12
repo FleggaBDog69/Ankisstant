@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import re
-from datetime import date
 
 from aqt.qt import (
     QApplication, QCheckBox, QColor, QColorDialog, QComboBox, QDate,
@@ -19,28 +18,11 @@ from aqt.utils import showInfo, showWarning, tooltip
 
 from ..core import api as core_api
 from ..core.config import (
-    DEFAULTS, PROVIDER_MODELS, active_family, ai_tools, family_for, load_config,
-    save_config, tool_config, tool_enabled,
+    DEFAULTS, PROVIDER_MODELS, family_for, load_config, save_config, tool_config,
+    tool_enabled,
 )
 from ..core.qt_utils import attach_deck_completer, attach_tag_completer, compact_button
 from ..tools import skills_catalog
-
-
-def _model_combo(current: str, fallback: str = "claude-sonnet-4-6",
-                 min_width: int = 0, models: list[str] | None = None) -> QComboBox:
-    """Editable combobox seeded with `models` (defaults to the Anthropic list).
-    currentText() returns the model ID — either a picked one or whatever the
-    user typed."""
-    cb = QComboBox()
-    cb.setEditable(True)
-    cb.addItems(models if models is not None else PROVIDER_MODELS["anthropic"])
-    cur = (current or "").strip() or fallback
-    if cur and cb.findText(cur) < 0:
-        cb.addItem(cur)
-    cb.setCurrentText(cur)
-    cb.setMinimumWidth(min_width)
-    cb.setToolTip("Pick a known model or type a custom model ID.")
-    return cb
 
 
 def _coerce_model_dict(stored, default_dict: dict) -> dict:
@@ -99,112 +81,6 @@ class _ModelField(QWidget):
     def values(self) -> dict:
         self._capture()
         return dict(self._models)
-
-
-class _SkillField(QWidget):
-    """Provider-channel-aware skill editor for an AI matrix tool. Holds two
-    channels — `anthropic` (an Anthropic custom skill_id) and `cli` (a Claude
-    Code invocation like '/malleus-anki') — and shows the one that matches the
-    current provider. Other providers (gemini/openai/ollama/manual) can't use
-    skills, so the field is disabled with an explanatory placeholder. Switching
-    provider preserves each channel's value, mirroring _ModelField."""
-
-    def __init__(self, stored: dict | None, provider: str, min_width: int = 0, parent=None):
-        super().__init__(parent)
-        s = stored if isinstance(stored, dict) else {}
-        self._channels = {"anthropic": (s.get("anthropic") or "").strip(),
-                          "cli": (s.get("cli") or "").strip()}
-        self._provider = (provider or "auto").lower()
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(2)
-        self._edit = QLineEdit()
-        self._edit.setMinimumWidth(min_width)
-        lay.addWidget(self._edit)
-        self._hint = QLabel("")
-        self._hint.setStyleSheet("color: gray;")
-        self._hint.setTextFormat(Qt.TextFormat.RichText)
-        self._hint.setWordWrap(True)
-        lay.addWidget(self._hint)
-        self._populate()
-
-    @staticmethod
-    def _channel_for(provider: str) -> str:
-        return "cli" if provider == "cli" else "anthropic"
-
-    @staticmethod
-    def _supported(provider: str) -> bool:
-        return provider in ("auto", "cli", "anthropic")
-
-    def _populate(self) -> None:
-        ch = self._channel_for(self._provider)
-        supported = self._supported(self._provider)
-        self._edit.blockSignals(True)
-        self._edit.setText(self._channels.get(ch, ""))
-        self._edit.setEnabled(supported)
-        if not supported:
-            self._edit.setPlaceholderText("Skills are Anthropic-only — ignored on this provider")
-            self._hint.setText(
-                "<small>This provider can't run skills; the inline prompt is used instead.</small>")
-        elif ch == "cli":
-            self._edit.setPlaceholderText("/skill-name  or  Use the <name> skill")
-            self._hint.setText(
-                "<small>CLI invocation — the skill body lives at "
-                "<code>~/.claude/skills/&lt;name&gt;/SKILL.md</code>.</small>")
-        else:
-            self._edit.setPlaceholderText("skill_… (Anthropic custom skill ID)")
-            self._hint.setText(
-                "<small>Anthropic custom skill ID (skills beta). Leave blank for none.</small>")
-        self._edit.blockSignals(False)
-
-    def _capture(self) -> None:
-        ch = self._channel_for(self._provider)
-        if self._supported(self._provider):
-            self._channels[ch] = self._edit.text().strip()
-
-    def set_provider(self, provider: str) -> None:
-        self._capture()
-        self._provider = (provider or "auto").lower()
-        self._populate()
-
-    def values(self) -> dict:
-        self._capture()
-        return dict(self._channels)
-
-
-class _OverridableModel(QWidget):
-    """A per-tool model picker that opts into overriding the consolidated AI-tab
-    default. The checkbox drives `<field>_override`; when off, the tool reads the
-    shared ai_matrix value and the picker is disabled. Lets a tool tab pin its own
-    model (the 'hybrid' model) without scattering the primary choice."""
-
-    def __init__(self, stored, default_dict: dict, family: str, override: bool,
-                 *, label: str = "Use a model just for this tool", min_width: int = 0,
-                 parent=None):
-        super().__init__(parent)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(3)
-        self._chk = QCheckBox(label + "  (otherwise uses the AI-tab default)")
-        self._chk.setChecked(bool(override))
-        self._chk.setToolTip(
-            "Off: this tool uses the model set in Settings → AI for its tool row. "
-            "On: pin a different model here, just for this tool.")
-        lay.addWidget(self._chk)
-        self._model = _ModelField(stored, default_dict, family, min_width=min_width)
-        lay.addWidget(self._model)
-        self._chk.toggled.connect(self._model.setEnabled)
-        self._model.setEnabled(self._chk.isChecked())
-
-    def set_family(self, family: str) -> None:
-        self._model.set_family(family)
-
-    def set_enabled_all(self, enabled: bool) -> None:
-        """Hide/show in manual mode (no model needed)."""
-        self.setVisible(enabled)
-
-    def values(self) -> tuple[dict, bool]:
-        return self._model.values(), self._chk.isChecked()
 
 
 # ── small helpers ────────────────────────────────────────────────────────────
@@ -979,9 +855,6 @@ class _AITab(QWidget):
     # ── dynamic UI ─────────────────────────────────────────────────────────
     def current_provider(self) -> str:
         return self._provider.currentData() or "auto"
-
-    def current_family(self) -> str:
-        return family_for(self.current_provider())
 
     def _capture_key(self) -> None:
         if self._cur_key_family:

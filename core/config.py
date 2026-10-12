@@ -1237,18 +1237,6 @@ def tool_model(tool_cfg: dict, field: str, family: str) -> str | None:
     return None
 
 
-def ai_tools() -> list[dict]:
-    """The canonical AI tool list for the consolidated matrix (Settings → AI)."""
-    return [dict(t) for t in _AI_TOOLS]
-
-
-def skill_anthropic_id(name: str, cfg: dict | None = None) -> str:
-    """The optional Anthropic custom skill_id the user pasted for bundled skill
-    `name` (for native by-id invocation on the Anthropic API). '' when unset."""
-    cfg = cfg if cfg is not None else load_config()
-    return str(((cfg.get("skills") or {}).get(name) or {}).get("anthropic_skill_id", "") or "")
-
-
 def tool_model_for(tool_key: str, family: str | None = None, *,
                    cfg: dict | None = None,
                    override_cfg: dict | None = None,
@@ -1451,15 +1439,6 @@ def auto_tag_base() -> str:
         return ""
 
 
-def quality_pass_cfg() -> dict:
-    """The card-creator quality-pass config slice (toggle, mode, action, grader
-    model/skill). Returns {} if unset. See tools/quality_pass.py."""
-    try:
-        return tool_config("card_creator").get("quality_pass", {}) or {}
-    except Exception:
-        return {}
-
-
 def mq_explain_enabled() -> bool:
     """Whether missed-question cards carry an AI-written knowledge-gap
     explanation (leading the Missed Questions field, above the screenshot).
@@ -1468,21 +1447,6 @@ def mq_explain_enabled() -> bool:
         return bool(tool_config("qbank").get("mq_explain", True))
     except Exception:
         return True
-
-
-def kg_type_info(type_key: str) -> tuple[str, bool]:
-    """Return (display_name, auto_tag_enabled) for a KG type key.
-    Falls back to ('', False) when the type is unknown."""
-    if not type_key:
-        return "", False
-    key = str(type_key).lower().strip()
-    try:
-        for t in tool_config("knowledge_gaps").get("types") or []:
-            if isinstance(t, dict) and str(t.get("key", "")).lower() == key:
-                return (t.get("name") or type_key), bool(t.get("auto_tag"))
-    except Exception:
-        pass
-    return "", False
 
 
 def month_tag() -> str:

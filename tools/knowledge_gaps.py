@@ -15,27 +15,26 @@ from __future__ import annotations
 
 import html as _html
 import re
-from typing import Callable
 
 from aqt import mw
 from aqt.qt import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
-    QDialogButtonBox, QFileDialog, QFont, QFontMetrics, QFrame, QGridLayout,
-    QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
-    QColor, QListWidgetItem, QMenu, QMessageBox, QPlainTextEdit, QPushButton,
-    QRect,
+    QDialogButtonBox, QFileDialog, QFont, QFontMetrics, QGridLayout, QGroupBox,
+    QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QColor,
+    QListWidgetItem, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QRect,
     QScrollArea,
-    QSizePolicy, QSplitter, QStackedWidget, QStyle, QStyledItemDelegate,
-    QStyleOptionViewItem,
-    QHeaderView, QTableWidget, QTableWidgetItem,
-    QKeySequence, QShortcut,
-    Qt, QTimer, QVBoxLayout, QWidget,
+    QSizePolicy,
+    QSplitter, QStackedWidget, QStyle, QStyledItemDelegate, QStyleOptionViewItem,
+    QHeaderView,
+    QTableWidget, QTableWidgetItem, QKeySequence,
+    QShortcut, Qt,
+    QTimer, QVBoxLayout, QWidget,
 )
 from aqt.utils import askUser, showWarning, tooltip
 
 from ..core import anki_utils, log
 from ..core.config import (
-    active_family, auto_tag_base, month_tag, save_tool_config, tool_config,
+    auto_tag_base, save_tool_config, tool_config,
 )
 from ..core.qt_utils import (
     compact_button,
@@ -4229,15 +4228,6 @@ class KnowledgeGapsPanel(QWidget):
 
     # ── chip rows ────────────────────────────────────────────────────────────
 
-    def _make_chip_row(self, parent_layout, entries) -> QHBoxLayout:
-        row = QHBoxLayout()
-        row.setSpacing(4)
-        for entry in entries:
-            self._add_chip(row, entry)
-        row.addStretch(1)
-        parent_layout.addLayout(row)
-        return row
-
     def _add_chip(self, row, entry) -> None:
         # entry = (key, label)  OR (key, label, color)
         if len(entry) == 3:
@@ -5608,22 +5598,6 @@ class KnowledgeGapsPanel(QWidget):
             kg_store.remove(kid)
         tooltip(f"Deleted {len(ids)} gap(s).")
         self.refresh_list()
-
-    def _bulk_search(self, ids: list[str]) -> None:
-        """Open the bulk-search popup on this selection. It searches the whole
-        batch in one pass, sized per gap — as opposed to Browse, which works one
-        gap at a time."""
-        try:
-            from .kg.bulk_search import open_bulk_search
-        except Exception as e:
-            print(f"[ankisstant] bulk search unavailable: {e}")
-            showWarning(f"Couldn't open bulk search:\n\n{e}")
-            return
-        kgs = [kg for kg in (kg_store.get(i) for i in ids) if kg]
-        if not kgs:
-            tooltip("Those gaps are no longer in the list.")
-            return
-        open_bulk_search(kgs, parent=self.window())
 
     # ── the work-through queue ───────────────────────────────────────────────
 

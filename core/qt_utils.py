@@ -376,17 +376,6 @@ def run_claude_json_async(button, on_done, **kwargs):
     mw.taskman.run_in_background(_bg, _finish, uses_collection=False)
 
 
-def run_claude_text(button, label: str, **kwargs):
-    """Cancellable ask_claude (text reply)."""
-    from . import api as core_api
-    if is_manual_provider():
-        return core_api.ask_claude(**kwargs)
-    return _run_claude(
-        button, label,
-        lambda: core_api.ask_claude(show_errors=False, **kwargs),
-    )
-
-
 class _MultiTagCompleter(QCompleter):
     """QCompleter variant that completes the token after the last comma,
     leaving prior tokens intact. Used for the comma-separated tag fields."""

@@ -72,43 +72,6 @@ def find_notes_by_query(query: str, limit: int | None = None) -> list[int]:
     return nids[:limit] if limit else nids
 
 
-def find_notes_for_terms(terms: list[str], limit: int = 30) -> list[int]:
-    """OR-join the terms and return matching note ids (capped)."""
-    if not terms:
-        return []
-    cleaned = [t.strip() for t in terms if t and t.strip()]
-    if not cleaned:
-        return []
-    query = " OR ".join(f'"{t}"' for t in cleaned)
-    return find_notes_by_query(query, limit=limit)
-
-
-def note_preview(note_id: int, max_len: int = 140) -> tuple[str, str]:
-    """Return (deck_short_name, plain-text preview of first non-empty field)."""
-    if mw.col is None:
-        return ("", "")
-    try:
-        note = mw.col.get_note(note_id)
-    except Exception:
-        return ("", "")
-
-    raw = next((f for f in note.fields if f.strip()), "")
-    plain = strip_html(raw)
-    if len(plain) > max_len:
-        plain = plain[: max_len - 1] + "…"
-
-    deck = ""
-    try:
-        cids = note.card_ids()
-        if cids:
-            card = mw.col.get_card(cids[0])
-            full = mw.col.decks.name(card.did)
-            deck = full.split("::")[-1]
-    except Exception:
-        pass
-    return (deck, plain)
-
-
 def note_suspended_state(note) -> tuple[int, int]:
     """Returns (suspended_count, total_count) across the note's cards."""
     if mw.col is None:
@@ -209,52 +172,3 @@ def find_deck_id(name: str) -> int | None:
     return None
 
 
-def open_add_card_prefilled(
-    fields: dict,
-    notetype_name: str = "",
-    deck_name: str = "",
-    tag: str = "",
-) -> None:
-    """Open Anki's Add Cards dialog with explicit field/notetype/deck/tag setup.
-    Missing fields are skipped silently."""
-    try:
-        import aqt
-        addcards = aqt.dialogs.open("AddCards", mw)
-
-        if notetype_name:
-            nt = find_notetype(notetype_name)
-            if nt:
-                try:
-                    addcards.notetype_chooser.selected_notetype_id = nt["id"]
-                except Exception as e:
-                    print(f"[ankisstant] couldn't set note type {notetype_name!r}: {e}")
-            else:
-                print(f"[ankisstant] note type {notetype_name!r} not found")
-
-        if deck_name:
-            did = find_deck_id(deck_name)
-            if did is not None:
-                try:
-                    addcards.deck_chooser.selected_deck_id = did
-                except Exception as e:
-                    print(f"[ankisstant] couldn't set deck {deck_name!r}: {e}")
-            else:
-                print(f"[ankisstant] deck {deck_name!r} not found")
-
-        note = addcards.editor.note
-        if note:
-            for fname, content in (fields or {}).items():
-                if content and fname in note:
-                    note[fname] = content
-            if tag and tag not in note.tags:
-                note.tags.append(tag)
-            try:
-                addcards.editor.loadNote()
-            except Exception:
-                pass
-
-        addcards.show()
-        addcards.raise_()
-        addcards.activateWindow()
-    except Exception as e:
-        print(f"[ankisstant] open_add_card_prefilled failed: {e}")

@@ -53,27 +53,6 @@ def attachments_dir(job_id: str) -> str:
     return d
 
 
-def copy_attachments(job_id: str, paths) -> list[str]:
-    """Copy source attachments into the job's folder so the job is self-contained
-    across restarts. Returns the copied paths (falls back to the original path on
-    any copy error)."""
-    if not paths:
-        return []
-    out: list[str] = []
-    try:
-        d = attachments_dir(job_id)
-    except OSError:
-        return list(paths)
-    for p in paths:
-        try:
-            dst = os.path.join(d, os.path.basename(p))
-            shutil.copy2(p, dst)
-            out.append(dst)
-        except OSError:
-            out.append(p)
-    return out
-
-
 # ── load / save ───────────────────────────────────────────────────────────────
 
 QUEUED, RUNNING, READY, ERROR, INTERRUPTED = (
@@ -176,30 +155,6 @@ def remove(job_id: str) -> None:
 
 def ready_count() -> int:
     return sum(1 for it in load_all() if it.get("status") == READY)
-
-
-def active_count() -> int:
-    """queued + running — i.e. generations currently in flight."""
-    return sum(1 for it in load_all() if it.get("status") in ACTIVE_STATUSES)
-
-
-def by_status(*statuses: str) -> list[dict]:
-    want = set(statuses)
-    return [it for it in load_all() if it.get("status") in want]
-
-
-def find_active_duplicate(*, mode: str, topic_label, source_label,
-                          notetype_name: str, focus: str) -> dict | None:
-    """An in-flight (queued/running) job with the same request signature, used to
-    warn the user before they accidentally fire the same generation twice."""
-    sig = (mode, topic_label or "", source_label or "", notetype_name or "", focus or "")
-    for it in load_all():
-        if it.get("status") not in ACTIVE_STATUSES:
-            continue
-        if (it.get("mode"), it.get("topic_label") or "", it.get("source_label") or "",
-                it.get("notetype_name") or "", it.get("focus") or "") == sig:
-            return it
-    return None
 
 
 # ── startup cleanup ─────────────────────────────────────────────────────────────
@@ -311,7 +266,6 @@ class _Runner:
             update(job_id, status=ERROR, error=str(e))
             outcome = "error"
         _toast_outcome(outcome, n_cards, (get(job_id) or {}).get("origin", ""))
-        _refresh_ui()
         self.pump()
 
     # ── cancel ──────────────────────────────────────────────────────────────
@@ -322,7 +276,6 @@ class _Runner:
             ev.set()
         else:                        # still queued → never started
             remove(job_id)
-        _refresh_ui()
 
 
 def _runner():
@@ -411,39 +364,6 @@ def drop_work_through_leftovers() -> int:
     for bid in bids:
         n += len(by_batch(bid))
         remove_batch(bid)
-    return n
-
-
-def drop_settled_work_through() -> int:
-    """Remove work-through batches whose every gap has since been closed.
-
-    A work-through batch is only meant to outlive its window when you closed it
-    WITHOUT applying ("Close and keep the cards"), and in that case its gaps
-    stay open. Once every gap it wrote for is done, the run was applied and
-    whatever is left in the batch is the cards you skipped in the Add window —
-    yet it kept showing in AI Create as gaps you had apparently queued there.
-
-    A batch with anything still queued or running is left alone, and so is one
-    whose gaps aren't in the store (a lecture run's sections aren't gaps).
-    Returns how many job records were dropped."""
-    try:
-        from .kg import store as kg_store
-        status = {str(k.get("id") or ""): k.get("status")
-                  for k in kg_store.load_all()}
-    except Exception:
-        return 0
-    batches: dict[str, list] = {}
-    for it in load_all():
-        if it.get("origin") == "work-through" and it.get("batch_id"):
-            batches.setdefault(it["batch_id"], []).append(it)
-    n = 0
-    for bid, jobs in batches.items():
-        if any(j.get("status") in ACTIVE_STATUSES for j in jobs):
-            continue
-        kg_ids = {str(j.get("kg_id") or "") for j in jobs}
-        if kg_ids and all(k and status.get(k) == "done" for k in kg_ids):
-            remove_batch(bid)
-            n += len(jobs)
     return n
 
 
@@ -742,19 +662,3 @@ def _toast_outcome(outcome: str, n_cards: int, origin: str = "") -> None:
         pass
 
 
-def _refresh_ui() -> None:
-    """Update the nav badge and the panel lists if they're alive. Safe to call
-    even when the Ankisstant window is closed (it just no-ops)."""
-    try:
-        from ..ui import main_window as mwmod
-        if getattr(mwmod, "_current", None) is not None:
-            mwmod._current.refresh_queue_badge()
-    except Exception:
-        pass
-    try:
-        from . import card_creator as cc
-        panel = getattr(cc, "_panel", None)
-        if panel is not None and hasattr(panel, "refresh_ready_lists"):
-            panel.refresh_ready_lists()
-    except Exception:
-        pass

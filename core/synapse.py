@@ -89,12 +89,6 @@ def synapse_available() -> bool:
     return _theme() is not None
 
 
-def theme_module():
-    """SynapsePro's ``theme`` module, or None — for callers that need its path
-    or its package name (icon files, the settings entry point)."""
-    return _theme()
-
-
 def package_name() -> str:
     """SynapsePro's actual add-on package name, whatever the folder is called."""
     mod = _theme()

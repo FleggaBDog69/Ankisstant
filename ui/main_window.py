@@ -9,14 +9,13 @@
 #
 # The UI itself is AnkisstantBody, an ordinary QWidget that knows nothing about
 # which host it's in beyond how wide it is. `_current` points at the *body*, not
-# the host, because every consumer elsewhere in the add-on is duck-typed on the
-# queue API (gap_queue, browse_queue, refresh_queue_badge, refresh_tool_queue,
-# show_create_tool, show_browse_tool) rather than on it being a window.
+# the host, because consumers elsewhere find it by duck-typing (queue_owner
+# looks for gap_queue) rather than by it being a window.
 #
 # The pop-out button re-parents the body rather than rebuilding it, which is not
-# just an optimisation: each tool module caches its panel in a module global
-# (see tools/card_creator.get_panel), so a rebuild would hand the same widget to
-# two parents. It also means a half-filled Create form survives the move.
+# just an optimisation: each page module caches its panel in a module global
+# (see tools/knowledge_gaps.get_panel), so a rebuild would hand the same widget
+# to two parents. It also means a half-typed gap survives the move.
 
 from __future__ import annotations
 
@@ -24,8 +23,8 @@ import importlib
 
 from aqt import gui_hooks, mw
 from aqt.qt import (
-    QDialog, QDockWidget, QEvent, QHBoxLayout, QLabel, QPushButton, QSize,
-    QSizePolicy, QStackedWidget, Qt, QTimer, QToolButton, QVBoxLayout, QWidget,
+    QDialog, QDockWidget, QEvent, QHBoxLayout, QLabel, QPushButton, QSizePolicy,
+    QStackedWidget, Qt, QTimer, QVBoxLayout, QWidget,
 )
 
 from ..core import synapse
@@ -55,78 +54,6 @@ TOOLS: list[tuple[str, str, str]] = [
 # its corner. The rest of TOOLS keeps its entry so settings and the panel
 # cache still know the names, but nothing opens them.
 PAGES = ("knowledge_gaps", "lecture", "qbank")
-
-# Rail icons, one per tool, drawn as SVG and recoloured from the live palette —
-# same reasoning as core/synapse_sidebar: they have to track whatever accent
-# SynapsePro is on, and a folder of colour variants would drift out of step.
-# `{c}` is substituted with the icon colour.
-_TOOL_SVG: dict[str, str] = {
-    # A checklist with one item still open — the things you don't know yet.
-    # Deliberately *not* a magnifier: AI Browse two rows down is one, and at
-    # 20px two magnifiers are indistinguishable.
-    "knowledge_gaps":
-        '<path d="M4.5 6.6 6.2 8.3 9.4 5.1M4.5 12 6.2 13.7 9.4 10.5" fill="none" '
-        'stroke="{c}" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>'
-        '<rect x="4.2" y="15.4" width="5.6" height="5.2" rx="1.4" fill="none" '
-        'stroke="{c}" stroke-width="1.8" stroke-dasharray="2.6 2"/>'
-        '<path d="M12.6 6.6h7.2M12.6 12h7.2M12.6 18h5" stroke="{c}" '
-        'stroke-width="1.8" stroke-linecap="round"/>',
-    # A bank of questions: stacked bars with a question mark.
-    "qbank":
-        '<rect x="3" y="4.5" width="18" height="15" rx="2.4" fill="none" '
-        'stroke="{c}" stroke-width="1.8"/>'
-        '<path d="M9.4 9.6a2.6 2.6 0 1 1 2.6 2.6v1.4" fill="none" stroke="{c}" '
-        'stroke-width="1.8" stroke-linecap="round"/>'
-        '<circle cx="12" cy="16.4" r="1" fill="{c}"/>',
-    # Magnifier with a spark — AI search.
-    "browse":
-        '<circle cx="10.5" cy="10.5" r="6.2" fill="none" stroke="{c}" stroke-width="1.8"/>'
-        '<path d="M15.2 15.2 20.5 20.5" stroke="{c}" stroke-width="1.8" stroke-linecap="round"/>'
-        '<path d="M10.5 7.2l.7 1.9 1.9.7-1.9.7-.7 1.9-.7-1.9-1.9-.7 1.9-.7z" fill="{c}"/>',
-    # A card with a plus — make one.
-    "card_creator":
-        '<rect x="3" y="5" width="18" height="14" rx="2.4" fill="none" '
-        'stroke="{c}" stroke-width="1.8"/>'
-        '<path d="M12 9v6M9 12h6" stroke="{c}" stroke-width="1.8" stroke-linecap="round"/>',
-    # A tag with a pencil stroke.
-    "update_by_tag":
-        '<path d="M4 4.6h7.6l8 8-7 7-8-8z" fill="none" stroke="{c}" '
-        'stroke-width="1.8" stroke-linejoin="round"/>'
-        '<circle cx="8.4" cy="9" r="1.5" fill="{c}"/>',
-    # A lecture slide on a stand.
-    "lecture":
-        '<rect x="3.2" y="4" width="17.6" height="11.5" rx="2" fill="none" '
-        'stroke="{c}" stroke-width="1.8"/>'
-        '<path d="M12 15.5V20M8.4 20h7.2" stroke="{c}" stroke-width="1.8" '
-        'stroke-linecap="round"/>'
-        '<path d="M7.4 8.4h7M7.4 11.4h4" stroke="{c}" stroke-width="1.5" '
-        'stroke-linecap="round"/>',
-}
-
-_RAIL_SVG_EXTRA: dict[str, str] = {
-    "add_kg": '<path d="M12 5.6v12.8M5.6 12h12.8" stroke="{c}" stroke-width="2.1" '
-              'stroke-linecap="round"/>',
-    # A gear, not a sun: the teeth have to be short and thick relative to a
-    # large rim, or short radiating strokes just read as rays.
-    "settings":
-        '<circle cx="12" cy="12" r="7.4" fill="none" stroke="{c}" stroke-width="1.8"/>'
-        '<circle cx="12" cy="12" r="2.6" fill="none" stroke="{c}" stroke-width="1.8"/>'
-        '<path d="M12 2.9v2.2M12 18.9v2.2M21.1 12h-2.2M5.1 12H2.9'
-        'M18.4 5.6l-1.55 1.55M7.15 16.85 5.6 18.4M18.4 18.4l-1.55-1.55'
-        'M7.15 7.15 5.6 5.6" stroke="{c}" stroke-width="2.4" stroke-linecap="round"/>',
-    # Arrow leaving a box — pop out into a window of its own.
-    "popout":
-        '<path d="M13.5 4.5H19.5V10.5" fill="none" stroke="{c}" stroke-width="1.9" '
-        'stroke-linecap="round" stroke-linejoin="round"/>'
-        '<path d="M19.5 4.5 11.5 12.5" stroke="{c}" stroke-width="1.9" '
-        'stroke-linecap="round"/>'
-        '<path d="M18 14.5v4a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 4 18.5v-11'
-        'A1.5 1.5 0 0 1 5.5 6h4" fill="none" stroke="{c}" stroke-width="1.9" '
-        'stroke-linecap="round" stroke-linejoin="round"/>',
-}
-
-_SVG_WRAP = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
-             '{body}</svg>')
 
 DOCK_OBJECT_NAME = "AnkisstantSidebarDock_v1"
 
@@ -193,43 +120,6 @@ def _disabled_placeholder(label: str, key: str | None = None) -> QWidget:
     return w
 
 
-def _rail_icon(body_svg: str, colour: str, badge: str | None = None):
-    """An SVG fragment rendered to a QIcon, optionally with a queue dot.
-
-    The dot is *never* the whole story — every caller also puts the count in the
-    button's tooltip. A mark you can only read by its colour isn't a state.
-    """
-    from aqt.qt import QByteArray, QIcon, QPixmap
-    svg = _SVG_WRAP.format(body=body_svg.format(c=colour))
-    if badge:
-        # A filled disc in the top-right corner of the 24-unit viewBox.
-        svg = svg.replace(
-            "</svg>",
-            f'<circle cx="19.4" cy="4.6" r="3.5" fill="{badge}" '
-            f'stroke="none"/></svg>',
-        )
-    data = QByteArray(svg.encode("utf-8"))
-    try:
-        from PyQt6.QtSvg import QSvgRenderer
-        from aqt.qt import QPainter
-        pix = QPixmap(48, 48)          # 24px at 2x for Retina
-        pix.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(pix)
-        try:
-            QSvgRenderer(data).render(painter)
-        finally:
-            painter.end()
-        return QIcon(pix)
-    except Exception:
-        try:
-            pix = QPixmap()
-            if not pix.loadFromData(data, "SVG"):
-                return None
-            return QIcon(pix)
-        except Exception:
-            return None
-
-
 class AnkisstantBody(QWidget):
     """The Ankisstant UI, independent of whichever host it's parented to.
 
@@ -243,8 +133,6 @@ class AnkisstantBody(QWidget):
                  parent=None):
         super().__init__(parent)
         self._compact = bool(compact)
-        self._nav_buttons: dict[str, QWidget] = {}
-        self._rail_buttons: list = []
         # Callback the host installs so the pop-out button can reach it without
         # the body knowing what a dock is.
         self.on_popout = None
@@ -294,7 +182,6 @@ class AnkisstantBody(QWidget):
                     pass
 
         self._build(select=_current_tool_key(adopt_from) if adopt_from else None)
-        self.refresh_queue_badge()
 
     # ── construction ─────────────────────────────────────────────────────────
 
@@ -352,114 +239,7 @@ class AnkisstantBody(QWidget):
         self._holders[key] = holder
         return holder
 
-    def _rail_button(self, svg: str, tooltip: str, accent: bool = False) -> QToolButton:
-        btn = QToolButton()
-        btn.setToolTip(tooltip)
-        btn.setAutoRaise(True)
-        btn.setFixedSize(QSize(36, 32))
-        btn.setIconSize(QSize(20, 20))
-        btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
-        btn._ank_svg = svg
-        btn._ank_accent = accent
-        btn._ank_badge = False
-        self._paint_rail_button(btn)
-        self._rail_buttons.append(btn)
-        return btn
-
-    def _paint_rail_button(self, btn) -> None:
-        svg = getattr(btn, "_ank_svg", None)
-        if not svg:
-            return
-        colour = (synapse.color("blue_accent", "#0071D3")
-                  if getattr(btn, "_ank_accent", False)
-                  else synapse.color("text_muted", "#6b6b70"))
-        badge = (synapse.color("blue", "#3b82f6")
-                 if getattr(btn, "_ank_badge", False) else None)
-        icon = _rail_icon(svg, colour, badge)
-        if icon is not None:
-            btn.setIcon(icon)
-        else:
-            btn.setText(btn.toolTip()[:1])
-
-    def refresh_theme(self) -> None:
-        """Re-render everything that baked a colour in — SynapsePro's accent or
-        Anki's light/dark changed under a live window."""
-        try:
-            # Only our own rail buttons — a findChildren sweep would also catch
-            # QToolButtons living inside the tool panels and repaint them with
-            # a rail icon.
-            for btn in self._rail_buttons:
-                self._paint_rail_button(btn)
-            self.refresh_queue_badge()
-        except Exception as e:
-            print(f"[ankisstant] refresh_theme failed: {e}")
-
     # ── queue handoff (Browse → Create) ──────────────────────────────────────
-
-    def refresh_queue_badge(self) -> None:
-        """Show the Create and Browse queue counts.
-
-        In the wide sidebar that's a suffix on the button label. On the rail
-        there's no room for text, so the icon gets a dot and the **count goes in
-        the tooltip** — the dot says "something's queued", the tooltip says what
-        and how many. Neither state is left to colour alone.
-        """
-        try:
-            from ..tools import create_jobs
-            ready = create_jobs.ready_count()
-        except Exception:
-            ready = 0
-
-        n_gaps = len(self.gap_queue)
-        create_tips = []
-        if n_gaps:
-            create_tips.append(f"{n_gaps} gap{'s' if n_gaps != 1 else ''} queued for Create")
-        if ready:
-            create_tips.append(f"{ready} generation{'s' if ready != 1 else ''} ready to review")
-
-        n_browse = len(self.browse_queue)
-        browse_tip = (f"{n_browse} KG{'s' if n_browse != 1 else ''} queued for Browse"
-                      if n_browse else "")
-
-        self._set_badge("card_creator", "AI Create",
-                        (f"  ●{n_gaps}" if n_gaps else "") + (f"  ✓{ready}" if ready else ""),
-                        bool(n_gaps or ready), " · ".join(create_tips))
-        self._set_badge("browse", "AI Browse",
-                        f"  ●{n_browse}" if n_browse else "",
-                        bool(n_browse), browse_tip)
-
-    def _set_badge(self, key: str, label: str, suffix: str,
-                   dot: bool, tooltip: str) -> None:
-        btn = self._nav_buttons.get(key)
-        if btn is None:
-            return
-        if self._compact:
-            btn._ank_badge = dot
-            self._paint_rail_button(btn)
-            # The rail's tooltip must always name the tool as well as the
-            # count, since the label isn't on screen.
-            btn.setToolTip(f"{label} — {tooltip}" if tooltip else label)
-        else:
-            btn.setText(label + suffix)
-            btn.setToolTip(tooltip)
-
-    def refresh_tool_queue(self, key: str) -> None:
-        """Re-sync one tool's queue view WITHOUT switching to it.
-
-        Queueing a gap shouldn't yank you onto another screen, but the target
-        panel — if it's already been built — would otherwise show a stale queue
-        until the next time you visited it.
-        """
-        widget = self._panel_cache.get(key)
-        if widget is None:
-            return          # not built yet; it'll read the queue when it is
-        from aqt.qt import QScrollArea
-        target = widget.widget() if isinstance(widget, QScrollArea) else widget
-        if hasattr(target, "refresh_queue_state"):
-            try:
-                target.refresh_queue_state(self)
-            except Exception as e:
-                print(f"[ankisstant] {key}.refresh_queue_state failed: {e}")
 
     def show_create_tool(self) -> None:
         """Kept for old callers. There is no Create page any more."""
@@ -535,34 +315,16 @@ class AnkisstantBody(QWidget):
             except Exception as e:
                 print(f"[ankisstant] pop-out failed: {e}")
 
-    def _open_add_kg(self) -> None:
-        try:
-            from ..tools.knowledge_gaps import open_add_kg_dialog
-            open_add_kg_dialog()
-            # If the KG panel is loaded, refresh.
-            from ..tools import knowledge_gaps as kg_tool
-            kg_tool._refresh_open_panel()
-        except Exception as e:
-            print(f"[ankisstant] open Add KG failed: {e}")
-
     def _open_settings(self) -> None:
         from .settings import SettingsDialog
         dlg = SettingsDialog(self.window())
         if dlg.exec():
-            # Refresh nav-button enabled states for tools whose sidebar entry
-            # already exists. Newly (in)visible tools need a restart to add
-            # or remove their entry — see the restart hint in Settings.
-            for key, _label, _path in TOOLS:
-                btn = self._nav_buttons.get(key)
-                if btn is not None:
-                    btn.setEnabled(_tool_visible(key))
             self._panel_cache.clear()
             try:
                 from ..core import synapse_sidebar
                 synapse_sidebar.apply_settings_change()
             except Exception:
                 pass
-            self.refresh_theme()
 
 
 # ── hosts ─────────────────────────────────────────────────────────────────────
@@ -937,8 +699,6 @@ def _on_theme_change() -> None:
         _theme_sig = synapse.theme_signature()
         if _host is not None and _is_live(_host):
             synapse.apply_stylesheet(_host)
-            if _current is not None:
-                _current.refresh_theme()
     except Exception:
         pass
 

@@ -1607,26 +1607,6 @@ def triage(kgs: list[dict], *, model: str | None = None,
     return plans
 
 
-def triage_create(kgs: list[dict], *, model: str | None = None,
-                  locks: dict | None = None, report=None) -> list[KGPlan]:
-    """Read a batch of knowledge gaps for GENERATION.
-
-    The sibling of triage(): same call shape, same error contract, same parsing
-    — a different prompt pair and a different dial. See _CREATE_SYSTEM for why
-    the two are separate rather than one function with a flag.
-
-    Points come back WITHOUT the terms requirement: a point that can't be
-    searched can still be written about, and the terms only matter if the user
-    turns on the optional deck/tag coverage check.
-    """
-    plans = _read_batch(kgs, creating=True, require_terms=False, model=model,
-                        locks=locks, report=report)
-    for p in plans:
-        log.trace(f"KG {p.kg_id}: breadth={p.breadth} band={p.depth_band} "
-                  f"cards={p.cards} points={len(p.points)} | {p.title[:60]}")
-    return plans
-
-
 def _group_for_queued(gap: dict, kg_id: str) -> str:
     """The group for a gap that came off a queue.
 

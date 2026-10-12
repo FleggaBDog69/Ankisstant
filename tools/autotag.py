@@ -16,14 +16,8 @@
 
 from ..core import api as core_api
 from ..core.config import (
-    auto_tag_base, format_hierarchical_tag, kg_type_info, tool_config,
+    auto_tag_base, format_hierarchical_tag, tool_config,
 )
-
-
-# Per-tool default: auto-tag is ON unless the user unticks the box.
-def is_enabled(tool_cfg: dict | None) -> bool:
-    """Whether the auto-tag checkbox is ticked for this tool. Defaults to True."""
-    return bool((tool_cfg or {}).get("auto_tag", True))
 
 
 def default_type_key() -> str:
@@ -33,19 +27,6 @@ def default_type_key() -> str:
         return str(tool_config("knowledge_gaps").get("default_type_on_add") or "kg").lower()
     except Exception:
         return "kg"
-
-
-def type_meta_for(kg_type_key: str) -> dict | None:
-    """The full KG type config dict for `kg_type_key` (for its name segment)."""
-    try:
-        types = tool_config("knowledge_gaps").get("types") or []
-    except Exception:
-        return None
-    key = (kg_type_key or "").lower().strip()
-    for t in types:
-        if isinstance(t, dict) and str(t.get("key", "")).lower() == key:
-            return t
-    return None
 
 
 # ── Existing-tag vocabulary ──────────────────────────────────────────────
@@ -363,14 +344,6 @@ def trim_levels(levels: dict | None, mode: str) -> dict:
             for k in ("system", "subsystem", "topic")}
 
 
-def group_segment_override(name: str) -> str:
-    """The explicit path set for this group, or '' if it uses the derived one.
-    Cleaned the same way a derived segment is, so an override can't put a space
-    or a stray slash into a tag."""
-    ov = group_override(name)
-    return ov["path"] if ov else ""
-
-
 def group_source(name: str) -> str:
     """The source path this group's cards came from, or ''.
 
@@ -379,13 +352,6 @@ def group_source(name: str) -> str:
     card is how a source axis stops being filled in."""
     ov = group_override(name)
     return (ov or {}).get("source", "") or ""
-
-
-def group_is_absolute(name: str) -> bool:
-    """True when this group owns its tag branch outright — the auto-tag base and
-    the type segment are not used for it."""
-    ov = group_override(name)
-    return bool(ov and ov["absolute"])
 
 
 def group_segment(name: str) -> str:
@@ -663,19 +629,6 @@ def sticky_source(tool: str) -> str:
         return str(tool_config(tool).get("source_path") or "").strip()
     except Exception:
         return ""
-
-
-def set_sticky_source(tool: str, path: str) -> None:
-    # Imported here, not at module level: autotag is deliberately importable
-    # with almost nothing stubbed, and three offline harnesses rely on that.
-    from ..core import log
-    from ..core.config import save_tool_config, tool_config as _tc
-    try:
-        cfg = dict(_tc(tool))
-        cfg["source_path"] = str(path or "").strip()
-        save_tool_config(tool, cfg)
-    except Exception as e:
-        log.warn(f"autotag: couldn't remember the source for {tool}: {e}")
 
 
 def source_path_for(*, tool: str = "", kg_type_key: str = "",

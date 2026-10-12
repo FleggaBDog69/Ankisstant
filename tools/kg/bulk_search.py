@@ -1875,7 +1875,7 @@ class BulkSearchDialog(CardPaneMixin, LectureDoorMixin, QDialog):
         QTimer.singleShot(0, self._start_generation)
 
     def _render_results(self) -> None:
-        from ..lecture import matcher
+        pass
 
         by_kg: dict[str, list] = {}
         for m in list(self._coverage.covered) + list(self._coverage.gaps):
@@ -4397,17 +4397,6 @@ class BulkSearchDialog(CardPaneMixin, LectureDoorMixin, QDialog):
         return closed
 
     # ── hand-off ─────────────────────────────────────────────────────────────
-
-    def _main_window(self):
-        """The Ankisstant window that owns the queues. Walks up from this
-        dialog's parent, then falls back to the module singleton — the dialog
-        can be parented to Anki's own main window, which has no queues."""
-        try:
-            from ...ui.main_window import queue_owner
-            return queue_owner(self.parent())
-        except Exception as e:
-            log.warn(f"bulk search: couldn't find the Ankisstant window: {e}")
-            return None
 
     def _uncovered_points(self) -> dict[str, list]:
         """{kg_id: [PointMatch, ...]} for the points with nothing ticked under

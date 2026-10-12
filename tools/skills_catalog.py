@@ -79,13 +79,6 @@ def catalog() -> list[dict]:
     return out
 
 
-def catalog_entry(name: str) -> dict | None:
-    for entry in catalog():
-        if entry["name"] == name:
-            return entry
-    return None
-
-
 def is_installed(name: str) -> bool:
     """True if the skill is present in the user's Claude skills folder."""
     return os.path.isfile(os.path.join(_claude_skills_dir(), name, "SKILL.md"))
