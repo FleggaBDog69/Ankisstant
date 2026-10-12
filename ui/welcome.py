@@ -630,7 +630,6 @@ class _PageCredentials(QWidget):
             key_row.addWidget(self._key_input, 1)
             show_btn = QPushButton("Show")
             show_btn.setCheckable(True)
-            show_btn.setFixedWidth(52)
             show_btn.toggled.connect(
                 lambda on: self._key_input.setEchoMode(
                     QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password

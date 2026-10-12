@@ -592,11 +592,21 @@ def make_setup_banner(parent: QWidget | None = None) -> QFrame:
     return frame
 
 
+def compact_button(btn: QPushButton) -> QPushButton:
+    """Make a one-glyph button (?, ×, ↑, ⟳) small without clipping it.
+
+    NOT setFixedWidth(28): the theme (core/synapse.qt_stylesheet) pads every
+    QPushButton 14px a side, so a 28px button has no room left and draws as
+    an empty grey square — which is what the help, refresh and remove buttons
+    looked like. Shrinking the padding keeps the glyph and lets Qt size it."""
+    btn.setStyleSheet(btn.styleSheet() + "QPushButton { padding: 4px 8px; }")
+    return btn
+
+
 def make_help_button(title: str, body_html: str, parent: QWidget | None = None) -> QPushButton:
     """Small '?' button. Clicking opens a modal with the given help text.
     `body_html` is rendered as rich text inside the dialog."""
-    btn = QPushButton("?", parent)
-    btn.setFixedWidth(28)
+    btn = compact_button(QPushButton("?", parent))
     btn.setToolTip("How this tool works")
     btn.setAutoDefault(False)
 

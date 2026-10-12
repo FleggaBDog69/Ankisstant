@@ -879,7 +879,6 @@ class LecturePanel(QWidget):
         file_row = QHBoxLayout(self._file_widget)
         file_row.setContentsMargins(0, 0, 0, 0)
         self._file_btn = QPushButton("Choose File…")
-        self._file_btn.setFixedWidth(120)
         self._file_btn.clicked.connect(self._pick_file)
         file_row.addWidget(self._file_btn)
         self._file_lbl = QLabel(
@@ -898,7 +897,6 @@ class LecturePanel(QWidget):
         # numbers and footer are stripped and each objective folded to one line.
         lo_load_row = QHBoxLayout()
         self._lo_file_btn = QPushButton("Load from file…")
-        self._lo_file_btn.setFixedWidth(140)
         self._lo_file_btn.setToolTip(
             "Pull the objectives out of a .pdf, .docx, .txt or .md — the course "
             "header, section headings, page numbers and footer are removed "
@@ -995,7 +993,6 @@ class LecturePanel(QWidget):
         comp_row = QHBoxLayout()
         comp_row.setContentsMargins(0, 0, 0, 0)
         self._companion_btn = QPushButton("Choose…")
-        self._companion_btn.setFixedWidth(120)
         self._companion_btn.clicked.connect(self._pick_companion)
         comp_row.addWidget(self._companion_btn)
         self._companion_lbl = QLabel("No file — .txt, .md, .docx, .vtt or .srt")
@@ -1041,13 +1038,16 @@ class LecturePanel(QWidget):
             "Comprehensive — every enumerable member split out (ACA / MCA / PCA "
             "stroke syndromes each their own line) with a full cluster of notes "
             "each: a proper study set.\n\n"
-            "Max notes (right) is still a hard cap on the total."
+            "The cap (right) is still a hard limit on the total."
         )
         opt.addWidget(self._coverage_combo)
         opt.addSpacing(18)
-        opt.addWidget(QLabel("Max notes:"))
+        # "Max notes: 40 ☑ from lecture" read as three unrelated things. It is
+        # one setting — a cap — sized either by hand or from the lecture.
+        opt.addWidget(QLabel("Cap at"))
         self._cards_spin = QSpinBox()
         self._cards_spin.setRange(5, 500)
+        self._cards_spin.setSuffix(" notes")
         self._cards_spin.setToolTip(
             "A hard CAP on the total notes for the whole lecture — not a target. "
             "Coverage decides how many notes are actually wanted; this only steps "
@@ -1055,7 +1055,7 @@ class LecturePanel(QWidget):
             "reach it."
         )
         opt.addWidget(self._cards_spin)
-        self._auto_cards_cb = QCheckBox("from lecture")
+        self._auto_cards_cb = QCheckBox("or size the cap from the lecture")
         self._auto_cards_cb.setToolTip(
             "Size the cap from how many learning points the lecture actually "
             "yields, instead of a fixed number.\n\nA fixed cap is wrong in both "
@@ -1069,6 +1069,19 @@ class LecturePanel(QWidget):
         opt.addWidget(self._auto_cards_cb)
         opt.addStretch(1)
         setup.addLayout(opt)
+
+        nt_row = QHBoxLayout()
+        nt_row.addWidget(QLabel("Search notetype:"))
+        self._nt_combo = QComboBox()
+        # Sized to a name, not to the longest notetype in the collection —
+        # otherwise one long AnKing name stretches it across the window.
+        self._nt_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self._nt_combo.setMinimumContentsLength(24)
+        self._nt_combo.setToolTip("Restrict matches to one notetype, or search them all.")
+        nt_row.addWidget(self._nt_combo)
+        nt_row.addStretch(1)
+        setup.addLayout(nt_row)
 
         opt2 = QHBoxLayout()
         self._vision_cb = QCheckBox("Read diagrams as images")
@@ -1091,12 +1104,6 @@ class LecturePanel(QWidget):
         )
         opt2.addWidget(self._enrich_cb)
         opt2.addSpacing(18)
-        opt2.addWidget(QLabel("Notetype:"))
-        self._nt_combo = QComboBox()
-        self._nt_combo.setMinimumWidth(180)
-        self._nt_combo.setToolTip("Restrict matches to one notetype, or search them all.")
-        opt2.addWidget(self._nt_combo)
-        opt2.addSpacing(18)
         # Demoted: the cache now self-invalidates when the extraction changes
         # (cache version bump), so a manual re-read is rarely needed — kept as a
         # small, unobtrusive toggle rather than a headline option.
@@ -1110,6 +1117,10 @@ class LecturePanel(QWidget):
         opt2.addWidget(self._reextract_cb)
         opt2.addStretch(1)
         setup.addLayout(opt2)
+        # Filled by _as_intake_form: the slide and notes tick boxes are options
+        # for the run, and belong here rather than down by the run button.
+        self._opt3 = QHBoxLayout()
+        setup.addLayout(self._opt3)
 
         # Give the native controls enough vertical room that a bumped Anki UI
         # font can't clip their tops (combos/buttons render a few px taller than
@@ -1295,6 +1306,10 @@ class LecturePanel(QWidget):
                   self._new_btn, self._unsuspend_cb):
             w.setVisible(False)
         self._attach_cb.setText("Pre-tick suggested slides")
+        self._opt3.addWidget(self._attach_cb)
+        self._opt3.addSpacing(18)
+        self._opt3.addWidget(self._notes_cb)
+        self._opt3.addStretch(1)
         self._attach_cb.setToolTip(
             "On Find & write, every card shows the slides its point came "
             "from (PDF only, and only pages with a diagram, table or picture) "
@@ -1306,7 +1321,7 @@ class LecturePanel(QWidget):
             + "\n\nRuns at the end of the deck search, so decide before you "
               "start; the proposed lines then show beside each card on the "
               "Find & write screen.")
-        self._run_btn.setText("Find & write  ▶")
+        self._run_btn.setText("Find && write  ▶")
         self._run_btn.setMinimumWidth(210)
         self._status_lbl.setText("")
         self.layout().addStretch(1)

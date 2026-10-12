@@ -38,6 +38,7 @@ from ..core.config import (
     active_family, auto_tag_base, month_tag, save_tool_config, tool_config,
 )
 from ..core.qt_utils import (
+    compact_button,
     attach_source_completer, attach_tag_completer, make_help_button,
     make_setup_banner,
     provider_configured, refresh_deck_browser, run_claude_json,
@@ -1810,15 +1811,21 @@ class KGDetailPane(QWidget):
         )
         self._group_btn.clicked.connect(self._on_group_clicked)
         meta_row.addWidget(self._group_btn)
-        meta_row.addSpacing(8)
+        meta_row.addStretch(1)
+        root.addLayout(meta_row)
+        # Where it came from and when, on a line of its own: on the same row as
+        # the type and group they pushed the pane wider than the window and
+        # "added …" was cut off at the edge.
+        origin_row = QHBoxLayout()
         self._source_lbl = QLabel("")
         self._source_lbl.setStyleSheet("color: gray; font-size: 11px;")
-        meta_row.addWidget(self._source_lbl)
-        meta_row.addStretch(1)
+        origin_row.addWidget(self._source_lbl)
+        origin_row.addSpacing(8)
         self._created_lbl = QLabel("")
         self._created_lbl.setStyleSheet("color: gray; font-size: 11px;")
-        meta_row.addWidget(self._created_lbl)
-        root.addLayout(meta_row)
+        origin_row.addWidget(self._created_lbl)
+        origin_row.addStretch(1)
+        root.addLayout(origin_row)
 
         # Tags
         self._tag_row_w = QWidget()
@@ -1899,7 +1906,7 @@ class KGDetailPane(QWidget):
         self._work_menu_btn.setToolTip(
             "Run Find & write on this now, without queueing it.")
         _wm = QMenu(self._work_menu_btn)
-        self._work_now_act = _wm.addAction("Find & write now — skip the queue")
+        self._work_now_act = _wm.addAction("Find && write now — skip the queue")
         self._work_now_act.setToolTip(
             "Open the unified pass on this selection straight away, without "
             "parking it first.")
@@ -1922,14 +1929,12 @@ class KGDetailPane(QWidget):
             "Open Anki's own Browse screen, searching the tags for this "
             "gap's title.")
         self._find_tag_btn.clicked.connect(lambda: self._open_anki_browse(True))
-        actions_row.addWidget(self._find_tag_btn)
         self._find_cards_btn = QPushButton("Find cards")
         self._find_cards_btn.setAutoDefault(False)
         self._find_cards_btn.setToolTip(
             "Open Anki's own Browse screen, searching the cards for this "
             "gap's title.")
         self._find_cards_btn.clicked.connect(lambda: self._open_anki_browse(False))
-        actions_row.addWidget(self._find_cards_btn)
 
         self._own_btn = QPushButton("✎ Write my own card")
         self._own_btn.setAutoDefault(False)
@@ -1940,15 +1945,23 @@ class KGDetailPane(QWidget):
         self._own_btn.clicked.connect(self._write_own_card)
         actions_row.addWidget(self._own_btn)
         actions_row.addStretch(1)
-        self._delete_btn = QPushButton("🗑 Delete")
-        self._delete_btn.setAutoDefault(False)
-        self._delete_btn.clicked.connect(self._delete)
-        actions_row.addWidget(self._delete_btn)
         self._save_btn = QPushButton("Save")
         self._save_btn.setAutoDefault(False)
         self._save_btn.clicked.connect(self._save)
         actions_row.addWidget(self._save_btn)
         root.addLayout(actions_row)
+        # Second row: looking it up, and getting rid of it. Seven buttons on
+        # one line were wider than the pane, and Delete was the one pushed
+        # off the edge.
+        lookup_row = QHBoxLayout()
+        lookup_row.addWidget(self._find_tag_btn)
+        lookup_row.addWidget(self._find_cards_btn)
+        lookup_row.addStretch(1)
+        self._delete_btn = QPushButton("🗑 Delete")
+        self._delete_btn.setAutoDefault(False)
+        self._delete_btn.clicked.connect(self._delete)
+        lookup_row.addWidget(self._delete_btn)
+        root.addLayout(lookup_row)
 
         # Empty-state overlay
         self._empty_lbl = QLabel("Select a knowledge gap, or click ＋ Add KG to start.")
@@ -2043,9 +2056,9 @@ class KGDetailPane(QWidget):
         self._empty_lbl.setVisible(True)
 
     def _set_widgets_visible(self, visible: bool) -> None:
-        for w in (self._title_input, self._type, self._source_lbl,
-                  self._status_lbl, self._group_btn, self._created_lbl,
-                  self._tags_input,
+        for w in (self._title_input, self._type_lbl, self._type,
+                  self._source_lbl, self._status_lbl, self._group_btn,
+                  self._created_lbl, self._tag_row_w,
                   self._schema_container, self._res_box, self._work_btn,
                   self._work_menu_btn, self._find_tag_btn,
                   self._find_cards_btn, self._own_btn, self._delete_btn,
@@ -2055,6 +2068,8 @@ class KGDetailPane(QWidget):
         # shows it only for type=lo KGs.
         if not visible:
             self._lo_analyser.setVisible(False)
+        else:
+            self._apply_compact()
 
     # ── schema-driven fields ─────────────────────────────────────────────────
 
@@ -2201,7 +2216,6 @@ class KGDetailPane(QWidget):
             le = QLineEdit()
             le.setPlaceholderText(ph or "https://…")
             open_btn = QPushButton("Open")
-            open_btn.setFixedWidth(58)
             open_btn.setAutoDefault(False)
             open_btn.clicked.connect(lambda _c=False, e=le: self._open_url(e.text()))
             h.addWidget(le, 1)
@@ -2256,11 +2270,10 @@ class KGDetailPane(QWidget):
         url_input = QLineEdit(url or "")
         url_input.setPlaceholderText("https://…")
         open_btn = QPushButton("Open")
-        open_btn.setFixedWidth(58)
         open_btn.setAutoDefault(False)
         open_btn.clicked.connect(lambda _c=False, u=url_input: self._open_url(u.text()))
         rm_btn = QPushButton("×")
-        rm_btn.setFixedWidth(28)
+        compact_button(rm_btn)
         rm_btn.setAutoDefault(False)
         rm_btn.clicked.connect(lambda _c=False, r=row: self._remove_resource_row(r))
         rl.addWidget(lbl_input)
@@ -2422,11 +2435,11 @@ class KGDetailPane(QWidget):
         if many:
             self._work_btn.setText(f"Send {n} gaps to queue")
             self._work_now_act.setText(
-                f"Find & write {n} gaps now — skip the queue")
+                f"Find && write {n} gaps now — skip the queue")
             self._own_btn.setText(f"✎ Write my own for {n} gaps")
         else:
             self._work_btn.setText("Send to queue")
-            self._work_now_act.setText("Find & write now — skip the queue")
+            self._work_now_act.setText("Find && write now — skip the queue")
             self._own_btn.setText("✎ Write my own card")
         # The two Browse doors search ONE title, so they say so when the
         # selection is bigger than one rather than implying they'll do the lot.
@@ -3180,7 +3193,8 @@ class _GroupsView(QWidget):
         brow.addWidget(manage)
         brow.addStretch(1)
         refresh = QPushButton("⟳")
-        refresh.setFixedWidth(28)
+        compact_button(refresh)
+        refresh.setToolTip("Refresh")
         refresh.setAutoDefault(False)
         refresh.clicked.connect(lambda: self.refresh())
         brow.addWidget(refresh)
@@ -3212,6 +3226,14 @@ class _GroupsView(QWidget):
             Qt.TextInteractionFlag.TextSelectableByMouse)
         rcol.addWidget(self._meta)
 
+        # Everything below the heading only means something once a group is
+        # picked. Before that it was a row of greyed-out buttons over an empty
+        # box — a form for nothing — so it is hidden instead (see _show).
+        self._group_body = QWidget()
+        bcol = QVBoxLayout(self._group_body)
+        bcol.setContentsMargins(0, 0, 0, 0)
+        bcol.setSpacing(6)
+        rcol.addWidget(self._group_body, 1)
         # The same as the gap pane: one button sends the group to the queue,
         # and the ▾ runs it straight away instead.
         self._buttons: dict[str, QPushButton] = {}
@@ -3236,12 +3258,12 @@ class _GroupsView(QWidget):
         self._work_menu_btn.setToolTip(
             "Run Find & write on this group now, without queueing it.")
         _gm = QMenu(self._work_menu_btn)
-        _gm.addAction("Find & write now — skip the queue",
+        _gm.addAction("Find && write now — skip the queue",
                       lambda: self._run(panel._work_through_now))
         self._work_menu_btn.setMenu(_gm)
         run_row.addWidget(self._work_menu_btn)
         run_row.addStretch(1)
-        rcol.addLayout(run_row)
+        bcol.addLayout(run_row)
         self._buttons["work"].clicked.connect(
             lambda: self._run(panel._queue_work_through))
 
@@ -3272,7 +3294,7 @@ class _GroupsView(QWidget):
             self._buttons[key] = b
             edit_row.addWidget(b)
         edit_row.addStretch(1)
-        rcol.addLayout(edit_row)
+        bcol.addLayout(edit_row)
         self._buttons["add"].clicked.connect(self._on_add)
         self._buttons["rename"].clicked.connect(self._on_rename)
         self._buttons["retag"].clicked.connect(self._on_retag)
@@ -3283,7 +3305,7 @@ class _GroupsView(QWidget):
 
         self._gaps_lbl = QLabel("")
         self._gaps_lbl.setStyleSheet("color: gray; font-size: 11px;")
-        rcol.addWidget(self._gaps_lbl)
+        bcol.addWidget(self._gaps_lbl)
         self._gaps = QListWidget()
         self._gaps.setAlternatingRowColors(True)
         self._gaps.setSelectionMode(
@@ -3297,7 +3319,7 @@ class _GroupsView(QWidget):
             "below to act on — click, Shift-click a run, Cmd-click to add one. "
             "Double-click a gap to open it on the Gaps page. Right-click for "
             "the same actions the gap list has.")
-        rcol.addWidget(self._gaps, 1)
+        bcol.addWidget(self._gaps, 1)
         self._gaps.itemSelectionChanged.connect(self._on_gap_select)
         # Same rule as the Gaps page: the box is the Closed state, the
         # highlight is the batch. Both pages write through
@@ -3316,7 +3338,11 @@ class _GroupsView(QWidget):
         self._gaps_tick_lbl.setStyleSheet("color: gray; font-size: 10px;")
         gtick_row.addWidget(self._gaps_tick_lbl)
         gtick_row.addStretch(1)
-        rcol.addLayout(gtick_row)
+        bcol.addLayout(gtick_row)
+        # With no group picked the body is hidden and this takes the space, so
+        # the heading stays at the top instead of spreading down the pane.
+        self._group_filler = QWidget()
+        rcol.addWidget(self._group_filler, 1)
         right.addWidget(top)
 
         # The gap pane: the same one the Gaps page uses, minus what won't fit
@@ -3329,6 +3355,7 @@ class _GroupsView(QWidget):
         det_wrap.setFrameShape(QScrollArea.Shape.NoFrame)
         det_wrap.setWidget(self._detail)
         right.addWidget(det_wrap)
+        self._det_wrap = det_wrap
         right.setSizes([420, 320])
         splitter.addWidget(right)
         splitter.setSizes([260, 640])
@@ -3432,6 +3459,9 @@ class _GroupsView(QWidget):
         # so it has to be told separately — otherwise it stays live over an
         # empty pick and offers to send nothing anywhere.
         self._work_menu_btn.setEnabled(bool(names))
+        self._group_body.setVisible(bool(names))
+        self._det_wrap.setVisible(bool(names))
+        self._group_filler.setVisible(not names)
         if not names:
             self._title.setText("<h3 style='margin:0'>No group picked</h3>")
             self._state.setText("")
@@ -4045,7 +4075,8 @@ class KnowledgeGapsPanel(QWidget):
                 "changed.")
             self._things_btn.clicked.connect(self._on_import_things)
         refresh_btn = QPushButton("⟳")
-        refresh_btn.setFixedWidth(28)
+        compact_button(refresh_btn)
+        refresh_btn.setToolTip("Refresh")
         refresh_btn.setAutoDefault(False)
         refresh_btn.clicked.connect(lambda: self.refresh_list())
         btn_row.addWidget(add_btn)
@@ -5302,7 +5333,7 @@ class KnowledgeGapsPanel(QWidget):
             "every point, cards are written for the points nothing covered, "
             "and one button adds both in one undoable step."
         )
-        now = menu.addAction(f"Find & write {label} now…",
+        now = menu.addAction(f"Find && write {label} now…",
                              lambda: self._work_through_now(ids))
         now.setToolTip("Open Find & write on these straight away, without "
                        "parking them first.")
@@ -5438,7 +5469,7 @@ class KnowledgeGapsPanel(QWidget):
                 "button adds both in one undoable step."
                 + ("\n\nGaps already Closed are left out." if done_note else "")
             )
-            menu.addAction(f"Find & write {label} ({m}){done_note} now…",
+            menu.addAction(f"Find && write {label} ({m}){done_note} now…",
                            lambda: self._work_through_now(live))
             on_queue = self._queued_set()
             queued = [i for i in ids if i in on_queue]
@@ -5702,7 +5733,7 @@ class KnowledgeGapsPanel(QWidget):
         from .kg import work_queue
         n = work_queue.count()
         menu = QMenu(self._work_queue_btn)
-        run = menu.addAction(f"Find & write all {n} now…",
+        run = menu.addAction(f"Find && write all {n} now…",
                              self._run_work_queue)
         run.setEnabled(bool(n))
         menu.addSeparator()
