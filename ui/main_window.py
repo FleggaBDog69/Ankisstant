@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import importlib
+import sys
 
 from aqt import gui_hooks, mw
 from aqt.qt import (
@@ -252,7 +253,7 @@ class AnkisstantBody(QWidget):
         if cached is None and path:
             try:
                 module = importlib.import_module(path)
-                widget = module.get_panel()
+                widget = _live_panel(module)
                 self._panel_cache[key] = widget
             except Exception as e:
                 print(f"[ankisstant] failed to load panel for {key}: {e}")
@@ -262,7 +263,7 @@ class AnkisstantBody(QWidget):
             # Already cached — let the tool refresh state on re-show.
             try:
                 module = importlib.import_module(path)
-                widget = module.get_panel()  # may refresh internally
+                widget = _live_panel(module)  # may refresh internally
             except Exception:
                 widget = cached
         else:
@@ -566,6 +567,27 @@ def _dock_mode() -> bool:
                 and bool(cfg.get("sidebar_buttons", True)))
     except Exception:
         return False
+
+
+def _live_panel(module):
+    """module.get_panel(), rebuilt if the singleton it hands back has been
+    deleted underneath it. Each page is a module-level singleton; if whatever
+    it was parented to is destroyed (a window torn down, a dev-screens copy
+    collected mid-run) the Python name survives with no widget behind it, and
+    every later visit to that page raised "wrapped C/C++ object … has been
+    deleted" until Anki restarted."""
+    try:
+        widget = module.get_panel()   # some refresh the old panel first,
+        if _is_live(widget):          # which raises if it's gone
+            return widget
+    except RuntimeError:
+        pass
+    for mod in (module, sys.modules.get(module.__name__ + ".panel")):
+        for attr in ("_panel", "_scroll"):
+            if mod is not None and getattr(mod, attr, None) is not None:
+                setattr(mod, attr, None)
+    print(f"[ankisstant] {module.__name__}: page was deleted, rebuilt it")
+    return module.get_panel()
 
 
 def _is_live(widget) -> bool:

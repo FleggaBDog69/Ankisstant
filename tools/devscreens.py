@@ -52,6 +52,11 @@ STEP_MS = 250            # let layouts settle and paint between each shot
 # every later request until Anki restarts.
 _running = globals().get("_running", 0.0)
 STALE_S = 300
+# The run in progress, held HERE. Its only other owner is the pending
+# QTimer.singleShot, which doesn't keep a plain Python object alive — so the
+# cyclic GC collected it ~45 steps in and the next step silently never fired
+# (that was the "last dialog hangs" stall, wherever the end happened to be).
+_current = None
 
 
 def _user_files() -> str:
@@ -86,12 +91,14 @@ def check() -> None:
 
 
 def _begin() -> None:
-    global _running
+    global _running, _current
     _running = time.time()
     try:
-        _Run().start()
+        _current = _Run()
+        _current.start()
     except Exception as e:
         _running = 0.0
+        _current = None
         log.error(f"dev screens failed to start: {e}\n{traceback.format_exc()}")
 
 
@@ -218,13 +225,14 @@ class _Run:
         self.steps[0:0] = list(steps)
 
     def _next(self) -> None:
-        global _running
+        global _running, _current
         if not self.steps:
             try:
                 self._finish()
             except Exception as e:
                 log.error(f"dev screens: finish failed: {e}\n{traceback.format_exc()}")
             _running = 0.0
+            _current = None
             return
         name, fn = self.steps.pop(0)
         self.step = f"{name} ({len(self.steps)} left)"
@@ -429,6 +437,7 @@ class _Run:
         """The smaller windows, each built off-screen, shot, and cancelled."""
         from . import knowledge_gaps as kgm
         from ..ui import settings as st
+        from ..ui.welcome import SetupWizard
         from .qbank.session_dialog import _SessionDialog
         from .qbank.browser import _QuestionCountDialog
         from ..core.config import load_config
@@ -461,9 +470,7 @@ class _Run:
                 list((tools.get("card_creator", {}).get("grounding") or {}).get("sources") or []))),
             ("qbank-session", lambda: _SessionDialog()),
             ("qbank-question-count", lambda: _QuestionCountDialog("QBank")),
-            # Not the setup wizard: its shot is taken, then the run never
-            # comes back from it (12 Oct 2026, not chased). It's a first-run
-            # screen; check it by hand when it changes.
+            ("setup-wizard", lambda: SetupWizard()),
         ]
         steps = []
         for name, make in makers:
