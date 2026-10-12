@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/scratchpad/tools/post_edit_hook.py\"",
+            "timeout": 120,
+            "statusMessage": "Running Ankisstant checks…"
+          }
+        ]
+      }
+    ]
+  }
+}

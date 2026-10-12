@@ -44,6 +44,8 @@ zip -rXq "$out" . \
   --exclude '_phaseA_backup_*' \
   --exclude '_phaseA_backup_*/*' \
   --exclude 'scratchpad' \
-  --exclude 'scratchpad/*'
+  --exclude 'scratchpad/*' \
+  --exclude 'CLAUDE.md' \
+  --exclude '.claude/*'
 
 echo "wrote $out"

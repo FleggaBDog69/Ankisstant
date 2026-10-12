@@ -174,6 +174,12 @@ def _stamp(path: str) -> tuple[float, int] | None:
 
 def _tick() -> None:
     global _seen
+    # Developer screenshots ride the same two-second tick (tools/devscreens.py).
+    try:
+        from .. import devscreens
+        devscreens.check()
+    except Exception as e:
+        print(f"[ankisstant] dev screens check failed: {e}")
     path = _patch_path()
     stamp = _stamp(path)
     if stamp is None or stamp == _seen:
