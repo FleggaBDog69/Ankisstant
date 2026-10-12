@@ -267,11 +267,10 @@ def separator() -> QFrame:
 
 def open_run(records: list, *, plans=None, matches=None, coverage=None,
              door: str = "", title: str = "", parent=None,
-             on_committed=None, unified: bool = True, adopt_batch: str = "",
-             source: str = "", lecture=None):
+             on_committed=None, source: str = "", lecture=None):
     """Open the shared run view on whatever this door has already produced.
 
-    Four ways in, and the door picks by how much it has done already:
+    Three ways in, and the door picks by how much it has done already:
 
       records only            -> the plan page, unread. (Knowledge Gaps)
       records + plans         -> the plan page, pre-planned; READ is skipped.
@@ -279,9 +278,6 @@ def open_run(records: list, *, plans=None, matches=None, coverage=None,
               + matches/cov   -> straight to the results page; READ, APPROVE
                                  and FIND are all skipped, because the door
                                  already did them. (AI Lecture)
-      records + plans
-              + adopt_batch   -> the write-only page, showing a create_jobs
-                                 batch this window did not start. (AI Create)
 
     `records` are FLATTENED gap records — pipeline.WorkItem.to_kg_record() or
     bulk_search.create_record_for(). A door with no knowledge-gap store behind
@@ -306,69 +302,14 @@ def open_run(records: list, *, plans=None, matches=None, coverage=None,
     if not records:
         tooltip("Nothing to run.")
         return None
-    dlg = BulkSearchDialog(records, parent=parent, unified=unified,
+    dlg = BulkSearchDialog(records, parent=parent,
                            plans=plans, matches=matches, coverage=coverage,
                            door=door, title=title, on_committed=on_committed,
-                           adopt_batch=adopt_batch, source=source,
-                           lecture=lecture)
+                           source=source, lecture=lecture)
     dlg.show()
     dlg.raise_()
     dlg.activateWindow()
     return dlg
-
-
-def open_written(job: dict, *, parent=None, door: str = "create"):
-    """A finished create_jobs generation, on the shared run view.
-
-    The door for AI Create: it enqueues its job exactly as it always has, and
-    when the cards land they appear here rather than in a review dialog of
-    their own. One work item, one plan built from the points the job was asked
-    to cover (or none, for a plain "N cards on a topic"), and the batch adopted
-    rather than started.
-
-    Returns the dialog, or None when the job can't be shown here.
-    """
-    if not isinstance(job, dict):
-        return None
-    batch = str(job.get("batch_id") or job.get("id") or "")
-    if not batch:
-        return None
-    item = pipeline.WorkItem(
-        id=str(job.get("kg_id") or f"create:{batch}"),
-        title=str(job.get("title") or job.get("topic_label") or "Generation"),
-        kind=pipeline.KIND_TOPIC,
-        type_key=str(job.get("kg_type_for_image") or ""),
-        tags=list(job.get("tags_raw") or []),
-        fields={"notes": str(job.get("kg_notes") or ""),
-                "stem_html": str(job.get("kg_stem_html") or ""),
-                "explanation": str(job.get("kg_explanation") or ""),
-                "images": list(job.get("kg_image_filenames") or [])},
-    )
-    # The points the job was asked to cover, so each card files under the point
-    # it answers rather than in one undifferentiated heap. A plain topic
-    # generation has none, and that is fine — the cards sit under the item.
-    concepts = [str(c or "").strip() for c in (job.get("mass_points") or [])]
-    plan = pipeline.Plan(
-        item=item,
-        concept=str(job.get("topic_label") or item.title),
-        cards=int(job.get("n_cards") or 0) or len(concepts),
-        points=[_bare_point(c) for c in concepts if c],
-    )
-    from . import autotag
-    return open_run([item.to_kg_record(concept=plan.concept)],
-                    plans=[plan], door=door, adopt_batch=batch,
-                    title=f"AI Create — {item.title}", parent=parent,
-                    source=autotag.source_path_for(
-                        tool="card_creator",
-                        kg_type_key=str(job.get("kg_type_for_image") or "")))
-
-
-def _bare_point(concept: str):
-    """A LearningPoint carrying only a concept. The write-only tree needs
-    somewhere to hang each card; it never searches, so terms and levels would
-    go unused."""
-    from .lecture.extractor import LearningPoint
-    return LearningPoint(concept=concept)
 
 
 # ── HTML: the run, written out ───────────────────────────────────────────────
