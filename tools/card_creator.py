@@ -623,9 +623,9 @@ def _tag_material(gap: dict | None, topic_label: str | None,
         stem = re.sub(r"<[^>]+>", " ", str(gap.get("stem_html") or ""))
         stem = re.sub(r"\s+", " ", stem).strip()
         if stem:
-            bits.append(stem[:600])
+            bits.append(autotag.clip(stem, 1500))
         if (gap.get("notes") or "").strip():
-            bits.append(gap["notes"].strip()[:300])
+            bits.append(autotag.clip(gap["notes"].strip(), 1500))
     else:
         if topic_label:
             bits.append(str(topic_label))
@@ -1152,7 +1152,6 @@ def match_cards_to_slides(cards: list, page_texts: list) -> None:
 def _grader_model(cfg: dict) -> str | None:
     """The grader model for the active family — the dedicated quality_pass model
     if set, else the generator model, else the family default (resolved later)."""
-    qpc = cfg.get("quality_pass") or {}
     fam = active_family()
     return pipeline.dial_for(pipeline.CHECK, family=fam)
 

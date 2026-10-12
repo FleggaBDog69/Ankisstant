@@ -20,6 +20,17 @@ from ..core.config import (
 )
 
 
+
+def clip(text: str, limit: int) -> str:
+    """Shorten text for a prompt, and SAY so when it bites. A silent cut
+    reads to the model as the whole of what was written (see triage's notes
+    handling), so the model is told rather than left to guess."""
+    text = str(text or "")
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + f" … [cut: {len(text) - limit} more characters]"
+
+
 def default_type_key() -> str:
     """The KG type whose segment is used when no specific gap/KG is loaded
     (free topic/source generation or a free Browse search)."""
@@ -142,7 +153,7 @@ def classify(material: str, *, model: str | None = None) -> dict | None:
     )
     try:
         resp = core_api.ask_claude_json(
-            prompt=f"Material to classify:\n{material[:1500]}",
+            prompt=f"Material to classify:\n{clip(material, 4000)}",
             system=system, max_tokens=256, model=model,
             show_errors=False,
         )

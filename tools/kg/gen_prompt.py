@@ -41,6 +41,7 @@ import uuid
 
 from ...core import log
 from ...core.config import load_config, tool_config
+from .. import autotag
 from . import engine
 from . import triage as kg_triage
 
@@ -271,9 +272,9 @@ def build_generation_request(*, kg: dict, plan, profile: dict, cfg: dict,
         stem = re.sub(r"<[^>]+>", " ", str(kg.get("stem_html") or ""))
         stem = re.sub(r"\s+", " ", stem).strip()
         if stem:
-            ctx.append(f"Question/stem: {stem[:600]}")
+            ctx.append(f"Question/stem: {autotag.clip(stem, 1500)}")
         if str(kg.get("notes") or "").strip():
-            ctx.append(f"Notes: {str(kg['notes']).strip()[:300]}")
+            ctx.append(f"Notes: {autotag.clip(str(kg['notes']).strip(), 1500)}")
         if ctx:
             user_msg += "\n\nCLASSIFY THIS MATERIAL for the tag:\n" + "\n".join(ctx)
 
