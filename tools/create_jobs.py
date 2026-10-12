@@ -21,7 +21,7 @@
 
 from __future__ import annotations
 
-import json
+from ..core import jsonfile
 import os
 import shutil
 import uuid
@@ -62,24 +62,12 @@ ACTIVE_STATUSES = {QUEUED, RUNNING}
 
 
 def load_all() -> list[dict]:
-    path = _store_path()
-    if not os.path.exists(path):
-        return []
-    try:
-        with open(path, "r") as f:
-            data = json.load(f)
-        return [it for it in data if isinstance(it, dict)] if isinstance(data, list) else []
-    except (json.JSONDecodeError, OSError) as e:
-        print(f"[ankisstant] create_jobs load failed: {e}")
-        return []
+    data = jsonfile.read(_store_path(), [])
+    return [it for it in data if isinstance(it, dict)] if isinstance(data, list) else []
 
 
 def save_all(items: list[dict]) -> None:
-    try:
-        with open(_store_path(), "w") as f:
-            json.dump(items, f, indent=2)
-    except OSError as e:
-        print(f"[ankisstant] create_jobs save failed: {e}")
+    jsonfile.write(_store_path(), items, indent=2)
 
 
 # ── normalisation ──────────────────────────────────────────────────────────────

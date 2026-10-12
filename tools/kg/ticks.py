@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-import json
+from ...core import jsonfile
 import os
 
 from . import store as kg_store
@@ -34,15 +34,7 @@ def ids() -> set[str]:
 
     The prune is silent: a gap can only leave kg_queue.json by being deleted,
     and a tick on nothing is noise rather than news."""
-    path = _path()
-    if not os.path.exists(path):
-        return set()
-    try:
-        with open(path, "r") as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
-        print(f"[ankisstant] kg_ticks load failed: {e}")
-        return set()
+    data = jsonfile.read(_path(), [])
     if not isinstance(data, list):
         return set()
     out: set[str] = set()
@@ -57,11 +49,7 @@ def save(kg_ids) -> None:
     """Replace the saved ticks. The panel always hands over its whole set, so
     this is a write of the truth rather than a patch of it."""
     rows = sorted({str(k or "").strip() for k in kg_ids if str(k or "").strip()})
-    try:
-        with open(_path(), "w") as f:
-            json.dump(rows, f, indent=2)
-    except OSError as e:
-        print(f"[ankisstant] kg_ticks save failed: {e}")
+    jsonfile.write(_path(), rows, indent=2)
 
 
 def count() -> int:

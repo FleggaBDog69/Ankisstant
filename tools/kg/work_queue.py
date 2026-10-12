@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-import json
+from ...core import jsonfile
 import os
 from datetime import datetime
 
@@ -33,15 +33,7 @@ def _path() -> str:
 # ── load / save ──────────────────────────────────────────────────────────────
 
 def _load_raw() -> list[dict]:
-    path = _path()
-    if not os.path.exists(path):
-        return []
-    try:
-        with open(path, "r") as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
-        print(f"[ankisstant] kg_work_queue load failed: {e}")
-        return []
+    data = jsonfile.read(_path(), [])
     if not isinstance(data, list):
         return []
     out: list[dict] = []
@@ -62,11 +54,7 @@ def _load_raw() -> list[dict]:
 
 
 def _save_raw(rows: list[dict]) -> None:
-    try:
-        with open(_path(), "w") as f:
-            json.dump(rows, f, indent=2)
-    except OSError as e:
-        print(f"[ankisstant] kg_work_queue save failed: {e}")
+    jsonfile.write(_path(), rows, indent=2)
 
 
 # ── reading ──────────────────────────────────────────────────────────────────

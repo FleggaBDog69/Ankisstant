@@ -36,9 +36,9 @@
 
 from __future__ import annotations
 
-import json
 import os
 
+from ...core import jsonfile
 from . import store
 
 POLL_MS = 2000
@@ -95,16 +95,22 @@ def apply_pending() -> list[dict]:
     file each call, which is 40 full rewrites when a batch ticks off a term's
     worth of gaps (the same reason store.set_group exists)."""
     path = _patch_path()
-    if not os.path.isfile(path):
-        return []
-    try:
-        with open(path, "r") as f:
-            raw = json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
-        print(f"[ankisstant] kg patch read failed: {e}")
-        return []
+    claim = path + ".applying"
+    # CLAIM, then read — see store.drain_inbox. Reading and truncating
+    # afterwards lost any patch appended in between, and this runs every two
+    # seconds while Anki is open. A claim left by a pass that died part-way is
+    # applied first; the live file waits for the next tick.
+    if not os.path.isfile(claim):
+        if not os.path.isfile(path):
+            return []
+        try:
+            os.replace(path, claim)
+        except OSError as e:
+            print(f"[ankisstant] kg patch claim failed: {e}")
+            return []
+    raw = jsonfile.read(claim, [])
     if not isinstance(raw, list) or not raw:
-        _clear(path)
+        _done(claim)
         return []
 
     items = store.load_all()
@@ -139,23 +145,17 @@ def apply_pending() -> list[dict]:
 
     if changed:
         store.save_all(items)
-    try:
-        with open(_result_path(), "w") as f:
-            json.dump(results, f, indent=2)
-    except OSError:
-        pass
-    _clear(path)
+    jsonfile.write(_result_path(), results, indent=2)
+    _done(claim)
     return results
 
 
-def _clear(path: str) -> None:
-    """Truncate rather than delete — external writers append to whatever is
-    there, and an empty list is a valid starting point they can read back."""
+def _done(claim: str) -> None:
+    """Drop the claimed file. Writers create a fresh [] when it's missing."""
     try:
-        with open(path, "w") as f:
-            json.dump([], f)
+        os.remove(claim)
     except OSError as e:
-        print(f"[ankisstant] kg patch clear failed: {e}")
+        print(f"[ankisstant] kg patch cleanup failed: {e}")
 
 
 # ── live watcher ─────────────────────────────────────────────────────────────

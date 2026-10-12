@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import json
+from ...core import jsonfile
 import os
 import uuid
 from datetime import datetime
@@ -51,12 +52,10 @@ def _legacy_migrated_path() -> str:
 # ── load / save ──────────────────────────────────────────────────────────────
 
 def load_all() -> list[dict]:
-    path = _queue_path()
-    if not os.path.exists(path):
-        return []
+    # jsonfile.read sets an unreadable file aside rather than letting it read
+    # as "no gaps" — the next save would otherwise write that over the lot.
+    data = jsonfile.read(_queue_path(), [])
     try:
-        with open(path, "r") as f:
-            data = json.load(f)
         if not isinstance(data, list):
             return []
         # One-shot in-memory migration: legacy status="dismissed" gets
@@ -72,17 +71,13 @@ def load_all() -> list[dict]:
                 it["dismissed"] = True
             out.append(it)
         return out
-    except (json.JSONDecodeError, OSError) as e:
+    except (TypeError, AttributeError) as e:
         print(f"[ankisstant] kg_queue load failed: {e}")
         return []
 
 
 def save_all(items: list[dict]) -> None:
-    try:
-        with open(_queue_path(), "w") as f:
-            json.dump(items, f, indent=2)
-    except OSError as e:
-        print(f"[ankisstant] kg_queue save failed: {e}")
+    jsonfile.write(_queue_path(), items, indent=2)
 
 
 # ── normalisation ────────────────────────────────────────────────────────────
@@ -427,17 +422,29 @@ def drain_inbox(*, groups_out: list | None = None) -> int:
     so it can't un-archive a put-away group itself — it hands the caller the
     names instead (see knowledge_gaps.wake_groups)."""
     path = _inbox_path()
-    if not os.path.isfile(path):
-        return 0
-    try:
-        with open(path, "r") as f:
-            raw = json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
-        print(f"[ankisstant] kg inbox read failed: {e}")
-        return 0
-    if not isinstance(raw, list) or not raw:
-        _clear_inbox(path)
-        return 0
+    claim = path + ".draining"
+    added = 0
+    # A claim left by a drain that died part-way is finished first.
+    if os.path.isfile(claim):
+        added += _drain_claim(claim, groups_out)
+    # CLAIM, then read. Reading the inbox and truncating it afterwards lost
+    # anything appended in between; renaming it first means a writer that
+    # comes along mid-drain simply starts a fresh inbox (they all create []
+    # when it's missing) and is picked up next time.
+    if os.path.isfile(path):
+        try:
+            os.replace(path, claim)
+        except OSError as e:
+            print(f"[ankisstant] kg inbox claim failed: {e}")
+            return added
+        added += _drain_claim(claim, groups_out)
+    return added
+
+
+def _drain_claim(claim: str, groups_out: list | None) -> int:
+    raw = jsonfile.read(claim, [])
+    if not isinstance(raw, list):
+        raw = []
 
     seen = {
         (it.get("fields") or {}).get("things_uuid")
@@ -460,15 +467,8 @@ def drain_inbox(*, groups_out: list | None = None) -> int:
         if groups_out is not None:
             groups_out.extend(
                 str(it.get("group") or "").strip() for it in fresh)
-    _clear_inbox(path)
-    return len(fresh)
-
-
-def _clear_inbox(path: str) -> None:
-    """Truncate rather than delete: lifed appends to whatever is there, and
-    an empty list is a valid starting point it can read back."""
     try:
-        with open(path, "w") as f:
-            json.dump([], f)
+        os.remove(claim)
     except OSError as e:
-        print(f"[ankisstant] kg inbox clear failed: {e}")
+        print(f"[ankisstant] kg inbox cleanup failed: {e}")
+    return len(fresh)
